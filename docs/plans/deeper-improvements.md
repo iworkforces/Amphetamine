@@ -36,7 +36,7 @@ Already completed (out of scope for re-work unless regression):
 - Parallel production build (`scripts/build-production.ts`)  
 - Benchmark scenarios + battery counters  
 - `setFeedURL` from package repo; CI mac yml/blockmap upload; CD `merge-latest-yml`  
-- AGENTS refresh, version 1.10.2, iWorkforces rehome  
+- AGENTS refresh, version 1.10.2, iworkforces rehome  
 
 ## Scope
 

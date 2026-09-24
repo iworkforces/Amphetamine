@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const mockGetPackageInfo = vi.hoisted(() =>
   vi.fn().mockReturnValue({
-    repository: "https://github.com/iWorkforces/Amphetamine",
+    repository: "https://github.com/iworkforces/Amphetamine",
   }),
 );
 
@@ -19,14 +19,14 @@ describe("auto-updater-utils", () => {
     vi.clearAllMocks();
     vi.resetModules();
     mockGetPackageInfo.mockReturnValue({
-      repository: "https://github.com/iWorkforces/Amphetamine",
+      repository: "https://github.com/iworkforces/Amphetamine",
     });
   });
 
   it("getReleaseUrlBase derives github releases tag base", async () => {
     const { getReleaseUrlBase } = await import("../../src/main/auto-updater-utils.js");
     expect(getReleaseUrlBase()).toBe(
-      "https://github.com/iWorkforces/Amphetamine/releases/tag/v",
+      "https://github.com/iworkforces/Amphetamine/releases/tag/v",
     );
   });
 
@@ -49,8 +49,8 @@ describe("auto-updater-utils", () => {
     const { parseGitHubRepoIdentity } = await import(
       "../../src/infrastructure/updater/auto-updater-utils.js"
     );
-    expect(parseGitHubRepoIdentity("https://github.com/iWorkforces/Amphetamine.git")).toEqual({
-      owner: "iWorkforces",
+    expect(parseGitHubRepoIdentity("https://github.com/iworkforces/Amphetamine.git")).toEqual({
+      owner: "iworkforces",
       repo: "Amphetamine",
     });
     expect(parseGitHubRepoIdentity("https://gitlab.com/org/repo")).toBeNull();

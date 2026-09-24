@@ -143,7 +143,7 @@ bun run clean                  # remove lib/dist outputs
 - Popover chips start a session only (do not write preference). Settings duration select starts **and** writes `defaultSessionDuration`.
 - Utility surfaces share `--utility-window-bg` (`#0D1117` only in `utility-tokens.css`). Fancy aurora bloom on `.icon-aurora` only; `bindIconAuroraStagePause` before any About await. Settings stays `icon-aurora--static`.
 - Settings/About/utility-dialog: **hide-on-close** warm cache; `*WantsVisible`; refcounted Dock via `utility-presentation`. Windows: taskbar + `titleBarOverlay`. About dismisses via system Close / Escape (no in-content OK).
-- Updater: injected `showUserDialog` → `presentUtilityDialog` (not `dialog.showMessageBox`). Info-only hides the OK row. Releases must publish `latest-mac.yml` + `latest.yml`. Repo: `iWorkforces/Amphetamine`.
+- Updater: injected `showUserDialog` → `presentUtilityDialog` (not `dialog.showMessageBox`). Info-only hides the OK row. Releases must publish `latest-mac.yml` + `latest.yml`. Repo: `iworkforces/Amphetamine`.
 - Utility-dialog private channels stay out of the public 16-name `IPC_CHANNELS` budget. `hardenWebContents` denies `window.open`; About allowlists the package GitHub repo via `shell.openExternal`.
 - Login items: darwin `openAsHidden: true`; win32 `openAtLogin` only. Sleep default `prevent-display-sleep`.
 - Develop CI: lint/test. **Beta** on `develop` publishes `vX.Y.Z-beta.N` (`prerelease: true`). Production CD is `workflow_run` on `main` only.

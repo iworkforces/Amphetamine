@@ -68,8 +68,8 @@ describe("renderer about", () => {
       productName: "Amphetamine",
       version: "1.10.5",
       description: "Keep awake",
-      repository: "https://github.com/iWorkforces/Amphetamine",
-      author: "iWorkforces Engineers",
+      repository: "https://github.com/iworkforces/Amphetamine",
+      author: "iworkforces Engineers",
     });
     Object.defineProperty(globalThis, "window", {
       value: {
@@ -111,7 +111,7 @@ describe("renderer about", () => {
     expect(document.getElementById("version")?.textContent).toBe("Version 1.10.5");
     expect(document.getElementById("description")?.textContent).toBe("Keep awake");
     expect(document.getElementById("copyright")?.textContent).toMatch(
-      /Copyright © \d{4} iWorkforces Engineers\. All rights reserved\./,
+      /Copyright © \d{4} iworkforces Engineers\. All rights reserved\./,
     );
     expect(document.title).toBe("About Amphetamine");
   });
@@ -133,7 +133,7 @@ describe("renderer about", () => {
 
     document.getElementById("app-icon")?.click();
     expect(mockOpen).toHaveBeenCalledWith(
-      "https://github.com/iWorkforces/Amphetamine",
+      "https://github.com/iworkforces/Amphetamine",
       "_blank",
       "noopener,noreferrer",
     );

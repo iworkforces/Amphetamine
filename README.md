@@ -4,7 +4,7 @@ A tray app that keeps your computer awake on **macOS** and **Windows**. Lives in
 
 > **One principle:** Do one thing and do it best.
 
-**Current version:** 1.11.0 · **Repo:** [iWorkforces/Amphetamine](https://github.com/iWorkforces/Amphetamine)
+**Current version:** 1.11.0 · **Repo:** [iworkforces/Amphetamine](https://github.com/iworkforces/Amphetamine)
 
 ## Features
 
@@ -133,7 +133,7 @@ Installs deps, builds, packages, Developer ID-signs when available (else ad-hoc)
 | Fuses | Applied in **`afterPack`** (fail-closed for darwin/win32) on the unpacked app **before** DMG/ZIP/NSIS. Strip/locale (arm64 mac) runs first; fuse flip last. Local `package*` scripts also re-flip leftover unpacked dirs. Disables RunAsNode / inspect / `NODE_OPTIONS`; enables ASAR integrity + cookie encryption |
 | macOS targets | DMG (`ULFO`) + ZIP; minimum macOS 11; arm64 and x64 |
 | Windows targets | NSIS (custom install dir) + portable; **x64 and arm64**; Start Menu shortcut, no desktop shortcut by default |
-| Updates | GitHub Releases (`iWorkforces/Amphetamine`); feeds `latest-mac.yml` / `latest.yml` (multi-arch assets + blockmaps) when published |
+| Updates | GitHub Releases (`iworkforces/Amphetamine`); feeds `latest-mac.yml` / `latest.yml` (multi-arch assets + blockmaps) when published |
 
 ### CI / CD / Beta
 
@@ -258,4 +258,4 @@ Questions or issues? [chitrung09t2@gmail.com](mailto:chitrung09t2@gmail.com).
 
 ## License
 
-[MIT](LICENSE) · Copyright (c) 2026 iWorkforces
+[MIT](LICENSE) · Copyright (c) 2026 iworkforces

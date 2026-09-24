@@ -66,7 +66,7 @@ vi.mock("../../src/main/utils/packageInfo.js", () => ({
     productName: "Amphetamine",
     version: "1.0.0",
     description: "Keep awake",
-    repository: "https://github.com/iWorkforces/Amphetamine",
+    repository: "https://github.com/iworkforces/Amphetamine",
     author: "Test",
   }),
 }));
@@ -233,7 +233,7 @@ describe("ipc-handlers", () => {
         productName: "Amphetamine",
         version: "1.0.0",
         description: "Keep awake",
-        repository: "https://github.com/iWorkforces/Amphetamine",
+        repository: "https://github.com/iworkforces/Amphetamine",
         author: "Test",
       });
     });
