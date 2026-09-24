@@ -1,5 +1,5 @@
 import "./styles.css";
-import type { AppSettings } from "../../shared/types.js";
+import type { AppSettings, SessionStatusResponse } from "../../shared/types.js";
 import { DEFAULT_SETTINGS } from "../../shared/types.js";
 import {
   DESC_ACTIVATE_FOR,
@@ -45,26 +45,59 @@ import {
 } from "./constants.js";
 
 const heroIcon = new URL("../../assets/settings-hero-icon.png", import.meta.url).toString();
+const DEFAULT_SHORTCUT = "CommandOrControl+Shift+A";
 
-let settings: AppSettings = { ...DEFAULT_SETTINGS };
-/** Duration from an actively-running session; overrides stored defaultSessionDuration in the UI. Cleared when the user explicitly picks a new duration. */
-let runningSessionDuration: number | null = null;
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
-let errorMessage: string | null = null;
-let isSaving = false;
-let pendingSaveIndicatorId: string | null = null;
-/** Accumulated partial for debounced / coalesced disk writes (not full snapshot). */
+const SETTINGS_KEYS = [
+  "launchAtLogin",
+  "preventSleep",
+  "defaultSessionDuration",
+  "batteryThreshold",
+  "shortcut",
+  "sleepBlockMode",
+] as const satisfies readonly (keyof AppSettings)[];
+
+let confirmedSettings: AppSettings = { ...DEFAULT_SETTINGS };
+let sessionStatus: SessionStatusResponse | null = null;
+let inFlightPartial: Partial<AppSettings> = {};
 let pendingPartial: Partial<AppSettings> = {};
+let pendingIndicators: Partial<Record<keyof AppSettings, string>> = {};
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+let openAnimationTimer: ReturnType<typeof setTimeout> | null = null;
+const animationFrames = new Set<number>();
+const rejectedSaveKeys = new Set<string>();
+const writeSaveErrors = new Map<keyof AppSettings, string>();
+let sessionErrorMessage: string | null = null;
+let shortcutErrorMessage: string | null = null;
+let isSaving = false;
+let pendingReady = false;
+let disposed = false;
+let settingsPushVersion = 0;
+const keyPushVersions: Partial<Record<keyof AppSettings, number>> = {};
+let sessionPushVersion = 0;
+let sessionStartVersion = 0;
+let pendingSessionDuration: number | null | undefined;
+let shortcutEdited = false;
 const saveIndicatorTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let isRecordingShortcut = false;
 let shortcutKeydownHandler: ((e: KeyboardEvent) => void) | null = null;
 
-window.addEventListener("beforeunload", () => {
-  for (const timer of saveIndicatorTimers.values()) {
-    clearTimeout(timer);
+function isActive(): boolean {
+  return !disposed;
+}
+
+function hasReadySave(): boolean {
+  return pendingReady;
+}
+
+function displayedSettings(): AppSettings {
+  const current = { ...confirmedSettings, ...inFlightPartial, ...pendingPartial };
+  if (pendingSessionDuration !== undefined) {
+    return { ...current, defaultSessionDuration: pendingSessionDuration };
   }
-  saveIndicatorTimers.clear();
-});
+  return sessionStatus?.isRunning
+    ? { ...current, defaultSessionDuration: sessionStatus.durationMinutes }
+    : current;
+}
 
 /** True when the settings window is running on Windows (preload platform snapshot). */
 function isWindowsUi(): boolean {
@@ -171,6 +204,7 @@ function toggleMarkup(
 
 /** Build the settings form HTML template (System Settings–style grouped lists). */
 function buildSettingsForm(): string {
+  const settings = displayedSettings();
   return `
     <div class="settings-titlebar">
       <span class="settings-title">${WINDOW_TITLE}</span>
@@ -287,7 +321,7 @@ function startRecordingShortcut(): void {
     const accelerator = keyEventToAccelerator(e);
     if (accelerator) {
       stopRecordingShortcut();
-      void saveSettings({ shortcut: accelerator }, "shortcut-save-indicator");
+      saveSettings({ shortcut: accelerator }, "shortcut-save-indicator");
     }
   };
   window.addEventListener("keydown", shortcutKeydownHandler, true);
@@ -303,7 +337,8 @@ function stopRecordingShortcut(): void {
   const btn = document.getElementById("shortcut-input") as HTMLButtonElement | null;
   if (btn) {
     btn.classList.remove("recording");
-    const display = formatAcceleratorForDisplay(settings.shortcut) || SHORTCUT_PLACEHOLDER;
+    const display =
+      formatAcceleratorForDisplay(displayedSettings().shortcut) || SHORTCUT_PLACEHOLDER;
     btn.textContent = display;
     btn.setAttribute("aria-pressed", "false");
     btn.setAttribute("aria-label", SHORTCUT_ARIA_LABEL);
@@ -321,6 +356,14 @@ function prefersReducedMotion(): boolean {
   }
 }
 
+function queueAnimationFrame(callback: () => void): void {
+  const frame = requestAnimationFrame(() => {
+    animationFrames.delete(frame);
+    if (!disposed) callback();
+  });
+  animationFrames.add(frame);
+}
+
 function startOpenAnimation(app: HTMLElement): void {
   if (prefersReducedMotion()) {
     app.classList.add("ready");
@@ -328,17 +371,22 @@ function startOpenAnimation(app: HTMLElement): void {
   }
   app.classList.add("pre-animate");
   const finish = (): void => {
+    if (openAnimationTimer !== null) {
+      clearTimeout(openAnimationTimer);
+      openAnimationTimer = null;
+    }
     app.classList.remove("pre-animate");
     app.classList.add("ready");
   };
   if (typeof requestAnimationFrame === "function") {
-    requestAnimationFrame(() => {
-      requestAnimationFrame(finish);
-    });
+    queueAnimationFrame(() => queueAnimationFrame(finish));
+    openAnimationTimer = setTimeout(() => {
+      openAnimationTimer = null;
+      if (!disposed) finish();
+    }, 500);
   } else {
     finish();
   }
-  window.setTimeout(finish, 500);
 }
 
 /** Attach change listeners to toggles and dropdown */
@@ -347,7 +395,7 @@ function attachFormListeners(): void {
   if (launchToggle) {
     launchToggle.addEventListener("change", () => {
       launchToggle.setAttribute("aria-checked", String(launchToggle.checked));
-      void saveSettings({ launchAtLogin: launchToggle.checked }, "launch-save-indicator");
+      saveSettings({ launchAtLogin: launchToggle.checked }, "launch-save-indicator");
     });
   }
 
@@ -355,7 +403,7 @@ function attachFormListeners(): void {
   if (sleepToggle) {
     sleepToggle.addEventListener("change", () => {
       sleepToggle.setAttribute("aria-checked", String(sleepToggle.checked));
-      void saveSettings({ preventSleep: sleepToggle.checked }, "sleep-save-indicator");
+      saveSettings({ preventSleep: sleepToggle.checked }, "sleep-save-indicator");
     });
   }
 
@@ -366,24 +414,31 @@ function attachFormListeners(): void {
     durationSelect.addEventListener("change", () => {
       const raw = durationSelect.value;
       const duration: number | null = raw === "" ? null : parseInt(raw, 10);
-      // User explicitly chose a new duration — stop overriding from running session
-      runningSessionDuration = null;
-      settings.defaultSessionDuration = duration;
+      const startVersion = ++sessionStartVersion;
+      pendingSessionDuration = duration;
+      setSessionErrorMessage(null);
       void (async () => {
         try {
           const resp = await window.api.session.start(duration);
+          if (disposed || startVersion !== sessionStartVersion) return;
           if (resp.ok) {
-            setErrorMessage(null);
+            setSessionErrorMessage(null);
           } else {
+            pendingSessionDuration = undefined;
+            updateSettingsUI();
             const message =
               resp.reason === "invalid-duration" ? ERROR_INVALID_DURATION : ERROR_START_SESSION;
-            setErrorMessage(message);
+            setSessionErrorMessage(message);
           }
         } catch {
-          setErrorMessage(ERROR_START_SESSION);
+          if (!disposed && startVersion === sessionStartVersion) {
+            pendingSessionDuration = undefined;
+            updateSettingsUI();
+            setSessionErrorMessage(ERROR_START_SESSION);
+          }
         }
       })();
-      void saveSettings({ defaultSessionDuration: duration }, "duration-save-indicator");
+      saveSettings({ defaultSessionDuration: duration }, "duration-save-indicator");
     });
   }
 
@@ -393,7 +448,7 @@ function attachFormListeners(): void {
   if (batterySelect) {
     batterySelect.addEventListener("change", () => {
       const parsed = parseInt(batterySelect.value, 10);
-      void saveSettings({ batteryThreshold: parsed }, "battery-save-indicator");
+      saveSettings({ batteryThreshold: parsed }, "battery-save-indicator");
     });
   }
 
@@ -404,7 +459,7 @@ function attachFormListeners(): void {
     sleepModeSelect.addEventListener("change", () => {
       const mode = sleepModeSelect.value;
       if (mode === "prevent-display-sleep" || mode === "prevent-app-suspension") {
-        void saveSettings({ sleepBlockMode: mode }, "sleep-mode-save-indicator");
+        saveSettings({ sleepBlockMode: mode }, "sleep-mode-save-indicator");
       }
     });
   }
@@ -415,12 +470,22 @@ function attachFormListeners(): void {
   }
 }
 
-function setErrorMessage(message: string | null): void {
-  errorMessage = message;
+function renderErrorMessage(): void {
+  if (disposed) return;
   const errorEl = document.getElementById("settings-error-text");
   if (errorEl) {
-    errorEl.textContent = message ?? "";
+    const saveErrorMessage =
+      writeSaveErrors.values().next().value ??
+      (rejectedSaveKeys.size > 0
+        ? `${ERROR_REJECTED_KEYS_PREFIX}: ${[...rejectedSaveKeys].join(", ")}`
+        : null);
+    errorEl.textContent = shortcutErrorMessage ?? sessionErrorMessage ?? saveErrorMessage ?? "";
   }
+}
+
+function setSessionErrorMessage(message: string | null): void {
+  sessionErrorMessage = message;
+  renderErrorMessage();
 }
 
 function render(): void {
@@ -433,17 +498,15 @@ function render(): void {
 
   app.innerHTML = buildSettingsForm();
 
-  // Set error message safely via textContent (prevents XSS)
-  const errorEl = document.getElementById("settings-error-text");
-  if (errorEl) {
-    errorEl.textContent = errorMessage ?? "";
-  }
+  renderErrorMessage();
 
   attachFormListeners();
   startOpenAnimation(app);
 }
 
-function updateSettingsUI(s: AppSettings): void {
+function updateSettingsUI(): void {
+  if (disposed) return;
+  const s = displayedSettings();
   const launchToggle = document.getElementById("launch-at-login-toggle") as HTMLInputElement | null;
   if (launchToggle) {
     launchToggle.checked = s.launchAtLogin;
@@ -460,7 +523,8 @@ function updateSettingsUI(s: AppSettings): void {
     "session-duration-select",
   ) as HTMLSelectElement | null;
   if (durationSelect) {
-    durationSelect.value = s.defaultSessionDuration === null ? "" : String(s.defaultSessionDuration);
+    durationSelect.value =
+      s.defaultSessionDuration === null ? "" : String(s.defaultSessionDuration);
   }
 
   const batterySelect = document.getElementById(
@@ -484,6 +548,7 @@ function updateSettingsUI(s: AppSettings): void {
 }
 
 function showSaveIndicator(id: string, text: string): void {
+  if (disposed) return;
   const indicator = document.getElementById(id);
   if (!indicator) return;
 
@@ -498,62 +563,99 @@ function showSaveIndicator(id: string, text: string): void {
   indicator.classList.add("visible");
 
   const timer = setTimeout(() => {
-    indicator.classList.remove("visible");
+    if (!disposed) indicator.classList.remove("visible");
     saveIndicatorTimers.delete(id);
   }, 1500);
   saveIndicatorTimers.set(id, timer);
 }
 
-async function flushSave(indicatorId: string): Promise<void> {
-  isSaving = true;
-  const toSend = { ...pendingPartial };
-  pendingPartial = {};
-  try {
-    if (Object.keys(toSend).length > 0) {
-      const res = await window.api.settings.set(toSend);
-      settings = res.settings;
-      updateSettingsUI(settings);
-      if (res.rejectedKeys.length > 0) {
-        setErrorMessage(`${ERROR_REJECTED_KEYS_PREFIX}: ${res.rejectedKeys.join(", ")}`);
-        return;
-      }
-    }
-    setErrorMessage(null);
-    showSaveIndicator(indicatorId, SAVED_INDICATOR);
-  } catch (err) {
-    // Re-queue failed keys so a later save can retry.
-    pendingPartial = { ...toSend, ...pendingPartial };
-    const message = err instanceof Error ? err.message : ERROR_SAVE_SETTINGS;
-    setErrorMessage(message);
-  } finally {
-    isSaving = false;
-    if (pendingSaveIndicatorId !== null) {
-      const nextId = pendingSaveIndicatorId;
-      pendingSaveIndicatorId = null;
-      void flushSave(nextId);
-    }
+function clearSaveIndicator(id: string): void {
+  const timer = saveIndicatorTimers.get(id);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+    saveIndicatorTimers.delete(id);
+  }
+  const indicator = document.getElementById(id);
+  if (indicator) {
+    indicator.textContent = "";
+    indicator.classList.remove("visible");
   }
 }
 
-async function saveSettings(
-  partial: Partial<AppSettings>,
-  indicatorId: string = "launch-save-indicator",
-): Promise<void> {
-  // Merge partial into settings immediately for UI responsiveness
-  settings = { ...settings, ...partial };
-  pendingPartial = { ...pendingPartial, ...partial };
+async function flushSave(): Promise<void> {
+  if (disposed || isSaving || !pendingReady || Object.keys(pendingPartial).length === 0) return;
+  isSaving = true;
+  const toSend = { ...pendingPartial };
+  const sentIndicators = { ...pendingIndicators };
+  pendingPartial = {};
+  pendingIndicators = {};
+  pendingReady = false;
+  inFlightPartial = toSend;
+  const savePushVersion = settingsPushVersion;
+  try {
+    const res = await window.api.settings.set(toSend);
+    if (!isActive()) return;
+    for (const key of SETTINGS_KEYS) {
+      if ((keyPushVersions[key] ?? 0) <= savePushVersion) {
+        confirmedSettings = { ...confirmedSettings, [key]: res.settings[key] };
+      }
+    }
+    inFlightPartial = {};
+    updateSettingsUI();
+    for (const key of SETTINGS_KEYS) {
+      if (!Object.hasOwn(toSend, key)) continue;
+      writeSaveErrors.delete(key);
+      if (res.rejectedKeys.includes(key)) continue;
+      rejectedSaveKeys.delete(key);
+      if (!Object.hasOwn(pendingPartial, key)) {
+        const indicatorId = sentIndicators[key];
+        if (indicatorId) showSaveIndicator(indicatorId, SAVED_INDICATOR);
+      }
+    }
+    for (const key of res.rejectedKeys) rejectedSaveKeys.add(key);
+    renderErrorMessage();
+  } catch (err) {
+    if (!isActive()) return;
+    pendingPartial = { ...toSend, ...pendingPartial };
+    pendingIndicators = { ...sentIndicators, ...pendingIndicators };
+    inFlightPartial = {};
+    updateSettingsUI();
+    const message = err instanceof Error ? err.message : ERROR_SAVE_SETTINGS;
+    for (const key of SETTINGS_KEYS) {
+      if (Object.hasOwn(toSend, key)) writeSaveErrors.set(key, message);
+    }
+    renderErrorMessage();
+  } finally {
+    isSaving = false;
+    if (isActive() && hasReadySave()) void flushSave();
+  }
+}
 
-  // Debounce the actual persistence. If a save is already in flight when the
-  // debounce fires, queue the latest partial to be persisted once it settles
-  // so user changes are never silently dropped.
-  if (saveTimer) clearTimeout(saveTimer);
+function saveSettings(partial: Partial<AppSettings>, indicatorId: string): void {
+  if (disposed) return;
+  pendingPartial = { ...pendingPartial, ...partial };
+  for (const key of SETTINGS_KEYS) {
+    if (Object.hasOwn(partial, key)) {
+      pendingIndicators[key] = indicatorId;
+      rejectedSaveKeys.delete(key);
+      writeSaveErrors.delete(key);
+    }
+  }
+  clearSaveIndicator(indicatorId);
+  if (Object.hasOwn(partial, "shortcut")) {
+    shortcutEdited = true;
+    shortcutErrorMessage = null;
+  }
+  updateSettingsUI();
+  renderErrorMessage();
+
+  if (saveTimer !== null) clearTimeout(saveTimer);
+  pendingReady = false;
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    if (isSaving) {
-      pendingSaveIndicatorId = indicatorId;
-      return;
-    }
-    void flushSave(indicatorId);
+    if (disposed) return;
+    pendingReady = true;
+    void flushSave();
   }, 300);
 }
 
@@ -570,64 +672,101 @@ function clearControlFocus(): void {
  * becomes visible again so Settings never lands on Launch at Login (or any control).
  */
 function onSettingsVisibilityChange(): void {
-  if (document.visibilityState !== "visible") {
+  if (disposed || document.visibilityState !== "visible") {
     return;
   }
   // Double rAF: run after Chromium's focus-restore on BrowserWindow.show().
-  requestAnimationFrame(() => {
-    requestAnimationFrame(clearControlFocus);
+  queueAnimationFrame(() => {
+    queueAnimationFrame(() => {
+      if (document.visibilityState === "visible") clearControlFocus();
+    });
   });
 }
 
 async function init(): Promise<void> {
-  try {
-    settings = await window.api.settings.get();
-  } catch {
-    // Keep DEFAULT_SETTINGS snapshot already in `settings`.
-  }
-
-  try {
-    const status = await window.api.session.getStatus();
-    if (!isSaving && status.isRunning) {
-      runningSessionDuration = status.durationMinutes;
-      settings = { ...settings, defaultSessionDuration: runningSessionDuration };
-    }
-  } catch {
-    // Session status is optional for the settings form.
-  }
-
-  render();
-
+  const settingsReadVersion = settingsPushVersion;
+  const statusReadVersion = sessionPushVersion;
   const cleanupSettings = window.api.onSettingsChanged((newSettings: AppSettings) => {
-    settings = newSettings;
-    // Prefer live session duration in the dropdown while a session is running.
-    if (runningSessionDuration !== null) {
-      settings = { ...settings, defaultSessionDuration: runningSessionDuration };
+    if (disposed) return;
+    settingsPushVersion++;
+    for (const key of SETTINGS_KEYS) {
+      if (newSettings[key] !== confirmedSettings[key]) {
+        keyPushVersions[key] = settingsPushVersion;
+      }
     }
-    updateSettingsUI(settings);
+    confirmedSettings = { ...newSettings };
+    updateSettingsUI();
   });
-
+  const cleanupSession = window.api.onSessionStatusUpdate((status) => {
+    if (disposed) return;
+    sessionPushVersion++;
+    if (
+      pendingSessionDuration !== undefined &&
+      (!status.isRunning || status.durationMinutes === pendingSessionDuration)
+    ) {
+      pendingSessionDuration = undefined;
+    }
+    sessionStatus = status;
+    updateSettingsUI();
+  });
   const cleanupShortcutFailed = window.api.onShortcutRegistrationFailed((data) => {
-    setErrorMessage(`${SHORTCUT_REGISTRATION_FAILED_PREFIX}: ${data.accelerator}`);
+    if (disposed) return;
+    if (shortcutEdited && data.accelerator !== (displayedSettings().shortcut || DEFAULT_SHORTCUT)) {
+      return;
+    }
+    shortcutErrorMessage = `${SHORTCUT_REGISTRATION_FAILED_PREFIX}: ${data.accelerator}`;
+    renderErrorMessage();
   });
 
-  document.addEventListener("visibilitychange", onSettingsVisibilityChange);
-
-  window.addEventListener("beforeunload", () => {
-    document.removeEventListener("visibilitychange", onSettingsVisibilityChange);
-    cleanupSettings();
-    cleanupShortcutFailed();
-  });
-
-  // Escape closes the utility window (parity with About / system dialogs).
-  window.addEventListener("keydown", (e: KeyboardEvent) => {
-    if (e.key === "Escape" && !isRecordingShortcut) {
+  function onEscape(e: KeyboardEvent): void {
+    if (!disposed && e.key === "Escape" && !isRecordingShortcut) {
       e.preventDefault();
       window.close();
     }
-  });
+  }
+
+  function dispose(): void {
+    if (disposed) return;
+    disposed = true;
+    cleanupSettings();
+    cleanupSession();
+    cleanupShortcutFailed();
+    document.removeEventListener("visibilitychange", onSettingsVisibilityChange);
+    window.removeEventListener("keydown", onEscape);
+    window.removeEventListener("beforeunload", dispose);
+    stopRecordingShortcut();
+    if (saveTimer !== null) clearTimeout(saveTimer);
+    if (openAnimationTimer !== null) clearTimeout(openAnimationTimer);
+    for (const timer of saveIndicatorTimers.values()) clearTimeout(timer);
+    saveIndicatorTimers.clear();
+    if (typeof cancelAnimationFrame === "function") {
+      for (const frame of animationFrames) cancelAnimationFrame(frame);
+    }
+    animationFrames.clear();
+  }
+
+  document.addEventListener("visibilitychange", onSettingsVisibilityChange);
+  window.addEventListener("keydown", onEscape);
+  window.addEventListener("beforeunload", dispose);
+
+  const initialSettings = await window.api.settings.get().catch(() => null);
+  if (!disposed && initialSettings && settingsPushVersion === settingsReadVersion) {
+    confirmedSettings = { ...initialSettings };
+  }
+  if (disposed) return;
+
+  const status = await window.api.session.getStatus().catch(() => null);
+  if (isActive() && sessionPushVersion === statusReadVersion) {
+    sessionStatus = status;
+  }
+  if (!isActive()) return;
+
+  render();
 }
 
-document.addEventListener("DOMContentLoaded", () => {
+function onDomReady(): void {
+  document.removeEventListener("DOMContentLoaded", onDomReady);
   void init();
-});
+}
+
+document.addEventListener("DOMContentLoaded", onDomReady);
