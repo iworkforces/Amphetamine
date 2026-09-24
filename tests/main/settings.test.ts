@@ -1,9 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { existsSync, readFileSync, mkdirSync, rmSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, readdirSync, mkdirSync, rmSync } from "fs";
 import { join } from "path";
 
 const fsMockState = vi.hoisted(() => ({
   failWriteFile: false,
+  failNextWriteFile: false,
+  pauseWriteFile: null as Promise<void> | null,
+  signalWriteStart: null as (() => void) | null,
   writeFileError: new Error("ENOSPC: no space left on device"),
 }));
 
@@ -14,7 +17,10 @@ vi.mock("node:fs/promises", async () => {
   return {
     ...actual,
     writeFile: vi.fn(async (...args: Parameters<typeof actual.writeFile>) => {
-      if (fsMockState.failWriteFile) {
+      fsMockState.signalWriteStart?.();
+      await fsMockState.pauseWriteFile;
+      if (fsMockState.failWriteFile || fsMockState.failNextWriteFile) {
+        fsMockState.failNextWriteFile = false;
         throw fsMockState.writeFileError;
       }
       return actual.writeFile(...args);
@@ -50,12 +56,17 @@ import {
   updateSettings,
 } from "../../src/main/settings.js";
 import { DEFAULT_SETTINGS } from "../../src/shared/types.js";
+import { createFileSettingsStore } from "../../src/infrastructure/settings/file-settings-store.js";
 
 describe("settings", () => {
   const settingsPath = join(MOCK_USER_DATA_PATH, "settings.json");
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    fsMockState.failWriteFile = false;
+    fsMockState.failNextWriteFile = false;
+    fsMockState.pauseWriteFile = null;
+    fsMockState.signalWriteStart = null;
 
     if (existsSync(MOCK_USER_DATA_PATH)) {
       rmSync(MOCK_USER_DATA_PATH, { recursive: true, force: true });
@@ -72,6 +83,19 @@ describe("settings", () => {
   });
 
   describe("initSettings", () => {
+    it("rejects access before the new store has loaded disk settings", async () => {
+      const freshSettings = createFileSettingsStore({
+        getUserDataPath: () => MOCK_USER_DATA_PATH,
+        onSaveFailure: { notifyPersistenceBroken: vi.fn() },
+        logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      });
+
+      expect(() => freshSettings.get()).toThrow(/before initSettings/);
+
+      await freshSettings.init();
+      expect(freshSettings.get()).toEqual(DEFAULT_SETTINGS);
+    });
+
     it("returns defaults when no file exists", async () => {
       if (existsSync(settingsPath)) {
         rmSync(settingsPath);
@@ -105,6 +129,61 @@ describe("settings", () => {
       const settings = getSettings();
 
       expect(settings).toEqual(DEFAULT_SETTINGS);
+    });
+
+    it("backs up malformed JSON while continuing with defaults", async () => {
+      writeFileSync(settingsPath, "{broken");
+
+      await initSettings();
+
+      const backups = readdirSync(MOCK_USER_DATA_PATH).filter((name) =>
+        name.startsWith("settings.json.corrupt-"),
+      );
+      expect(backups).toHaveLength(1);
+      expect(readFileSync(join(MOCK_USER_DATA_PATH, backups[0] ?? ""), "utf-8")).toBe("{broken");
+      expect(existsSync(settingsPath)).toBe(false);
+      expect(getSettings()).toEqual(DEFAULT_SETTINGS);
+    });
+
+    it("uses defaults and reports a read error other than a missing file", async () => {
+      mkdirSync(settingsPath);
+
+      await initSettings();
+
+      expect(getSettings()).toEqual(DEFAULT_SETTINGS);
+      expect(log.error).toHaveBeenCalledWith(
+        "[settings] Failed to read settings file:",
+        expect.objectContaining({ code: "EISDIR" }),
+      );
+    });
+
+    it.each(["null", "[]", "42"])("treats JSON %s as an empty settings record", async (raw) => {
+      writeFileSync(settingsPath, raw);
+
+      await initSettings();
+
+      expect(getSettings()).toEqual(DEFAULT_SETTINGS);
+      expect(readFileSync(settingsPath, "utf-8")).toBe(raw);
+    });
+
+    it("validates disk fields independently while migrating a legacy session duration", async () => {
+      writeFileSync(
+        settingsPath,
+        JSON.stringify({
+          launchAtLogin: true,
+          batteryThreshold: 150,
+          sessionDuration: 45,
+          shortcut: "Cmd+Q",
+        }),
+      );
+
+      await initSettings();
+
+      expect(getSettings()).toEqual({
+        ...DEFAULT_SETTINGS,
+        launchAtLogin: true,
+        defaultSessionDuration: 45,
+      });
     });
   });
 
@@ -424,6 +503,39 @@ describe("settings", () => {
       await expect(_settings.updateSettings({ defaultSessionDuration: 150 })).rejects.toThrow();
 
       expect(dialog.showErrorBox).not.toHaveBeenCalled();
+    });
+
+    it("rejects a failed active write but persists the later merged pending batch", async () => {
+      let releaseWrite: () => void = () => {};
+      const blockedWrite = new Promise<void>((resolve) => {
+        releaseWrite = resolve;
+      });
+      let signalStarted: () => void = () => {};
+      const writeStarted = new Promise<void>((resolve) => {
+        signalStarted = resolve;
+      });
+      fsMockState.pauseWriteFile = blockedWrite;
+      fsMockState.signalWriteStart = signalStarted;
+      fsMockState.failNextWriteFile = true;
+
+      const failed = _settings.updateSettings({ defaultSessionDuration: 30 });
+      const failedAssertion = expect(failed).rejects.toThrow(/ENOSPC/);
+      await writeStarted;
+
+      const valid = _settings.updateSettings({ launchAtLogin: true, batteryThreshold: 150 });
+      const latest = _settings.updateSettings({ batteryThreshold: 20 });
+      releaseWrite();
+      fsMockState.pauseWriteFile = null;
+
+      await failedAssertion;
+      const [firstPending, lastPending] = await Promise.all([valid, latest]);
+      expect(firstPending.rejectedKeys).toEqual(["batteryThreshold"]);
+      expect(lastPending.rejectedKeys).toEqual([]);
+      const expected = { ...DEFAULT_SETTINGS, launchAtLogin: true, batteryThreshold: 20 };
+      expect(firstPending.settings).toEqual(expected);
+      expect(lastPending.settings).toEqual(expected);
+      expect(_settings.getSettings()).toEqual(expected);
+      expect(JSON.parse(readFileSync(settingsPath, "utf-8"))).toEqual(expected);
     });
   });
 

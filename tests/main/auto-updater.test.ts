@@ -17,6 +17,7 @@ const mockDownloadUpdate = vi.hoisted(() => vi.fn().mockResolvedValue(undefined)
 const mockQuitAndInstall = vi.hoisted(() => vi.fn());
 const mockGetAllWindows = vi.hoisted(() => vi.fn().mockReturnValue([]));
 const mockIpcMainHandle = vi.hoisted(() => vi.fn());
+const mockGetAppPath = vi.hoisted(() => vi.fn().mockReturnValue("/path/to/app.asar"));
 const mockLogInfo = vi.hoisted(() => vi.fn());
 const mockLogError = vi.hoisted(() => vi.fn());
 const mockLogWarn = vi.hoisted(() => vi.fn());
@@ -55,7 +56,7 @@ vi.mock("electron-updater", () => ({
 vi.mock("electron", () => ({
   app: {
     isPackaged: true,
-    getAppPath: () => "/path/to/app.asar",
+    getAppPath: mockGetAppPath,
     focus: vi.fn(),
   },
   BrowserWindow: {
@@ -95,6 +96,7 @@ describe("auto-updater (hybrid infrastructure)", () => {
     vi.useFakeTimers();
 
     mockCheckForUpdates.mockResolvedValue(null);
+    mockGetAppPath.mockReturnValue("/path/to/app.asar");
     mockDownloadUpdate.mockResolvedValue(undefined);
     mockGetAllWindows.mockReturnValue([]);
     mockShowUserDialog.mockResolvedValue({ response: 1, checkboxChecked: false });
@@ -655,8 +657,43 @@ describe("auto-updater (hybrid infrastructure)", () => {
       const result = await handler({
         senderFrame: { parent: null, url: "file:///path/to/app.asar/lib/renderer/index.html" },
       });
-      // validateSender may fail depending on path; still should not throw
-      expect(result === null || typeof result === "object").toBe(true);
+      expect(result).toBeNull();
+      expect(mockCheckForUpdates).toHaveBeenCalledTimes(1);
+    });
+
+    it("accepts a packaged Windows renderer sender with spaces in its path", async () => {
+      mockGetAppPath.mockReturnValue("C:\\Program Files\\Amphetamine\\resources\\app.asar");
+      mockCheckForUpdates.mockResolvedValueOnce({
+        updateInfo: { version: "2.0.0", releaseDate: "2026-01-01" },
+      });
+      registerAutoUpdaterIpc();
+      const handler = mockIpcMainHandle.mock.calls.find(
+        (call) => call[0] === "auto-updater:check",
+      )![1] as (event: unknown) => Promise<unknown>;
+
+      const result = await handler({
+        senderFrame: {
+          parent: null,
+          url: "file:///C:/Program%20Files/Amphetamine/resources/app.asar/lib/renderer/index.html",
+        },
+      });
+
+      expect(result).toEqual({ version: "2.0.0", releaseDate: "2026-01-01" });
+      expect(mockCheckForUpdates).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects a forbidden sender without checking for updates", async () => {
+      registerAutoUpdaterIpc();
+      const handler = mockIpcMainHandle.mock.calls.find(
+        (call) => call[0] === "auto-updater:check",
+      )![1] as (event: unknown) => Promise<unknown>;
+
+      const result = await handler({
+        senderFrame: { parent: null, url: "https://evil.example/index.html" },
+      });
+
+      expect(result).toBeNull();
+      expect(mockCheckForUpdates).not.toHaveBeenCalled();
     });
   });
 

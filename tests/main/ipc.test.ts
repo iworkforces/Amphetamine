@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { afterEach } from "vitest";
 import { IPC_CHANNELS, DEFAULT_SETTINGS } from "../../src/shared/types.js";
 import type { IpcMainInvokeEvent, IpcMainEvent } from "electron";
 import { validateSender } from "../../src/main/ipc.js";
@@ -109,6 +110,7 @@ const {
   mockStartSession,
   mockCancelSession,
   mockGetStatus,
+  mockGetPackageInfo,
 } = vi.hoisted(() => ({
   mockGetSettings: vi.fn(),
   mockUpdateSettings: vi.fn(),
@@ -117,6 +119,11 @@ const {
   mockStartSession: vi.fn(),
   mockCancelSession: vi.fn(),
   mockGetStatus: vi.fn(),
+  mockGetPackageInfo: vi.fn(),
+}));
+
+vi.mock("../../src/main/utils/packageInfo.js", () => ({
+  getPackageInfo: mockGetPackageInfo,
 }));
 
 vi.mock("../../src/main/settings.js", () => ({
@@ -174,6 +181,7 @@ describe("ipc additional coverage", () => {
 
     const electron = await import("electron");
     vi.mocked(electron.app.getAppPath).mockReturnValue("/path/to/app.asar");
+    vi.mocked(electron.app.getVersion).mockReturnValue("1.0.0");
     vi.mocked(electron.app.quit).mockClear();
     appQuitMock = vi.mocked(electron.app.quit) as unknown as ReturnType<typeof vi.fn>;
 
@@ -194,6 +202,12 @@ describe("ipc additional coverage", () => {
       expiresAt: null,
       remainingSeconds: null,
       durationMinutes: null,
+    });
+    mockGetPackageInfo.mockReturnValue({
+      productName: "Amphetamine",
+      description: "Keep awake",
+      repository: "https://github.com/iWorkforces/Amphetamine",
+      author: "Test Author",
     });
 
     registeredHandlers = new Map();
@@ -232,6 +246,243 @@ describe("ipc additional coverage", () => {
       const handler = registeredHandlers.get(IPC_CHANNELS.WINDOW_SET_HEIGHT);
       handler!(invalidEvent, 320);
       expect(mockWindow.setSize).not.toHaveBeenCalled();
+    });
+
+    it("coalesces a burst for 16ms and uses the latest valid height", async () => {
+      vi.useFakeTimers();
+      try {
+        const mockWindow = { setSize: vi.fn() };
+        registerIpcHandlers(mockWindow, makeIpcDeps());
+        const handler = registeredHandlers.get(IPC_CHANNELS.WINDOW_SET_HEIGHT);
+        expect(handler).toBeDefined();
+
+        handler?.(validEvent, 290);
+        await vi.advanceTimersByTimeAsync(8);
+        handler?.(validEvent, 365);
+        handler?.(invalidEvent, 470);
+        handler?.(validEvent, 0);
+        await vi.advanceTimersByTimeAsync(7);
+        expect(mockWindow.setSize).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(1);
+        expect(mockWindow.setSize).toHaveBeenCalledExactlyOnceWith(360, 365, false);
+
+        handler?.(validEvent, 410);
+        await vi.advanceTimersByTimeAsync(16);
+        expect(mockWindow.setSize).toHaveBeenNthCalledWith(2, 360, 410, false);
+        expect(mockWindow.setSize).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it.each([
+      { firstHeight: 300, latestHeight: 100, expectedHeight: 220 },
+      { firstHeight: 300, latestHeight: 1000, expectedHeight: 480 },
+    ])("clamps the latest height in a coalesced burst to $expectedHeight", async ({
+      firstHeight,
+      latestHeight,
+      expectedHeight,
+    }) => {
+      vi.useFakeTimers();
+      try {
+        const mockWindow = { setSize: vi.fn() };
+        registerIpcHandlers(mockWindow, makeIpcDeps());
+        const handler = registeredHandlers.get(IPC_CHANNELS.WINDOW_SET_HEIGHT);
+        expect(handler).toBeDefined();
+
+        handler?.(validEvent, firstHeight);
+        handler?.(validEvent, latestHeight);
+        await vi.advanceTimersByTimeAsync(16);
+
+        expect(mockWindow.setSize).toHaveBeenCalledExactlyOnceWith(360, expectedHeight, false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it.each(["320", 320.5, Number.NaN])("ignores invalid height %s", async (height) => {
+      vi.useFakeTimers();
+      try {
+        const mockWindow = { setSize: vi.fn() };
+        registerIpcHandlers(mockWindow, makeIpcDeps());
+        const handler = registeredHandlers.get(IPC_CHANNELS.WINDOW_SET_HEIGHT);
+        expect(handler).toBeDefined();
+
+        handler?.(validEvent, height);
+        await vi.advanceTimersByTimeAsync(16);
+
+        expect(mockWindow.setSize).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe("app information handlers", () => {
+    it("returns the live app version for an allowed sender", async () => {
+      const electron = await import("electron");
+      vi.mocked(electron.app.getVersion).mockReturnValue("9.8.7");
+      registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+
+      const result = registeredHandlers.get(IPC_CHANNELS.APP_GET_VERSION)?.(validEvent);
+
+      expect(result).toBe("9.8.7");
+    });
+
+    it("returns an empty version without reading the app version for a rejected sender", async () => {
+      const electron = await import("electron");
+      registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+
+      const result = registeredHandlers.get(IPC_CHANNELS.APP_GET_VERSION)?.(invalidEvent);
+
+      expect(result).toBe("");
+      expect(electron.app.getVersion).not.toHaveBeenCalled();
+    });
+
+    it("returns package metadata with the live app version for an allowed sender", async () => {
+      const electron = await import("electron");
+      vi.mocked(electron.app.getVersion).mockReturnValue("9.8.7");
+      registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+
+      const result = registeredHandlers.get(IPC_CHANNELS.APP_GET_ABOUT)?.(validEvent);
+
+      expect(result).toEqual({
+        productName: "Amphetamine",
+        version: "9.8.7",
+        description: "Keep awake",
+        repository: "https://github.com/iWorkforces/Amphetamine",
+        author: "Test Author",
+      });
+      expect(mockGetPackageInfo).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns blank about fields without reading package metadata for a rejected sender", async () => {
+      const electron = await import("electron");
+      registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+
+      const result = registeredHandlers.get(IPC_CHANNELS.APP_GET_ABOUT)?.(invalidEvent);
+
+      expect(result).toEqual({
+        productName: "",
+        version: "",
+        description: "",
+        repository: "",
+        author: "",
+      });
+      expect(electron.app.getVersion).not.toHaveBeenCalled();
+      expect(mockGetPackageInfo).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("settings handlers", () => {
+    it("returns current settings for an allowed sender", () => {
+      const settings = { ...DEFAULT_SETTINGS, preventSleep: true, batteryThreshold: 35 };
+      mockGetSettings.mockReturnValue(settings);
+      registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+
+      const result = registeredHandlers.get(IPC_CHANNELS.SETTINGS_GET)?.(validEvent);
+
+      expect(result).toEqual(settings);
+      expect(mockGetSettings).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns defaults instead of private settings for a rejected sender", () => {
+      mockGetSettings.mockReturnValue({ ...DEFAULT_SETTINGS, preventSleep: true });
+      registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+
+      const result = registeredHandlers.get(IPC_CHANNELS.SETTINGS_GET)?.(invalidEvent);
+
+      expect(result).toEqual(DEFAULT_SETTINGS);
+      expect(mockGetSettings).not.toHaveBeenCalled();
+    });
+
+    it("returns the persisted settings and rejected keys from an allowed update", async () => {
+      const partial = { preventSleep: true, batteryThreshold: 35 };
+      const response = {
+        settings: { ...DEFAULT_SETTINGS, preventSleep: true },
+        rejectedKeys: ["batteryThreshold"],
+      };
+      mockUpdateSettings.mockResolvedValue(response);
+      registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+
+      const result = await registeredHandlers.get(IPC_CHANNELS.SETTINGS_SET)?.(validEvent, partial);
+
+      expect(mockUpdateSettings).toHaveBeenCalledWith(partial);
+      expect(result).toEqual(response);
+    });
+
+    it("does not persist a rejected update and returns current settings without rejected keys", async () => {
+      const settings = { ...DEFAULT_SETTINGS, preventSleep: true, batteryThreshold: 35 };
+      mockGetSettings.mockReturnValue(settings);
+      registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+
+      const result = await registeredHandlers.get(IPC_CHANNELS.SETTINGS_SET)?.(invalidEvent, {
+        preventSleep: false,
+      });
+
+      expect(result).toEqual({ settings, rejectedKeys: [] });
+      expect(mockUpdateSettings).not.toHaveBeenCalled();
+    });
+
+    it("opens settings for an allowed sender", async () => {
+      registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+
+      const result = await registeredHandlers.get(IPC_CHANNELS.SETTINGS_OPEN)?.(validEvent);
+
+      expect(result).toBeUndefined();
+      expect(mockCreateSettingsWindow).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not open settings for a rejected sender", async () => {
+      registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+
+      const result = await registeredHandlers.get(IPC_CHANNELS.SETTINGS_OPEN)?.(invalidEvent);
+
+      expect(result).toBeUndefined();
+      expect(mockCreateSettingsWindow).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("session cancel and rejected status", () => {
+    it("cancels an allowed session and acknowledges cancellation", async () => {
+      registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+
+      const result = await registeredHandlers.get(IPC_CHANNELS.SESSION_CANCEL)?.(validEvent);
+
+      expect(result).toEqual({ cancelled: true });
+      expect(mockCancelSession).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not cancel a session for a rejected sender", async () => {
+      registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+
+      const result = await registeredHandlers.get(IPC_CHANNELS.SESSION_CANCEL)?.(invalidEvent);
+
+      expect(result).toEqual({ cancelled: false });
+      expect(mockCancelSession).not.toHaveBeenCalled();
+    });
+
+    it("hides a running session from a rejected sender without reading its status", () => {
+      mockGetStatus.mockReturnValue({
+        isRunning: true,
+        startedAt: 1_700_000_000_000,
+        expiresAt: 1_700_000_060_000,
+        remainingSeconds: 42,
+        durationMinutes: 1,
+      });
+      registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+
+      const result = registeredHandlers.get(IPC_CHANNELS.SESSION_STATUS)?.(invalidEvent);
+
+      expect(result).toEqual({
+        isRunning: false,
+        startedAt: null,
+        expiresAt: null,
+        remainingSeconds: null,
+        durationMinutes: null,
+      });
+      expect(mockGetStatus).not.toHaveBeenCalled();
     });
   });
 
@@ -442,6 +693,114 @@ describe("ipc additional coverage", () => {
       const handler = registeredHandlers.get(IPC_CHANNELS.APP_QUIT);
       await handler!(traversalEvent);
       expect(appQuitMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("packaged Windows public IPC senders", () => {
+    const rendererRoot = "file:///C:/Program%20Files/Amphetamine/app.asar/lib/renderer/";
+
+    beforeEach(async () => {
+      const electron = await import("electron");
+      vi.mocked(electron.app.getAppPath).mockReturnValue("C:\\Program Files\\Amphetamine\\app.asar");
+      Object.defineProperty(electron.app, "isPackaged", { configurable: true, value: true });
+      vi.resetModules();
+      const mod = await import("../../src/main/ipc.js");
+      registerIpcHandlers = mod.registerIpcHandlers as unknown as typeof registerIpcHandlers;
+      registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+    });
+
+    afterEach(async () => {
+      const electron = await import("electron");
+      Object.defineProperty(electron.app, "isPackaged", { configurable: true, value: false });
+    });
+
+    it("returns the app version from the packaged index main frame", () => {
+      const event = { senderFrame: { url: `${rendererRoot}index.html`, parent: null } };
+
+      const result = registeredHandlers.get(IPC_CHANNELS.APP_GET_VERSION)?.(event);
+
+      expect(result).toBe("1.0.0");
+    });
+
+    it("returns settings from the packaged settings main frame", () => {
+      const settings = { ...DEFAULT_SETTINGS, preventSleep: true };
+      mockGetSettings.mockReturnValue(settings);
+      const event = { senderFrame: { url: `${rendererRoot}settings.html`, parent: null } };
+
+      const result = registeredHandlers.get(IPC_CHANNELS.SETTINGS_GET)?.(event);
+
+      expect(result).toEqual(settings);
+      expect(mockGetSettings).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns about metadata from the packaged about main frame", () => {
+      const event = { senderFrame: { url: `${rendererRoot}about.html`, parent: null } };
+
+      const result = registeredHandlers.get(IPC_CHANNELS.APP_GET_ABOUT)?.(event);
+
+      expect(result).toEqual({
+        productName: "Amphetamine",
+        version: "1.0.0",
+        description: "Keep awake",
+        repository: "https://github.com/iWorkforces/Amphetamine",
+        author: "Test Author",
+      });
+      expect(mockGetPackageInfo).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ["outside bundle", "file:///C:/Other/Amphetamine/app.asar/lib/renderer/index.html"],
+      ["similar bundle prefix", "file:///C:/Program%20Files/Amphetamine/app.asar.evil/lib/renderer/index.html"],
+      ["unlisted renderer", `${rendererRoot}utility-dialog.html`],
+      ["traversal", `${rendererRoot}../../index.html`],
+      ["malformed escape", `${rendererRoot}index%ZZ.html`],
+      ["UNC host", "file://server/C:/Program%20Files/Amphetamine/app.asar/lib/renderer/index.html"],
+    ])("rejects %s through the registered version handler", (_reason, url) => {
+      const event = { senderFrame: { url, parent: null } };
+
+      const result = registeredHandlers.get(IPC_CHANNELS.APP_GET_VERSION)?.(event);
+
+      expect(result).toBe("");
+    });
+
+    it("rejects a child frame even when its URL is allowlisted", () => {
+      const event = {
+        senderFrame: { url: `${rendererRoot}index.html`, parent: { url: `${rendererRoot}index.html` } },
+      };
+
+      const result = registeredHandlers.get(IPC_CHANNELS.APP_GET_VERSION)?.(event);
+
+      expect(result).toBe("");
+    });
+
+    it("rejects a missing sender frame", () => {
+      const event = { senderFrame: undefined };
+
+      const result = registeredHandlers.get(IPC_CHANNELS.APP_GET_VERSION)?.(event);
+
+      expect(result).toBe("");
+    });
+
+    it("rejects the dev HTTP origin in a packaged build", () => {
+      const event = { senderFrame: { url: "http://localhost:5173/index.html", parent: null } };
+
+      const result = registeredHandlers.get(IPC_CHANNELS.APP_GET_VERSION)?.(event);
+
+      expect(result).toBe("");
+    });
+
+    it("allows the dev HTTP origin in an unpackaged build", async () => {
+      const electron = await import("electron");
+      Object.defineProperty(electron.app, "isPackaged", { configurable: true, value: false });
+      vi.resetModules();
+      const mod = await import("../../src/main/ipc.js");
+      registerIpcHandlers = mod.registerIpcHandlers as unknown as typeof registerIpcHandlers;
+      registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+      const event = { senderFrame: { url: "http://localhost:5173/index.html", parent: null } };
+
+      const result = registeredHandlers.get(IPC_CHANNELS.APP_GET_VERSION)?.(event);
+
+      expect(result).toBe("1.0.0");
     });
   });
 });

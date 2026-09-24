@@ -1,18 +1,23 @@
 import { ipcMain, app, type IpcMainEvent, type IpcMainInvokeEvent } from "electron/main";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import log from "electron-log";
 import { type IpcChannelMap } from "../shared/types.js";
 import { DEV_ORIGINS } from "./constants.js";
 
 let _cachedAppPath: string | null = null;
 let _allowedFilePaths: ReadonlySet<string> | null = null;
+let _windowsAppPath = false;
 function getAllowedFilePaths(): ReadonlySet<string> {
   if (_allowedFilePaths === null) {
-    _cachedAppPath = path.resolve(app.getAppPath());
+    const appPath = app.getAppPath();
+    _windowsAppPath = /^[A-Za-z]:[\\/]/.test(appPath);
+    const pathForApp = _windowsAppPath ? path.win32 : path.posix;
+    _cachedAppPath = pathForApp.resolve(appPath);
     _allowedFilePaths = new Set([
-      path.join(_cachedAppPath, "lib", "renderer", "index.html").normalize("NFC"),
-      path.join(_cachedAppPath, "lib", "renderer", "settings.html").normalize("NFC"),
-      path.join(_cachedAppPath, "lib", "renderer", "about.html").normalize("NFC"),
+      pathForApp.join(_cachedAppPath, "lib", "renderer", "index.html").normalize("NFC"),
+      pathForApp.join(_cachedAppPath, "lib", "renderer", "settings.html").normalize("NFC"),
+      pathForApp.join(_cachedAppPath, "lib", "renderer", "about.html").normalize("NFC"),
     ]);
   }
   return _allowedFilePaths;
@@ -45,13 +50,14 @@ export function validateSenderUrl(senderUrl: string): boolean {
     }
     // file:// origin check (packaged app) - exact path match within app bundle
     if (url.protocol === "file:") {
-      let urlPath: string;
+      if (url.host !== "") return false;
+      const allowedPaths = getAllowedFilePaths();
       try {
-        urlPath = path.resolve(decodeURIComponent(url.pathname)).normalize("NFC");
+        const urlPath = fileURLToPath(url, { windows: _windowsAppPath }).normalize("NFC");
+        return allowedPaths.has(urlPath);
       } catch {
         return false;
       }
-      return getAllowedFilePaths().has(urlPath);
     }
     return false;
   } catch {

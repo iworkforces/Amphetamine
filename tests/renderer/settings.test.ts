@@ -1,14 +1,22 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import type { AppSettings, SessionStatusResponse } from "../../src/shared/types.js";
+import type {
+  AppSettings,
+  IpcResponse,
+  IPC_CHANNELS,
+  SessionStartResponse,
+  SessionStatusResponse,
+} from "../../src/shared/types.js";
 import { asPerf, DEFAULT_SETTINGS } from "../../src/shared/types.js";
 import { SAVED_INDICATOR } from "../../src/renderer/settings/constants.js";
+
+type SettingsSetResponse = IpcResponse<typeof IPC_CHANNELS.SETTINGS_SET>;
 
 const mockApi = {
   window: { setHeight: vi.fn() },
   app: { getVersion: vi.fn().mockResolvedValue("1.0.0"), quit: vi.fn() },
   settings: {
     get: vi.fn<() => Promise<AppSettings>>(),
-    set: vi.fn(),
+    set: vi.fn<(_partial: Partial<AppSettings>) => Promise<SettingsSetResponse>>(),
     open: vi.fn(),
   },
   session: {
@@ -19,7 +27,9 @@ const mockApi = {
   onSettingsChanged: vi.fn<(_cb: (s: AppSettings) => void) => () => void>(() => vi.fn()),
   onShortcutRegistrationFailed: vi.fn<(_cb: (d: { accelerator: string }) => void) => () => void>(() => vi.fn()),
   onWindowHide: vi.fn(() => vi.fn()),
-  onSessionStatusUpdate: vi.fn(() => vi.fn()),
+  onSessionStatusUpdate: vi.fn<(_cb: (status: SessionStatusResponse) => void) => () => void>(
+    () => vi.fn(),
+  ),
   autoUpdater: {
     checkForUpdates: vi.fn(),
     onStatus: vi.fn(() => vi.fn()),
@@ -47,6 +57,34 @@ describe("renderer settings", () => {
     preventSleep: false,
     defaultSessionDuration: null,
   };
+  const idleStatus: SessionStatusResponse = {
+    isRunning: false,
+    startedAt: null,
+    expiresAt: null,
+    remainingSeconds: null,
+    durationMinutes: null,
+  };
+
+  function accepted(settings: AppSettings): SettingsSetResponse {
+    return { settings, rejectedKeys: [] };
+  }
+
+  async function startCurrentSettingsEntry(): Promise<void> {
+    vi.resetModules();
+    const addListener = vi.spyOn(document, "addEventListener");
+    await import("../../src/renderer/settings/index.js");
+    const ready = addListener.mock.calls.find(([eventName]) => eventName === "DOMContentLoaded")?.[1];
+    addListener.mockRestore();
+    if (typeof ready !== "function") throw new Error("Settings entry did not register for DOM ready");
+    document.removeEventListener("DOMContentLoaded", ready);
+    ready.call(document, new Event("DOMContentLoaded"));
+  }
+
+  async function mountSettings(): Promise<void> {
+    mockApi.session.getStatus.mockResolvedValue(idleStatus);
+    await startCurrentSettingsEntry();
+    await vi.advanceTimersByTimeAsync(0);
+  }
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -566,7 +604,7 @@ describe("renderer settings", () => {
             if (callCount === 1) {
               rejectors.push(() => reject(new Error("Disk full")));
             } else {
-              resolvers.push(() => resolve(s));
+              resolvers.push(() => resolve(accepted({ ...defaultSettings, ...s })));
             }
           }),
       );
@@ -596,6 +634,665 @@ describe("renderer settings", () => {
 
       resolvers[0]!();
       await vi.advanceTimersByTimeAsync(0);
+    });
+  });
+
+  describe("save reconciliation with renderer state", () => {
+    it("keeps a debounced local edit visible through a settings push while applying unrelated fields", async () => {
+      await mountSettings();
+
+      const sleepToggle = document.getElementById("prevent-sleep-toggle") as HTMLInputElement;
+      const batterySelect = document.getElementById("battery-threshold-select") as HTMLSelectElement;
+      sleepToggle.checked = true;
+      sleepToggle.dispatchEvent(new Event("change"));
+      expect(sleepToggle.checked).toBe(true);
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+
+      mockApi.onSettingsChanged.mock.calls.at(-1)![0]({
+        ...defaultSettings,
+        batteryThreshold: 10,
+      });
+      expect(batterySelect.value).toBe("10");
+      expect(sleepToggle.checked).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(299);
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(mockApi.settings.set).toHaveBeenCalledExactlyOnceWith({ preventSleep: true });
+    });
+
+    it("does not repaint a newer same-key edit with an older save response", async () => {
+      const firstSave = Promise.withResolvers<SettingsSetResponse>();
+      mockApi.settings.set.mockImplementationOnce(() => firstSave.promise);
+      await mountSettings();
+
+      const batterySelect = document.getElementById("battery-threshold-select") as HTMLSelectElement;
+      batterySelect.value = "10";
+      batterySelect.dispatchEvent(new Event("change"));
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenCalledExactlyOnceWith({ batteryThreshold: 10 });
+
+      batterySelect.value = "20";
+      batterySelect.dispatchEvent(new Event("change"));
+      expect(batterySelect.value).toBe("20");
+      firstSave.resolve(accepted({ ...defaultSettings, batteryThreshold: 10 }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(batterySelect.value).toBe("20");
+
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenNthCalledWith(2, { batteryThreshold: 20 });
+    });
+
+    it("retains an unrelated authoritative push after an older save acknowledges", async () => {
+      const firstSave = Promise.withResolvers<SettingsSetResponse>();
+      mockApi.settings.set.mockImplementationOnce(() => firstSave.promise);
+      await mountSettings();
+
+      const launchToggle = document.getElementById("launch-at-login-toggle") as HTMLInputElement;
+      launchToggle.checked = true;
+      launchToggle.dispatchEvent(new Event("change"));
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenCalledExactlyOnceWith({ launchAtLogin: true });
+
+      mockApi.onSettingsChanged.mock.calls.at(-1)![0]({
+        ...defaultSettings,
+        launchAtLogin: true,
+        preventSleep: true,
+        batteryThreshold: 10,
+      });
+      expect((document.getElementById("prevent-sleep-toggle") as HTMLInputElement).checked).toBe(true);
+      expect((document.getElementById("battery-threshold-select") as HTMLSelectElement).value).toBe("10");
+
+      firstSave.resolve(accepted({ ...defaultSettings, launchAtLogin: true }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(launchToggle.checked).toBe(true);
+      expect((document.getElementById("prevent-sleep-toggle") as HTMLInputElement).checked).toBe(true);
+      expect((document.getElementById("battery-threshold-select") as HTMLSelectElement).value).toBe("10");
+    });
+
+    it("applies an unrelated duration preference returned only in a successful partial save", async () => {
+      const save = Promise.withResolvers<SettingsSetResponse>();
+      mockApi.settings.get.mockResolvedValue({ ...defaultSettings, defaultSessionDuration: 30 });
+      mockApi.settings.set.mockImplementationOnce(() => save.promise);
+      await mountSettings();
+
+      const launchToggle = document.querySelector<HTMLInputElement>("#launch-at-login-toggle");
+      const durationSelect = document.querySelector<HTMLSelectElement>("#session-duration-select");
+      expect(durationSelect?.value).toBe("30");
+      launchToggle?.click();
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenCalledExactlyOnceWith({ launchAtLogin: true });
+      expect(durationSelect?.value).toBe("30");
+
+      save.resolve(
+        accepted({ ...defaultSettings, launchAtLogin: true, defaultSessionDuration: 120 }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(launchToggle?.checked).toBe(true);
+      expect(document.getElementById("launch-save-indicator")?.textContent).toBe(SAVED_INDICATOR);
+      expect(durationSelect?.value).toBe("120");
+      expect(mockApi.session.start).not.toHaveBeenCalled();
+    });
+
+    it("waits for the latest 300ms debounce before flushing a queued edit", async () => {
+      const firstSave = Promise.withResolvers<SettingsSetResponse>();
+      mockApi.settings.set.mockImplementationOnce(() => firstSave.promise);
+      await mountSettings();
+
+      const launchToggle = document.getElementById("launch-at-login-toggle") as HTMLInputElement;
+      const batterySelect = document.getElementById("battery-threshold-select") as HTMLSelectElement;
+      launchToggle.checked = true;
+      launchToggle.dispatchEvent(new Event("change"));
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenCalledExactlyOnceWith({ launchAtLogin: true });
+
+      batterySelect.value = "10";
+      batterySelect.dispatchEvent(new Event("change"));
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenCalledTimes(1);
+      batterySelect.value = "20";
+      batterySelect.dispatchEvent(new Event("change"));
+      await vi.advanceTimersByTimeAsync(100);
+
+      firstSave.resolve(accepted({ ...defaultSettings, launchAtLogin: true }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockApi.settings.set).toHaveBeenCalledTimes(1);
+      expect(batterySelect.value).toBe("20");
+      await vi.advanceTimersByTimeAsync(199);
+      expect(mockApi.settings.set).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(mockApi.settings.set).toHaveBeenNthCalledWith(2, { batteryThreshold: 20 });
+    });
+
+    it("reverts a rejected key to its confirmed value without showing Saved", async () => {
+      mockApi.settings.set.mockResolvedValueOnce({
+        settings: { ...defaultSettings },
+        rejectedKeys: ["preventSleep"],
+      });
+      await mountSettings();
+
+      const sleepToggle = document.getElementById("prevent-sleep-toggle") as HTMLInputElement;
+      sleepToggle.checked = true;
+      sleepToggle.dispatchEvent(new Event("change"));
+      expect(sleepToggle.checked).toBe(true);
+      await vi.advanceTimersByTimeAsync(300);
+
+      expect(mockApi.settings.set).toHaveBeenCalledExactlyOnceWith({ preventSleep: true });
+      expect(sleepToggle.checked).toBe(false);
+      expect(document.getElementById("settings-error-text")?.textContent).toContain("preventSleep");
+      expect(document.getElementById("sleep-save-indicator")?.textContent).not.toBe(SAVED_INDICATOR);
+    });
+
+    it("keeps a rejected shortcut error after an unrelated setting saves", async () => {
+      const confirmedSettings: AppSettings = {
+        ...defaultSettings,
+        shortcut: "CommandOrControl+Shift+A",
+      };
+      mockApi.settings.get.mockResolvedValueOnce(confirmedSettings);
+      mockApi.settings.set
+        .mockResolvedValueOnce({ settings: confirmedSettings, rejectedKeys: ["shortcut"] })
+        .mockResolvedValueOnce(accepted({ ...confirmedSettings, launchAtLogin: true }));
+      await mountSettings();
+
+      const shortcutButton = document.getElementById("shortcut-input") as HTMLButtonElement;
+      expect(shortcutButton.textContent).toBe("⌘⇧A");
+      shortcutButton.click();
+      document.defaultView!.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "W", metaKey: true, bubbles: true, cancelable: true }),
+      );
+      expect(shortcutButton.textContent).toBe("⌘W");
+      await vi.advanceTimersByTimeAsync(300);
+
+      expect(mockApi.settings.set).toHaveBeenCalledExactlyOnceWith({ shortcut: "CommandOrControl+W" });
+      expect(shortcutButton.textContent).toBe("⌘⇧A");
+      expect(document.getElementById("shortcut-save-indicator")?.textContent).not.toBe(SAVED_INDICATOR);
+      const errorText = document.getElementById("settings-error-text");
+      expect(errorText?.textContent).toContain("shortcut");
+      const rejectedError = errorText?.textContent;
+
+      const launchToggle = document.getElementById("launch-at-login-toggle") as HTMLInputElement;
+      launchToggle.click();
+      await vi.advanceTimersByTimeAsync(300);
+
+      expect(mockApi.settings.set).toHaveBeenNthCalledWith(2, { launchAtLogin: true });
+      expect(launchToggle.checked).toBe(true);
+      expect(document.getElementById("launch-save-indicator")?.textContent).toBe(SAVED_INDICATOR);
+      expect(shortcutButton.textContent).toBe("⌘⇧A");
+      expect(errorText?.textContent).toBe(rejectedError);
+    });
+
+    it("does not revert a newer same-key edit when an earlier edit is rejected", async () => {
+      const firstSave = Promise.withResolvers<SettingsSetResponse>();
+      mockApi.settings.set.mockImplementationOnce(() => firstSave.promise);
+      await mountSettings();
+
+      const batterySelect = document.getElementById("battery-threshold-select") as HTMLSelectElement;
+      batterySelect.value = "10";
+      batterySelect.dispatchEvent(new Event("change"));
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenCalledExactlyOnceWith({ batteryThreshold: 10 });
+
+      batterySelect.value = "20";
+      batterySelect.dispatchEvent(new Event("change"));
+      expect(batterySelect.value).toBe("20");
+      firstSave.resolve({ settings: { ...defaultSettings }, rejectedKeys: ["batteryThreshold"] });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.getElementById("settings-error-text")?.textContent).toContain("batteryThreshold");
+      expect(batterySelect.value).toBe("20");
+      expect(document.getElementById("battery-save-indicator")?.textContent).not.toBe(SAVED_INDICATOR);
+
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenNthCalledWith(2, { batteryThreshold: 20 });
+    });
+
+    it("requeues a failed write behind the newest edit without flushing early or showing false Saved", async () => {
+      const firstSave = Promise.withResolvers<SettingsSetResponse>();
+      const retry = Promise.withResolvers<SettingsSetResponse>();
+      mockApi.settings.set.mockImplementationOnce(() => firstSave.promise).mockImplementationOnce(() => retry.promise);
+      await mountSettings();
+
+      const launchToggle = document.getElementById("launch-at-login-toggle") as HTMLInputElement;
+      const batterySelect = document.getElementById("battery-threshold-select") as HTMLSelectElement;
+      launchToggle.checked = true;
+      launchToggle.dispatchEvent(new Event("change"));
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenCalledExactlyOnceWith({ launchAtLogin: true });
+      batterySelect.value = "10";
+      batterySelect.dispatchEvent(new Event("change"));
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenCalledTimes(1);
+      batterySelect.value = "20";
+      batterySelect.dispatchEvent(new Event("change"));
+      await vi.advanceTimersByTimeAsync(100);
+
+      firstSave.reject(new Error("Disk full"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.getElementById("settings-error-text")?.textContent).toBe("Disk full");
+      expect(document.getElementById("battery-save-indicator")?.textContent).not.toBe(SAVED_INDICATOR);
+      expect(mockApi.settings.set).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(200);
+      expect(mockApi.settings.set).toHaveBeenNthCalledWith(2, {
+        launchAtLogin: true,
+        batteryThreshold: 20,
+      });
+      expect(document.getElementById("battery-save-indicator")?.textContent).not.toBe(SAVED_INDICATOR);
+
+      retry.resolve(accepted({ ...defaultSettings, launchAtLogin: true, batteryThreshold: 20 }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.getElementById("battery-save-indicator")?.textContent).toBe(SAVED_INDICATOR);
+    });
+
+    it("starts a duration session but saves its preference even when session.start fails", async () => {
+      mockApi.session.start.mockResolvedValueOnce({ ok: false, reason: "rejected" });
+      await mountSettings();
+
+      const durationSelect = document.getElementById("session-duration-select") as HTMLSelectElement;
+      durationSelect.value = "30";
+      durationSelect.dispatchEvent(new Event("change"));
+      expect(durationSelect.value).toBe("30");
+      expect(mockApi.session.start).toHaveBeenCalledExactlyOnceWith(30);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.getElementById("settings-error-text")?.textContent).toBe("Failed to start session");
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenCalledExactlyOnceWith({ defaultSessionDuration: 30 });
+      expect(document.getElementById("settings-error-text")?.textContent).toBe("Failed to start session");
+    });
+
+    it("keeps a new duration selected while its session start awaits a matching status push", async () => {
+      const start = Promise.withResolvers<SessionStartResponse>();
+      mockApi.settings.get.mockResolvedValue({ ...defaultSettings, defaultSessionDuration: 60 });
+      mockApi.session.getStatus.mockResolvedValue({
+        isRunning: true,
+        startedAt: asPerf(100),
+        expiresAt: asPerf(3_600_100),
+        remainingSeconds: 3600,
+        durationMinutes: 60,
+      });
+      mockApi.session.start.mockImplementationOnce(() => start.promise);
+      await startCurrentSettingsEntry();
+      await vi.advanceTimersByTimeAsync(0);
+
+      const durationSelect = document.getElementById("session-duration-select") as HTMLSelectElement;
+      expect(durationSelect.value).toBe("60");
+      durationSelect.value = "30";
+      durationSelect.dispatchEvent(new Event("change"));
+      expect(mockApi.session.start).toHaveBeenCalledExactlyOnceWith(30);
+      expect(durationSelect.value).toBe("30");
+
+      mockApi.onSettingsChanged.mock.calls.at(-1)![0]({
+        ...defaultSettings,
+        defaultSessionDuration: 60,
+        batteryThreshold: 10,
+      });
+      expect((document.getElementById("battery-threshold-select") as HTMLSelectElement).value).toBe("10");
+      expect(durationSelect.value).toBe("30");
+
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenCalledExactlyOnceWith({ defaultSessionDuration: 30 });
+      expect(durationSelect.value).toBe("30");
+
+      start.resolve({ ok: true, startedAt: 200, durationMinutes: 30, expiresAt: 1_800_200 });
+      await vi.advanceTimersByTimeAsync(0);
+      mockApi.onSessionStatusUpdate.mock.calls.at(-1)![0]({
+        isRunning: true,
+        startedAt: asPerf(200),
+        expiresAt: asPerf(1_800_200),
+        remainingSeconds: 1800,
+        durationMinutes: 30,
+      });
+      expect(durationSelect.value).toBe("30");
+    });
+
+    it("ignores an older shortcut failure after a newer shortcut is queued and acknowledged", async () => {
+      const firstSave = Promise.withResolvers<SettingsSetResponse>();
+      const secondSave = Promise.withResolvers<SettingsSetResponse>();
+      mockApi.settings.set.mockImplementation((partial) =>
+        partial.shortcut === "CommandOrControl+K" ? firstSave.promise : secondSave.promise,
+      );
+      await mountSettings();
+
+      const shortcutButton = document.getElementById("shortcut-input") as HTMLButtonElement;
+      shortcutButton.click();
+      document.defaultView!.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "K", metaKey: true, bubbles: true, cancelable: true }),
+      );
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenCalledExactlyOnceWith({ shortcut: "CommandOrControl+K" });
+
+      shortcutButton.click();
+      document.defaultView!.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "L", metaKey: true, bubbles: true, cancelable: true }),
+      );
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenCalledTimes(1);
+      expect(shortcutButton.textContent).toBe("⌘L");
+
+      mockApi.onShortcutRegistrationFailed.mock.calls.at(-1)![0]({
+        accelerator: "CommandOrControl+K",
+      });
+      expect(document.getElementById("settings-error-text")?.textContent).toBe("");
+      expect(shortcutButton.textContent).toBe("⌘L");
+
+      firstSave.resolve(accepted({ ...defaultSettings, shortcut: "CommandOrControl+K" }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockApi.settings.set).toHaveBeenNthCalledWith(2, { shortcut: "CommandOrControl+L" });
+
+      secondSave.resolve(accepted({ ...defaultSettings, shortcut: "CommandOrControl+L" }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(shortcutButton.textContent).toBe("⌘L");
+      expect(document.getElementById("shortcut-save-indicator")?.textContent).toBe(SAVED_INDICATOR);
+      expect(document.getElementById("settings-error-text")?.textContent).toBe("");
+    });
+  });
+
+  describe("session status projection", () => {
+    it("tracks a timed session push without changing the stored duration preference", async () => {
+      mockApi.settings.get.mockResolvedValue({ ...defaultSettings, defaultSessionDuration: 30 });
+      await mountSettings();
+
+      const durationSelect = document.getElementById("session-duration-select") as HTMLSelectElement;
+      expect(durationSelect.value).toBe("30");
+      mockApi.onSessionStatusUpdate.mock.calls.at(-1)?.[0]({
+        isRunning: true,
+        startedAt: asPerf(100),
+        expiresAt: asPerf(3_600_100),
+        remainingSeconds: 3600,
+        durationMinutes: 60,
+      });
+      expect(durationSelect.value).toBe("60");
+
+      mockApi.onSettingsChanged.mock.calls.at(-1)![0]({
+        ...defaultSettings,
+        defaultSessionDuration: 30,
+        preventSleep: true,
+      });
+      expect(durationSelect.value).toBe("60");
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+    });
+
+    it("keeps an indefinite running session selected through a settings push", async () => {
+      mockApi.settings.get.mockResolvedValue({ ...defaultSettings, defaultSessionDuration: 30 });
+      mockApi.session.getStatus.mockResolvedValue({
+        isRunning: true,
+        startedAt: asPerf(100),
+        expiresAt: null,
+        remainingSeconds: null,
+        durationMinutes: null,
+      });
+      await startCurrentSettingsEntry();
+      await vi.advanceTimersByTimeAsync(0);
+
+      const durationSelect = document.getElementById("session-duration-select") as HTMLSelectElement;
+      expect(durationSelect.value).toBe("");
+      mockApi.onSettingsChanged.mock.calls.at(-1)![0]({
+        ...defaultSettings,
+        defaultSessionDuration: 30,
+        batteryThreshold: 10,
+      });
+      expect((document.getElementById("battery-threshold-select") as HTMLSelectElement).value).toBe("10");
+      expect(durationSelect.value).toBe("");
+    });
+
+    it("switches from a timed session to an indefinite session on a status push", async () => {
+      mockApi.settings.get.mockResolvedValue({ ...defaultSettings, defaultSessionDuration: 30 });
+      mockApi.session.getStatus.mockResolvedValue({
+        isRunning: true,
+        startedAt: asPerf(100),
+        expiresAt: asPerf(3_600_100),
+        remainingSeconds: 3600,
+        durationMinutes: 60,
+      });
+      await startCurrentSettingsEntry();
+      await vi.advanceTimersByTimeAsync(0);
+
+      const durationSelect = document.getElementById("session-duration-select") as HTMLSelectElement;
+      expect(durationSelect.value).toBe("60");
+      mockApi.onSessionStatusUpdate.mock.calls.at(-1)?.[0]({
+        isRunning: true,
+        startedAt: asPerf(200),
+        expiresAt: null,
+        remainingSeconds: null,
+        durationMinutes: null,
+      });
+      expect(durationSelect.value).toBe("");
+
+      mockApi.onSettingsChanged.mock.calls.at(-1)![0]({
+        ...defaultSettings,
+        defaultSessionDuration: 30,
+        preventSleep: true,
+      });
+      expect(durationSelect.value).toBe("");
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+    });
+
+    it("restores the stored preference when a timed session becomes idle", async () => {
+      mockApi.settings.get.mockResolvedValue({ ...defaultSettings, defaultSessionDuration: 30 });
+      mockApi.session.getStatus.mockResolvedValue({
+        isRunning: true,
+        startedAt: asPerf(100),
+        expiresAt: asPerf(3_600_100),
+        remainingSeconds: 3600,
+        durationMinutes: 60,
+      });
+      await startCurrentSettingsEntry();
+      await vi.advanceTimersByTimeAsync(0);
+
+      const durationSelect = document.getElementById("session-duration-select") as HTMLSelectElement;
+      expect(durationSelect.value).toBe("60");
+      mockApi.onSessionStatusUpdate.mock.calls.at(-1)?.[0](idleStatus);
+      expect(durationSelect.value).toBe("30");
+
+      mockApi.onSettingsChanged.mock.calls.at(-1)![0]({
+        ...defaultSettings,
+        defaultSessionDuration: 30,
+        preventSleep: true,
+      });
+      expect(durationSelect.value).toBe("30");
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+    });
+
+    it("applies status pushes while hidden and retains them on warm-cache reopen", async () => {
+      mockApi.settings.get.mockResolvedValue({ ...defaultSettings, defaultSessionDuration: 30 });
+      await mountSettings();
+
+      const durationSelect = document.getElementById("session-duration-select") as HTMLSelectElement;
+      const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+      document.dispatchEvent(new Event("visibilitychange"));
+      mockApi.onSessionStatusUpdate.mock.calls.at(-1)?.[0]({
+        isRunning: true,
+        startedAt: asPerf(100),
+        expiresAt: asPerf(1_800_100),
+        remainingSeconds: 1800,
+        durationMinutes: 30,
+      });
+      mockApi.onSessionStatusUpdate.mock.calls.at(-1)?.[0]({
+        isRunning: true,
+        startedAt: asPerf(200),
+        expiresAt: asPerf(3_600_200),
+        remainingSeconds: 3600,
+        durationMinutes: 60,
+      });
+      expect(durationSelect.value).toBe("60");
+
+      visibility.mockReturnValue("visible");
+      document.dispatchEvent(new Event("visibilitychange"));
+      await vi.advanceTimersByTimeAsync(35);
+      expect(durationSelect.value).toBe("60");
+      mockApi.onSettingsChanged.mock.calls.at(-1)![0]({
+        ...defaultSettings,
+        defaultSessionDuration: 30,
+        preventSleep: true,
+      });
+      expect((document.getElementById("prevent-sleep-toggle") as HTMLInputElement).checked).toBe(true);
+      expect(durationSelect.value).toBe("60");
+    });
+  });
+
+  describe("startup push ordering", () => {
+    it("does not overwrite a settings push with an older settings.get result", async () => {
+      const initialSettings = Promise.withResolvers<AppSettings>();
+      mockApi.settings.get.mockImplementationOnce(() => initialSettings.promise);
+      mockApi.session.getStatus.mockResolvedValue(idleStatus);
+      await startCurrentSettingsEntry();
+      expect(mockApi.settings.get).toHaveBeenCalledTimes(1);
+
+      mockApi.onSettingsChanged.mock.calls.at(-1)?.[0]({
+        ...defaultSettings,
+        preventSleep: true,
+        batteryThreshold: 10,
+      });
+      initialSettings.resolve({ ...defaultSettings });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect((document.getElementById("prevent-sleep-toggle") as HTMLInputElement).checked).toBe(true);
+      expect((document.getElementById("battery-threshold-select") as HTMLSelectElement).value).toBe("10");
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+    });
+
+    it("does not overwrite a session push with an older session.getStatus result", async () => {
+      const initialStatus = Promise.withResolvers<SessionStatusResponse>();
+      mockApi.settings.get.mockResolvedValue({ ...defaultSettings, defaultSessionDuration: 30 });
+      mockApi.session.getStatus.mockImplementationOnce(() => initialStatus.promise);
+      await startCurrentSettingsEntry();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockApi.session.getStatus).toHaveBeenCalledTimes(1);
+
+      mockApi.onSessionStatusUpdate.mock.calls.at(-1)?.[0]({
+        isRunning: true,
+        startedAt: asPerf(100),
+        expiresAt: asPerf(3_600_100),
+        remainingSeconds: 3600,
+        durationMinutes: 60,
+      });
+      initialStatus.resolve(idleStatus);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect((document.getElementById("session-duration-select") as HTMLSelectElement).value).toBe("60");
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("warm-cache and unload lifecycle", () => {
+    it("keeps subscriptions active through hide and reopen", async () => {
+      const stopSettings = vi.fn();
+      const stopShortcut = vi.fn();
+      mockApi.onSettingsChanged.mockReturnValueOnce(stopSettings);
+      mockApi.onShortcutRegistrationFailed.mockReturnValueOnce(stopShortcut);
+      mockApi.settings.get.mockResolvedValue({ ...defaultSettings, shortcut: "CommandOrControl+K" });
+      await mountSettings();
+
+      const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+      document.dispatchEvent(new Event("visibilitychange"));
+      expect(stopSettings).not.toHaveBeenCalled();
+      expect(stopShortcut).not.toHaveBeenCalled();
+
+      mockApi.onSettingsChanged.mock.calls.at(-1)![0]({
+        ...defaultSettings,
+        preventSleep: true,
+        shortcut: "CommandOrControl+K",
+      });
+      expect((document.getElementById("prevent-sleep-toggle") as HTMLInputElement).checked).toBe(true);
+      visibility.mockReturnValue("visible");
+      document.dispatchEvent(new Event("visibilitychange"));
+      await vi.advanceTimersByTimeAsync(35);
+      mockApi.onShortcutRegistrationFailed.mock.calls.at(-1)![0]({ accelerator: "CommandOrControl+K" });
+      expect(document.getElementById("settings-error-text")?.textContent).toContain("CommandOrControl+K");
+      expect(stopSettings).not.toHaveBeenCalled();
+      expect(stopShortcut).not.toHaveBeenCalled();
+    });
+
+    it("unsubscribes settings, shortcut, and session pushes on beforeunload", async () => {
+      const stopSettings = vi.fn();
+      const stopShortcut = vi.fn();
+      const stopSession = vi.fn();
+      mockApi.onSettingsChanged.mockReturnValueOnce(stopSettings);
+      mockApi.onShortcutRegistrationFailed.mockReturnValueOnce(stopShortcut);
+      mockApi.onSessionStatusUpdate.mockReturnValueOnce(stopSession);
+      await mountSettings();
+
+      document.defaultView!.dispatchEvent(new Event("beforeunload"));
+      expect(stopSettings).toHaveBeenCalledTimes(1);
+      expect(stopShortcut).toHaveBeenCalledTimes(1);
+      expect(stopSession).toHaveBeenCalledTimes(1);
+    });
+
+    it("cancels a pending debounced save on beforeunload", async () => {
+      await mountSettings();
+
+      const sleepToggle = document.getElementById("prevent-sleep-toggle") as HTMLInputElement;
+      sleepToggle.checked = true;
+      sleepToggle.dispatchEvent(new Event("change"));
+      expect(sleepToggle.checked).toBe(true);
+      await vi.advanceTimersByTimeAsync(299);
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+
+      document.defaultView!.dispatchEvent(new Event("beforeunload"));
+      await vi.advanceTimersByTimeAsync(1);
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+    });
+
+    it("stops shortcut recorder key handling on beforeunload", async () => {
+      await mountSettings();
+
+      const shortcutButton = document.getElementById("shortcut-input") as HTMLButtonElement;
+      shortcutButton.click();
+      expect(shortcutButton.getAttribute("aria-pressed")).toBe("true");
+      document.defaultView!.dispatchEvent(new Event("beforeunload"));
+      document.defaultView!.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "K", metaKey: true, bubbles: true, cancelable: true }),
+      );
+      await vi.advanceTimersByTimeAsync(300);
+
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+      expect(shortcutButton.getAttribute("aria-pressed")).toBe("false");
+    });
+
+    it("does not repaint or show Saved when an in-flight save settles after beforeunload", async () => {
+      const firstSave = Promise.withResolvers<SettingsSetResponse>();
+      mockApi.settings.set.mockImplementationOnce(() => firstSave.promise);
+      await mountSettings();
+
+      const batterySelect = document.getElementById("battery-threshold-select") as HTMLSelectElement;
+      batterySelect.value = "10";
+      batterySelect.dispatchEvent(new Event("change"));
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenCalledExactlyOnceWith({ batteryThreshold: 10 });
+      batterySelect.value = "20";
+      batterySelect.dispatchEvent(new Event("change"));
+      expect(batterySelect.value).toBe("20");
+
+      document.defaultView!.dispatchEvent(new Event("beforeunload"));
+      firstSave.resolve(accepted({ ...defaultSettings, batteryThreshold: 10 }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(batterySelect.value).toBe("20");
+      expect(document.getElementById("battery-save-indicator")?.textContent).not.toBe(SAVED_INDICATOR);
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenCalledTimes(1);
+    });
+
+    it("ignores already-delivered push callbacks after beforeunload", async () => {
+      await mountSettings();
+
+      const settingsPush = mockApi.onSettingsChanged.mock.calls.at(-1)![0];
+      const sessionPush = mockApi.onSessionStatusUpdate.mock.calls.at(-1)?.[0];
+      const sleepToggle = document.getElementById("prevent-sleep-toggle") as HTMLInputElement;
+      const durationSelect = document.getElementById("session-duration-select") as HTMLSelectElement;
+      expect(sleepToggle.checked).toBe(false);
+      expect(durationSelect.value).toBe("");
+      document.defaultView!.dispatchEvent(new Event("beforeunload"));
+
+      settingsPush({ ...defaultSettings, preventSleep: true, defaultSessionDuration: 30 });
+      sessionPush?.({
+        isRunning: true,
+        startedAt: asPerf(100),
+        expiresAt: asPerf(3_600_100),
+        remainingSeconds: 3600,
+        durationMinutes: 60,
+      });
+      expect(sleepToggle.checked).toBe(false);
+      expect(durationSelect.value).toBe("");
     });
   });
 
