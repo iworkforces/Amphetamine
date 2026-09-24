@@ -852,7 +852,7 @@ export function presentUtilityDialog(
   utilityDialogPayload = payload;
   utilityDialogWantsVisible = true;
 
-  utilityDialogInFlight = new Promise<UtilityDialogResult>((resolve) => {
+  const inFlight = new Promise<UtilityDialogResult>((resolve) => {
     utilityDialogResolve = resolve;
 
     try {
@@ -881,7 +881,11 @@ export function presentUtilityDialog(
     }
   });
 
-  return utilityDialogInFlight;
+  if (utilityDialogResolve !== null) {
+    utilityDialogInFlight = inFlight;
+  }
+
+  return inFlight;
 }
 
 /**
