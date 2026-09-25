@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| **Author** | Kenny Dizi / iWorkforces Engineers |
+| **Author** | Kenny Dizi / iworkforces Engineers |
 | **Date** | 2026-07-27 |
 | **Status** | Draft (rev 2.2 — user decisions final: composition, platform, benchmark, log tags) |
 | **Branch** | `refactoring-codebase` |

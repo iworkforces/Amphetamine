@@ -206,7 +206,7 @@ describe("ipc additional coverage", () => {
     mockGetPackageInfo.mockReturnValue({
       productName: "Amphetamine",
       description: "Keep awake",
-      repository: "https://github.com/iWorkforces/Amphetamine",
+      repository: "https://github.com/iworkforces/Amphetamine",
       author: "Test Author",
     });
 
@@ -351,7 +351,7 @@ describe("ipc additional coverage", () => {
         productName: "Amphetamine",
         version: "9.8.7",
         description: "Keep awake",
-        repository: "https://github.com/iWorkforces/Amphetamine",
+        repository: "https://github.com/iworkforces/Amphetamine",
         author: "Test Author",
       });
       expect(mockGetPackageInfo).toHaveBeenCalledTimes(1);
@@ -742,7 +742,7 @@ describe("ipc additional coverage", () => {
         productName: "Amphetamine",
         version: "1.0.0",
         description: "Keep awake",
-        repository: "https://github.com/iWorkforces/Amphetamine",
+        repository: "https://github.com/iworkforces/Amphetamine",
         author: "Test Author",
       });
       expect(mockGetPackageInfo).toHaveBeenCalledTimes(1);

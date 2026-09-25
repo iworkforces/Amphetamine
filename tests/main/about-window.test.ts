@@ -72,7 +72,7 @@ vi.mock("../../src/main/utils/packageInfo.js", () => ({
     productName: "Amphetamine",
     version: "1.0.0",
     description: "Keep awake",
-    repository: "https://github.com/iWorkforces/Amphetamine",
+    repository: "https://github.com/iworkforces/Amphetamine",
     author: "Test",
   }),
 }));
@@ -157,7 +157,7 @@ describe("about-window", () => {
     });
     const { showAbout } = await import("../../src/main/about-window.js");
     showAbout();
-    const repo = "https://github.com/iWorkforces/Amphetamine";
+    const repo = "https://github.com/iworkforces/Amphetamine";
     expect(openHandler?.({ url: repo })).toEqual({ action: "deny" });
     expect(mockOpenExternal).toHaveBeenCalledWith(repo);
     mockOpenExternal.mockClear();

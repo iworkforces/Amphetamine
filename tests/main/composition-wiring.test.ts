@@ -148,7 +148,7 @@ vi.mock("../../src/main/about-window.js", () => ({
 }));
 vi.mock("../../src/main/utils/packageInfo.js", () => ({
   getPackageInfo: () => ({
-    repository: "https://github.com/iWorkforces/Amphetamine",
+    repository: "https://github.com/iworkforces/Amphetamine",
     productName: "Amphetamine",
     version: "1.0.0",
     description: "",

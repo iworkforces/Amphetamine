@@ -8,7 +8,7 @@ export type GitHubRepoIdentity = {
 
 /**
  * Parse `owner` / `repo` from a GitHub repository URL
- * (e.g. `https://github.com/iWorkforces/Amphetamine[.git]`).
+ * (e.g. `https://github.com/iworkforces/Amphetamine[.git]`).
  */
 export function parseGitHubRepoIdentity(repoUrlStr: string): GitHubRepoIdentity | null {
   try {

@@ -1,10 +1,10 @@
 {
   "name": "amphetamine",
   "version": "1.13.1",
-  "author": "iWorkforces Engineers",
+  "author": "iworkforces Engineers",
   "authorEmail": "chitrung09t2@gmail.com",
   "description": "A tray app that keeps your computer awake on macOS and Windows. Lives in the system tray, prevents the system from going to sleep, and stays out of the Dock/taskbar when idle.",
-  "repository": "https://github.com/iWorkforces/Amphetamine",
+  "repository": "https://github.com/iworkforces/Amphetamine",
   "main": "lib/main/index.cjs",
   "devDependencies": {
     "@electron/fuses": "^2.1.3",
@@ -39,7 +39,7 @@
     "node": ">=26 <27",
     "bun": ">=1.4.2"
   },
-  "homepage": "https://github.com/iWorkforces/Amphetamine",
+  "homepage": "https://github.com/iworkforces/Amphetamine",
   "packageManager": "bun@1.4.2",
   "private": true,
   "productName": "Amphetamine",
