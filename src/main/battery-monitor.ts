@@ -106,6 +106,7 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
   const onPercentSample = deps.onPercentSample;
 
   let isCheckingBattery = false;
+  let disposed = false;
   let onBatteryListener: (() => void) | null = null;
   let onAcListener: (() => void) | null = null;
   let onResumeListener: (() => void) | null = null;
@@ -125,6 +126,7 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
     try {
       const percent = await getBatteryPercent();
       recordBattery("completedRead");
+      if (disposed) return;
       onPercentSample?.(percent);
       if (percent !== null && percent <= threshold) {
         log.info(
@@ -135,13 +137,13 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
     } catch (err) {
       // Still a completed attempt past the gate (I/O failed after entry).
       recordBattery("completedRead");
-      log.warn("[battery] Failed to check battery level:", err);
+      if (!disposed) log.warn("[battery] Failed to check battery level:", err);
     }
   };
 
   const runGuardedBatteryCheck = (errorMessage: string): void => {
     recordBattery("callbackAttempted");
-    if (isCheckingBattery) {
+    if (disposed || isCheckingBattery) {
       recordBattery("guardedSkipped");
       return;
     }
@@ -159,7 +161,7 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
    * Idempotent — safe to call repeatedly.
    */
   const startPeriodicBatteryChecks = (): void => {
-    if (batteryCheckInterval !== null) return;
+    if (disposed || batteryCheckInterval !== null) return;
     if (!isThresholdEnabled(getThreshold())) return;
     if (!powerMonitor.isOnBatteryPower()) return;
     if (!isPreventingSleep()) return;
@@ -181,6 +183,7 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
 
   /** @internal Power monitor listeners persist for app lifetime by design. */
   const initBatteryMonitoring = async (): Promise<void> => {
+    if (disposed || onBatteryListener !== null) return;
     onBatteryListener = () => {
       runGuardedBatteryCheck("[battery] Battery check error:");
       // AC→battery transition: if we're already preventing sleep, begin polling
@@ -210,6 +213,8 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
 
   /** Remove power monitor listeners. For completeness in cleanup paths. */
   const cleanupBatteryMonitoring = (): void => {
+    if (disposed) return;
+    disposed = true;
     stopPeriodicBatteryChecks();
     if (onBatteryListener) {
       powerMonitor.off("on-battery", onBatteryListener);
@@ -230,6 +235,7 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
    * loop when prevention turns on (and we're on battery); stop it when off.
    */
   const onPreventSleepChange = (active: boolean): void => {
+    if (disposed) return;
     if (active) {
       startPeriodicBatteryChecks();
     } else {
@@ -243,6 +249,7 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
    * actually starts monitoring.
    */
   const reconfigure = (): void => {
+    if (disposed) return;
     stopPeriodicBatteryChecks();
     startPeriodicBatteryChecks();
     if (isThresholdEnabled(getThreshold()) && isPreventingSleep()) {
