@@ -127,6 +127,7 @@ describe("createAppComposition", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.resetModules();
+    mockInitSettings.mockResolvedValue(undefined);
     mockCreateSessionTimer.mockReturnValue({
       startSession: vi.fn(),
       cancelSession: vi.fn(),
@@ -206,6 +207,67 @@ describe("createAppComposition", () => {
     const unsub = tray.onActiveStateChanged(() => {});
     unsub();
     composition.cleanup();
+    expect(composition.ready).toBe(false);
+  });
+
+  it("shares settings initialization and ignores its completion after cleanup", async () => {
+    const settings = Promise.withResolvers<void>();
+    mockInitSettings.mockReturnValue(settings.promise);
+    const { createAppComposition } = await import("../../src/main/composition-root.js");
+    const composition = createAppComposition();
+    const first = composition.init();
+    expect(composition.init()).toBe(first);
+    composition.cleanup();
+    settings.resolve();
+    await first;
+    await composition.init();
+    expect(mockInitSettings).toHaveBeenCalledTimes(1);
+    expect(mockCreateSessionTimer).not.toHaveBeenCalled();
+    expect(mockCreateBatteryMonitor).not.toHaveBeenCalled();
+    expect(mockOnSettingsChanged).not.toHaveBeenCalled();
+    expect(composition.ready).toBe(false);
+  });
+
+  it("releases remaining resources once when a disposer throws", async () => {
+    const unsubscribe = vi.fn(() => {
+      throw new Error("unsubscribe failure");
+    });
+    mockOnSettingsChanged.mockReturnValue(unsubscribe);
+    const { createAppComposition } = await import("../../src/main/composition-root.js");
+    const { unregisterGlobalShortcut } = await import("../../src/main/global-shortcut.js");
+    const { closeAboutWindow } = await import("../../src/main/about-window.js");
+    const composition = createAppComposition();
+    await composition.init();
+    composition.cleanup();
+    composition.cleanup();
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+    expect(
+      mockCreateBatteryMonitor.mock.results[0]?.value.cleanupBatteryMonitoring,
+    ).toHaveBeenCalledTimes(1);
+    expect(mockCreateSessionTimer.mock.results[0]?.value.cleanup).toHaveBeenCalledTimes(1);
+    expect(mockStopPreventingSleep).toHaveBeenCalledTimes(1);
+    expect(unregisterGlobalShortcut).toHaveBeenCalledTimes(1);
+    expect(closeAboutWindow).toHaveBeenCalledTimes(1);
+    expect(composition.ready).toBe(false);
+  });
+
+  it("cleans up partial initialization when shortcut registration throws", async () => {
+    const { registerGlobalShortcut, unregisterGlobalShortcut } =
+      await import("../../src/main/global-shortcut.js");
+    vi.mocked(registerGlobalShortcut).mockImplementationOnce(() => {
+      throw new Error("shortcut failed");
+    });
+    const { createAppComposition } = await import("../../src/main/composition-root.js");
+    const composition = createAppComposition();
+    await expect(composition.init()).rejects.toThrow("shortcut failed");
+    composition.cleanup();
+    expect(
+      mockCreateBatteryMonitor.mock.results[0]?.value.cleanupBatteryMonitoring,
+    ).toHaveBeenCalledTimes(1);
+    expect(mockCreateSessionTimer.mock.results[0]?.value.cleanup).toHaveBeenCalledTimes(1);
+    expect(mockStopPreventingSleep).toHaveBeenCalledTimes(1);
+    expect(unregisterGlobalShortcut).toHaveBeenCalledTimes(1);
+    expect(mockOnSettingsChanged).not.toHaveBeenCalled();
     expect(composition.ready).toBe(false);
   });
 });
