@@ -448,11 +448,7 @@ export function createSettingsWindow(): BrowserWindow {
 
 /** True when the settings window exists and is currently visible. */
 export function isSettingsWindowOpen(): boolean {
-  return (
-    settingsWindow !== null &&
-    !settingsWindow.isDestroyed() &&
-    settingsWindow.isVisible()
-  );
+  return settingsWindow !== null && !settingsWindow.isDestroyed() && settingsWindow.isVisible();
 }
 
 /**
@@ -498,7 +494,9 @@ export function showAbout(_mainWindow?: BrowserWindow): void {
   hardenWebContents(win);
 
   // Allow only the package repository URL (and its path under github.com).
-  const repoUrl = getPackageInfo().repository.replace(/\.git$/i, "").replace(/\/$/, "");
+  const repoUrl = getPackageInfo()
+    .repository.replace(/\.git$/i, "")
+    .replace(/\/$/, "");
   win.webContents.setWindowOpenHandler(({ url }) => {
     try {
       const parsed = new URL(url);
@@ -583,8 +581,7 @@ let utilityDialogResolve: ((result: UtilityDialogResult) => void) | null = null;
 let utilityDialogHandlersRegistered = false;
 
 function normalizeUtilityDialogOptions(options: UtilityDialogOptions): UtilityDialogPayload {
-  const buttons =
-    options.buttons.length > 0 ? options.buttons.slice(0, 3) : (["OK"] as string[]);
+  const buttons = options.buttons.length > 0 ? options.buttons.slice(0, 3) : (["OK"] as string[]);
   const lastIndex = buttons.length - 1;
   const defaultId =
     typeof options.defaultId === "number" &&
@@ -633,6 +630,45 @@ function releaseUtilityDialogForeground(): void {
     releaseUtilityForeground();
     utilityDialogHeldForeground = false;
   }
+}
+
+function destroyUtilityDialogShell(): void {
+  const win = utilityDialogWindow;
+  const handlersRegistered = utilityDialogHandlersRegistered;
+  utilityDialogWindow = null;
+  utilityDialogShellReady = false;
+  utilityDialogPayload = null;
+  utilityDialogWantsVisible = false;
+  utilityDialogHandlersRegistered = false;
+
+  let firstError: unknown;
+  try {
+    releaseUtilityDialogForeground();
+  } catch (error) {
+    firstError ??= error;
+    utilityDialogHeldForeground = false;
+  }
+  if (handlersRegistered) {
+    for (const channel of [
+      UTILITY_DIALOG_GET_PAYLOAD,
+      UTILITY_DIALOG_RESPOND,
+      UTILITY_DIALOG_SET_HEIGHT,
+    ]) {
+      try {
+        ipcMain.removeHandler(channel);
+      } catch (error) {
+        firstError ??= error;
+      }
+    }
+  }
+  try {
+    if (win !== null && !win.isDestroyed()) {
+      win.destroy();
+    }
+  } catch (error) {
+    firstError ??= error;
+  }
+  if (firstError !== undefined) throw firstError;
 }
 
 function acquireUtilityDialogForeground(): void {
@@ -694,33 +730,26 @@ function finishUtilityDialog(response: number): void {
   // Keep last payload only until hide completes; clear so getPayload fails when idle.
   utilityDialogPayload = null;
 
-  releaseUtilityDialogForeground();
-
-  if (destroying) {
-    if (utilityDialogHandlersRegistered) {
-      ipcMain.removeHandler(UTILITY_DIALOG_GET_PAYLOAD);
-      ipcMain.removeHandler(UTILITY_DIALOG_RESPOND);
-      ipcMain.removeHandler(UTILITY_DIALOG_SET_HEIGHT);
-      utilityDialogHandlersRegistered = false;
+  try {
+    if (destroying) {
+      destroyUtilityDialogShell();
+    } else {
+      releaseUtilityDialogForeground();
+      if (win !== null && !win.isDestroyed() && win.isVisible()) {
+        win.hide();
+      }
     }
-    utilityDialogShellReady = false;
-    utilityDialogWindow = null;
-    if (win !== null && !win.isDestroyed()) {
-      win.destroy();
+  } finally {
+    if (resolve !== null) {
+      const safeResponse =
+        payload !== null &&
+        Number.isInteger(response) &&
+        response >= 0 &&
+        response < payload.buttons.length
+          ? response
+          : (payload?.cancelId ?? 0);
+      resolve({ response: safeResponse, checkboxChecked: false });
     }
-  } else if (win !== null && !win.isDestroyed() && win.isVisible()) {
-    win.hide();
-  }
-
-  if (resolve !== null) {
-    const safeResponse =
-      payload !== null &&
-      Number.isInteger(response) &&
-      response >= 0 &&
-      response < payload.buttons.length
-        ? response
-        : (payload?.cancelId ?? 0);
-    resolve({ response: safeResponse, checkboxChecked: false });
   }
 }
 
@@ -841,9 +870,7 @@ function createUtilityDialogShell(): BrowserWindow {
  * First open creates + loads the shell; later opens re-apply payload + show (warm cache).
  * Concurrent calls share the in-flight promise.
  */
-export function presentUtilityDialog(
-  options: UtilityDialogOptions,
-): Promise<UtilityDialogResult> {
+export function presentUtilityDialog(options: UtilityDialogOptions): Promise<UtilityDialogResult> {
   if (utilityDialogInFlight !== null) {
     return utilityDialogInFlight;
   }
@@ -896,27 +923,16 @@ export function closeUtilityDialogWindow(): void {
   utilityDialogAllowDestroy = true;
   utilityDialogWantsVisible = false;
 
-  if (utilityDialogInFlight !== null) {
-    const cancelId = utilityDialogPayload?.cancelId ?? 0;
-    finishUtilityDialog(cancelId);
-  } else {
-    releaseUtilityDialogForeground();
-    if (utilityDialogHandlersRegistered) {
-      ipcMain.removeHandler(UTILITY_DIALOG_GET_PAYLOAD);
-      ipcMain.removeHandler(UTILITY_DIALOG_RESPOND);
-      ipcMain.removeHandler(UTILITY_DIALOG_SET_HEIGHT);
-      utilityDialogHandlersRegistered = false;
+  try {
+    if (utilityDialogInFlight !== null) {
+      const cancelId = utilityDialogPayload?.cancelId ?? 0;
+      finishUtilityDialog(cancelId);
+    } else {
+      destroyUtilityDialogShell();
     }
-    const win = utilityDialogWindow;
-    utilityDialogWindow = null;
-    utilityDialogShellReady = false;
-    utilityDialogPayload = null;
-    if (win !== null && !win.isDestroyed()) {
-      win.destroy();
-    }
+  } finally {
+    utilityDialogAllowDestroy = false;
   }
-
-  utilityDialogAllowDestroy = false;
 }
 
 /**
@@ -925,11 +941,22 @@ export function closeUtilityDialogWindow(): void {
  */
 export function destroyAllWindows(): void {
   cancelPendingPopoverHide();
-  closeUtilityDialogWindow();
-  closeSettingsWindow();
-  closeAboutWindow();
-  if (popoverWindow !== null && !popoverWindow.isDestroyed()) {
-    popoverWindow.destroy();
+  let firstError: unknown;
+  for (const closeWindow of [closeUtilityDialogWindow, closeSettingsWindow, closeAboutWindow]) {
+    try {
+      closeWindow();
+    } catch (err) {
+      firstError ??= err;
+    }
   }
+  const win = popoverWindow;
   popoverWindow = null;
+  try {
+    if (win !== null && !win.isDestroyed()) {
+      win.destroy();
+    }
+  } catch (err) {
+    firstError ??= err;
+  }
+  if (firstError !== undefined) throw firstError;
 }
