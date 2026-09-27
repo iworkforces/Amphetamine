@@ -34,6 +34,12 @@ const mockBatteryInit = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const mockBatteryCleanup = vi.hoisted(() => vi.fn());
 const mockBatteryOnPreventSleepChange = vi.hoisted(() => vi.fn());
 const mockBatteryReconfigure = vi.hoisted(() => vi.fn());
+const mockBatterySensor = vi.hoisted(() => ({
+  getPercent: vi.fn(),
+  isOnBatteryPower: vi.fn(),
+  onPowerSourceChange: vi.fn(),
+}));
+const mockCreateBatterySensor = vi.hoisted(() => vi.fn(() => mockBatterySensor));
 const mockCreateBatteryMonitor = vi.hoisted(() =>
   vi.fn(() => ({
     initBatteryMonitoring: mockBatteryInit,
@@ -156,6 +162,7 @@ vi.mock("../../src/main/utils/packageInfo.js", () => ({
   }),
 }));
 vi.mock("../../src/main/platform/index.js", () => ({
+  createBatterySensor: mockCreateBatterySensor,
   enterForegroundMode: vi.fn(),
   enterTrayOnlyMode: vi.fn(),
   acquireUtilityForeground: vi.fn(),
@@ -289,6 +296,18 @@ describe("composition wiring", () => {
       // Battery monitor is a pure detector — it must NOT receive a direct
       // sleep-prevention stop wrapper. Policy lives in composition (HandleLowBatteryAutoStop).
       expect(deps.stopPreventingSleep).toBeUndefined();
+    });
+
+    it("creates one sensor and injects it into the one monitor on repeated initialization", async () => {
+      await initComposition();
+      await composition?.init();
+
+      expect(mockCreateBatterySensor).toHaveBeenCalledTimes(1);
+      expect(mockCreateBatteryMonitor).toHaveBeenCalledTimes(1);
+      expect(firstCallArg<{ sensor: unknown }>(mockCreateBatteryMonitor).sensor).toBe(
+        mockBatterySensor,
+      );
+      expect(mockBatteryInit).toHaveBeenCalledTimes(1);
     });
 
     it("battery onAutoStop cancels session and clears standing preventSleep when set", async () => {
