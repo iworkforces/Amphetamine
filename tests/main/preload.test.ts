@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { IPC_CHANNELS } from "../../src/shared/types.js";
+import { SETTINGS_QUIT_DRAIN_REQUEST, SETTINGS_QUIT_DRAIN_ACK } from "../../src/shared/settings-quit.js";
 
 const mockSend = vi.fn();
 const mockInvoke = vi.fn();
@@ -79,6 +80,21 @@ describe("preload", () => {
     api.settings.open();
 
     expect(mockInvoke).toHaveBeenCalledWith(IPC_CHANNELS.SETTINGS_OPEN);
+  });
+
+  it("exposes only a typed quit drain subscription and acknowledgement", () => {
+    const callback = vi.fn();
+    const unsubscribe = api.settings.onQuitDrain(callback);
+    expect(mockOn).toHaveBeenCalledWith(SETTINGS_QUIT_DRAIN_REQUEST, expect.any(Function));
+    const listener = mockOn.mock.calls.find(([channel]) => channel === SETTINGS_QUIT_DRAIN_REQUEST)?.[1];
+    listener({}, { requestId: "quit-1" });
+    expect(callback).toHaveBeenCalledExactlyOnceWith({ requestId: "quit-1" });
+    const ack = { requestId: "quit-1", status: "saved" };
+    api.settings.ackQuitDrain(ack);
+    expect(mockSend).toHaveBeenCalledWith(SETTINGS_QUIT_DRAIN_ACK, ack);
+    unsubscribe();
+    expect(mockRemoveListener).toHaveBeenCalledWith(SETTINGS_QUIT_DRAIN_REQUEST, listener);
+    expect(api.settings.send).toBeUndefined();
   });
 
   it("session.start calls ipcRenderer.invoke with durationMinutes", () => {

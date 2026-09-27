@@ -19,6 +19,7 @@ const mockSetupTray = vi.hoisted(() => vi.fn().mockReturnValue(vi.fn()));
 const mockIpcCleanup = vi.hoisted(() => vi.fn());
 const mockRegisterIpcHandlers = vi.hoisted(() => vi.fn().mockReturnValue(mockIpcCleanup));
 const mockFlushSettings = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockDrainSettings = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const mockEnterTrayOnlyMode = vi.hoisted(() => vi.fn());
 const mockCreatePopoverWindow = vi.hoisted(() =>
   vi.fn().mockReturnValue({ id: 1, show: vi.fn(), isDestroyed: () => false }),
@@ -57,6 +58,7 @@ vi.mock("../../src/main/platform/index.js", () => ({
 
 vi.mock("../../src/main/process/window-graph.js", () => ({
   createPopoverWindow: mockCreatePopoverWindow,
+  drainSettingsWindow: mockDrainSettings,
   destroyAllWindows: mockDestroyAllWindows,
   getPopoverWindow: mockGetPopoverWindow,
 }));
@@ -67,6 +69,7 @@ describe("createAppShell", () => {
     vi.resetModules();
     mockCompositionInit.mockResolvedValue(undefined);
     mockFlushSettings.mockResolvedValue(undefined);
+    mockDrainSettings.mockResolvedValue(undefined);
     mockSetupTray.mockReturnValue(vi.fn());
     mockRegisterIpcHandlers.mockReturnValue(mockIpcCleanup);
     mockIsBenchmarkMode.mockReturnValue(false);
@@ -123,12 +126,14 @@ describe("createAppShell", () => {
     await shell.cleanup();
 
     expect(mockFlushSettings).toHaveBeenCalledTimes(1);
+    expect(mockDrainSettings).toHaveBeenCalledTimes(1);
     expect(trayCleanup).toHaveBeenCalledTimes(1);
     expect(mockIpcCleanup).toHaveBeenCalledTimes(1);
     expect(mockCompositionCleanup).toHaveBeenCalledTimes(1);
     expect(mockDestroyAllWindows).toHaveBeenCalledTimes(1);
     expect(shell.ready).toBe(false);
     const order = [
+      mockDrainSettings.mock.invocationCallOrder[0],
       mockFlushSettings.mock.invocationCallOrder[0],
       trayCleanup.mock.invocationCallOrder[0],
       mockIpcCleanup.mock.invocationCallOrder[0],
@@ -289,6 +294,76 @@ describe("createAppShell", () => {
       await vi.advanceTimersByTimeAsync(1);
       await cleanup;
       expect(mockDestroyAllWindows).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives the store only the remainder of the same renderer-first deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const renderer = Promise.withResolvers<void>();
+      mockDrainSettings.mockReturnValue(renderer.promise);
+      mockFlushSettings.mockReturnValue(new Promise<void>(() => {}));
+      const { createAppShell } = await import("../../src/main/app-shell.js");
+      const shell = createAppShell();
+      await shell.init();
+      const cleanup = shell.cleanup();
+      expect(mockFlushSettings).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1500);
+      renderer.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockFlushSettings).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(499);
+      expect(mockDestroyAllWindows).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await cleanup;
+      expect(mockDestroyAllWindows).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("flushes the store after a renderer rejection and still tears down", async () => {
+    mockDrainSettings.mockRejectedValueOnce(new Error("disk rejected"));
+    const { createAppShell } = await import("../../src/main/app-shell.js");
+    const { default: log } = await import("electron-log");
+    const shell = createAppShell();
+    await shell.init();
+    await shell.cleanup();
+    expect(log.error).toHaveBeenCalledWith(
+      "[app-shell] Settings renderer drain on quit failed:", expect.any(Error),
+    );
+    expect(mockFlushSettings).toHaveBeenCalledOnce();
+    expect(mockCompositionCleanup).toHaveBeenCalledOnce();
+    expect(mockDestroyAllWindows).toHaveBeenCalledOnce();
+  });
+
+  it("aborts a stalled renderer at 2000ms, starts the store flush, and logs both timeouts", async () => {
+    vi.useFakeTimers();
+    try {
+      const signal = vi.fn();
+      mockDrainSettings.mockImplementationOnce((abortSignal: AbortSignal) => {
+        signal(abortSignal);
+        return new Promise<void>(() => {});
+      });
+      mockFlushSettings.mockReturnValue(new Promise<void>(() => {}));
+      const { createAppShell } = await import("../../src/main/app-shell.js");
+      const { default: log } = await import("electron-log");
+      const shell = createAppShell();
+      await shell.init();
+      const cleanup = shell.cleanup();
+      await vi.advanceTimersByTimeAsync(1999);
+      expect(mockFlushSettings).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await cleanup;
+      expect(signal.mock.calls[0]?.[0].aborted).toBe(true);
+      expect(mockFlushSettings).toHaveBeenCalledOnce();
+      expect(log.error).toHaveBeenCalledWith("[app-shell] Settings renderer drain on quit timed out");
+      expect(log.error).toHaveBeenCalledWith("[app-shell] Settings store flush on quit timed out");
+      expect(mockDestroyAllWindows).toHaveBeenCalledOnce();
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();

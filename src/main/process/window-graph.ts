@@ -7,8 +7,9 @@
 import { BrowserWindow, screen } from "electron/main";
 import { nativeImage, shell } from "electron/common";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { app, ipcMain, type IpcMainInvokeEvent } from "electron/main";
+import { app, ipcMain, type IpcMainEvent, type IpcMainInvokeEvent } from "electron/main";
 import {
   ABOUT_WINDOW_HEIGHT,
   ABOUT_WINDOW_WIDTH,
@@ -27,6 +28,11 @@ import {
 import { hardenWebContents } from "../security.js";
 import { broadcastToWindows } from "../utils/broadcast.js";
 import { IPC_CHANNELS } from "../../shared/types.js";
+import {
+  SETTINGS_QUIT_DRAIN_ACK,
+  SETTINGS_QUIT_DRAIN_REQUEST,
+  type SettingsQuitDrainRequest,
+} from "../../shared/settings-quit.js";
 import {
   UTILITY_DIALOG_APPLY,
   UTILITY_DIALOG_GET_PAYLOAD,
@@ -90,6 +96,7 @@ function ensureUtilityDockIcon(): void {
 
 let popoverWindow: BrowserWindow | null = null;
 let settingsWindow: BrowserWindow | null = null;
+let settingsReadyWindow: BrowserWindow | null = null;
 let aboutWindow: BrowserWindow | null = null;
 /** Single pending delayed hide for the popover (blur/minimize coalesced). */
 let popoverHideTimeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -418,6 +425,7 @@ export function createSettingsWindow(): BrowserWindow {
   }
 
   win.once("ready-to-show", () => {
+    settingsReadyWindow = win;
     // May no-op if the user dismissed before first paint (wantsVisible=false).
     presentCachedUtilityWindow(win, "settings");
   });
@@ -435,6 +443,7 @@ export function createSettingsWindow(): BrowserWindow {
     if (settingsWindow === win) {
       settingsWindow = null;
     }
+    if (settingsReadyWindow === win) settingsReadyWindow = null;
     setWantsVisible("settings", false);
     if (settingsHeldForeground) {
       releaseUtilityForeground();
@@ -449,6 +458,74 @@ export function createSettingsWindow(): BrowserWindow {
 /** True when the settings window exists and is currently visible. */
 export function isSettingsWindowOpen(): boolean {
   return settingsWindow !== null && !settingsWindow.isDestroyed() && settingsWindow.isVisible();
+}
+
+export function drainSettingsWindow(signal: AbortSignal): Promise<void> {
+  const win = settingsWindow;
+  if (
+    win === null ||
+    win !== settingsReadyWindow ||
+    win.isDestroyed() ||
+    win.webContents.isDestroyed() ||
+    win.webContents.isLoadingMainFrame()
+  ) {
+    return Promise.resolve();
+  }
+
+  const contents = win.webContents;
+  const request: SettingsQuitDrainRequest = { requestId: randomUUID() };
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const cleanup = (): void => {
+      ipcMain.removeListener(SETTINGS_QUIT_DRAIN_ACK, onAck);
+      contents.removeListener("destroyed", onDestroyed);
+      win.removeListener("closed", onDestroyed);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const settle = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve();
+    };
+    const onDestroyed = (): void => settle(new Error("Settings window closed during quit drain"));
+    const onAbort = (): void => settle(new Error("Settings quit drain timed out"));
+    const onAck = (event: IpcMainEvent, value: unknown): void => {
+      if (
+        settingsWindow !== win ||
+        win.isDestroyed() ||
+        contents.isDestroyed() ||
+        event.sender !== contents ||
+        event.senderFrame !== contents.mainFrame ||
+        event.senderFrame.parent !== null ||
+        typeof value !== "object" ||
+        value === null ||
+        !("requestId" in value) ||
+        value.requestId !== request.requestId ||
+        !("status" in value)
+      )
+        return;
+      if (value.status === "failed") {
+        settle(new Error("Settings renderer save failed during quit drain"));
+      } else if (value.status === "saved") {
+        settle();
+      }
+    };
+    ipcMain.on(SETTINGS_QUIT_DRAIN_ACK, onAck);
+    contents.once("destroyed", onDestroyed);
+    win.once("closed", onDestroyed);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    try {
+      contents.send(SETTINGS_QUIT_DRAIN_REQUEST, request);
+    } catch (error) {
+      settle(error instanceof Error ? error : new Error("Settings quit drain send failed"));
+    }
+  });
 }
 
 /**

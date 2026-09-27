@@ -2,6 +2,12 @@ import { contextBridge, ipcRenderer } from "electron";
 import type { IpcRendererEvent } from "electron";
 import { BENCHMARK_ENV_NAME } from "../shared/benchmark-types.js";
 import { IPC_CHANNELS } from "../shared/types.js";
+import {
+  SETTINGS_QUIT_DRAIN_ACK,
+  SETTINGS_QUIT_DRAIN_REQUEST,
+  type SettingsQuitDrainAck,
+  type SettingsQuitDrainRequest,
+} from "../shared/settings-quit.js";
 import type {
   AppSettings,
   IpcChannel,
@@ -51,6 +57,17 @@ const api = {
 
     open: (): Promise<IpcResponse<typeof IPC_CHANNELS.SETTINGS_OPEN>> =>
       invoke(IPC_CHANNELS.SETTINGS_OPEN),
+
+    onQuitDrain: (callback: (_request: SettingsQuitDrainRequest) => void): (() => void) => {
+      const listener = (_event: IpcRendererEvent, request: SettingsQuitDrainRequest) => {
+        callback(request);
+      };
+      ipcRenderer.on(SETTINGS_QUIT_DRAIN_REQUEST, listener);
+      return () => ipcRenderer.removeListener(SETTINGS_QUIT_DRAIN_REQUEST, listener);
+    },
+
+    ackQuitDrain: (ack: SettingsQuitDrainAck): void =>
+      ipcRenderer.send(SETTINGS_QUIT_DRAIN_ACK, ack),
   },
 
   session: {

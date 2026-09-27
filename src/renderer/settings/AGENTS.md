@@ -29,7 +29,7 @@ Separate Rsbuild renderer entry for the settings BrowserWindow. Vanilla TypeScri
 - User close hides the BrowserWindow; the renderer stays loaded (no second cold start).
 - On `visibilitychange` → visible: clear control focus (double rAF) so reopen does not restore Launch at Login or last focused control.
 - Main also blurs form focus after Settings present (deferred `executeJavaScript`).
-- Quit force-destroys the window (real unload / `beforeunload` cleanup).
+- Quit drains pending renderer saves (including while hidden) before force-destroying the window (real unload / `beforeunload` cleanup).
 
 ## Form flow
 
@@ -54,6 +54,7 @@ Separate Rsbuild renderer entry for the settings BrowserWindow. Vanilla TypeScri
 ## Save rules
 
 - Debounced (~300ms); queue latest snapshot if a save is in flight.
+- On the private quit drain request, cancel debounce and flush pending edits through the serialized queue. Acknowledge only when quiescent, freeze further saves after success, and fail without retrying indefinitely after a rejected write.
 - Display save state via constants; errors use `textContent` on the error element.
 - Validation is enforced on main (domain validators); do not reimplement full validation in UI.
 

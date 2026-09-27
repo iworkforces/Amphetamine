@@ -14,17 +14,18 @@ import { isBenchmarkMode } from "../infrastructure/benchmark/benchmark-env.js";
 import { enterTrayOnlyMode } from "./platform/index.js";
 import {
   createPopoverWindow,
+  drainSettingsWindow,
   destroyAllWindows,
   getPopoverWindow,
 } from "./process/window-graph.js";
 
-const SETTINGS_FLUSH_TIMEOUT_MS = 2000;
+const SETTINGS_QUIT_DEADLINE_MS = 2000;
 
 export interface AppShell {
   /** Ready order: tray-only mode → popover → composition → IPC → tray → updater. */
   init(): Promise<void>;
   /**
-   * Quit order: flush settings → tray → IPC → composition.cleanup → destroy windows.
+   * Quit order: drain Settings renderer → flush store → tray → IPC → composition.cleanup → destroy windows.
    * Idempotent.
    */
   cleanup(): Promise<void>;
@@ -82,19 +83,40 @@ export function createAppShell(): AppShell {
     if (cleanupOperation !== null) return cleanupOperation;
     isQuitting = true;
     cleanupOperation = (async () => {
-      let flushTimeout: ReturnType<typeof setTimeout> | undefined;
-      try {
-        await Promise.race([
-          flushSettingsWriteChain(),
-          new Promise<void>((resolve) => {
-            flushTimeout = setTimeout(resolve, SETTINGS_FLUSH_TIMEOUT_MS);
-          }),
-        ]);
-      } catch (err) {
-        log.error("[app-shell] Settings flush on quit failed:", err);
-      } finally {
-        if (flushTimeout !== undefined) clearTimeout(flushTimeout);
-      }
+      const deadline = performance.now() + SETTINGS_QUIT_DEADLINE_MS;
+      const drainController = new AbortController();
+      const awaitWithinDeadline = async (
+        stage: string,
+        operation: () => Promise<void>,
+      ): Promise<void> => {
+        const remaining = Math.max(0, deadline - performance.now());
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        try {
+          if (remaining === 0) {
+            void operation().catch((err: unknown) => {
+              log.error(`[app-shell] ${stage} on quit failed:`, err);
+            });
+            log.error(`[app-shell] ${stage} on quit timed out`);
+            return;
+          }
+          const completed = await Promise.race([
+            operation().then(() => true),
+            new Promise<false>((resolve) => {
+              timeout = setTimeout(() => resolve(false), remaining);
+            }),
+          ]);
+          if (!completed) log.error(`[app-shell] ${stage} on quit timed out`);
+        } catch (err) {
+          log.error(`[app-shell] ${stage} on quit failed:`, err);
+        } finally {
+          if (timeout !== undefined) clearTimeout(timeout);
+        }
+      };
+      await awaitWithinDeadline("Settings renderer drain", () =>
+        drainSettingsWindow(drainController.signal),
+      );
+      drainController.abort();
+      await awaitWithinDeadline("Settings store flush", flushSettingsWriteChain);
 
       try {
         cleanupTray?.();

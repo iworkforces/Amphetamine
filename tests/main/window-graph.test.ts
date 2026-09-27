@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { BrowserWindow } from "electron";
+import { SETTINGS_QUIT_DRAIN_ACK, SETTINGS_QUIT_DRAIN_REQUEST } from "../../src/shared/settings-quit.js";
 import {
   UTILITY_DIALOG_APPLY,
   UTILITY_DIALOG_GET_PAYLOAD,
@@ -31,6 +32,8 @@ const mockIpcHandle =
     ) => void
   >();
 const mockIpcRemoveHandler = vi.fn();
+const mockIpcOn = vi.fn<(_channel: string, _listener: (_event: { sender: unknown; senderFrame: { parent: unknown } | null }, _value: unknown) => void) => void>();
+const mockIpcRemoveListener = vi.fn();
 let mockWebContentsId = 0;
 const mockGetSize = vi.fn().mockReturnValue([420, 300]);
 const mockSetPosition = vi.fn();
@@ -40,6 +43,8 @@ vi.mock("electron", () => ({
   ipcMain: {
     handle: mockIpcHandle,
     removeHandler: mockIpcRemoveHandler,
+    on: mockIpcOn,
+    removeListener: mockIpcRemoveListener,
   },
   BrowserWindow: vi.fn(function (this: Record<string, unknown>) {
     this.focus = mockFocus;
@@ -53,15 +58,20 @@ vi.mock("electron", () => ({
     this.loadFile = mockLoadFile;
     this.once = mockOnce;
     this.on = mockOn;
+    this.removeListener = vi.fn();
     this.getSize = mockGetSize;
     this.setPosition = mockSetPosition;
     this.setContentSize = vi.fn();
     this.webContents = {
       id: ++mockWebContentsId,
+      mainFrame: { parent: null },
       setWindowOpenHandler: mockSetWindowOpenHandler,
       on: vi.fn(),
+      once: vi.fn(),
+      removeListener: vi.fn(),
       send: vi.fn(),
       isDestroyed: vi.fn().mockReturnValue(false),
+      isLoadingMainFrame: vi.fn().mockReturnValue(false),
       executeJavaScript: vi.fn().mockResolvedValue(undefined),
     };
   }),
@@ -161,6 +171,19 @@ function closedUtilityDialog(index = 0): void {
   handler?.({ preventDefault: vi.fn() });
 }
 
+function quitAckListener() {
+  const listener = mockIpcOn.mock.calls.findLast(([channel]) => channel === SETTINGS_QUIT_DRAIN_ACK)?.[1];
+  if (!listener) throw new Error("Expected quit acknowledgement listener");
+  return listener;
+}
+
+function quitRequest(win: BrowserWindow): { requestId: string } {
+  const send = vi.mocked(win.webContents.send);
+  const call = send.mock.calls.find(([channel]) => channel === SETTINGS_QUIT_DRAIN_REQUEST);
+  if (!call) throw new Error("Expected settings quit request");
+  return call[1] as { requestId: string };
+}
+
 describe("window-graph", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -213,6 +236,98 @@ describe("window-graph", () => {
       nodeIntegration: false,
     });
     expect(String(opts.webPreferences.preload)).toContain("preload");
+  });
+
+  it("skips absent, not-ready and destroyed Settings windows without installing a listener", async () => {
+    const { createSettingsWindow, drainSettingsWindow } = await import("../../src/main/process/window-graph.js");
+    const { BrowserWindow } = await import("electron");
+    const controller = new AbortController();
+    await drainSettingsWindow(controller.signal);
+    createSettingsWindow();
+    const settings = createdWindow(BrowserWindow);
+    await drainSettingsWindow(controller.signal);
+    expect(mockIpcOn).not.toHaveBeenCalled();
+    readyUtilityDialog();
+    vi.mocked(settings.webContents.isLoadingMainFrame).mockReturnValue(true);
+    await drainSettingsWindow(controller.signal);
+    expect(mockIpcOn).not.toHaveBeenCalled();
+    vi.mocked(settings.webContents.isLoadingMainFrame).mockReturnValue(false);
+    vi.mocked(settings.webContents.isDestroyed).mockReturnValue(true);
+    await drainSettingsWindow(controller.signal);
+    expect(mockIpcOn).not.toHaveBeenCalled();
+  });
+
+  it("drains a hidden ready Settings renderer via its exact webContents and main frame", async () => {
+    const { createSettingsWindow, drainSettingsWindow } = await import("../../src/main/process/window-graph.js");
+    const { BrowserWindow } = await import("electron");
+    createSettingsWindow();
+    const settings = createdWindow(BrowserWindow);
+    readyUtilityDialog();
+    settings.hide();
+    expect(settings.isVisible()).toBe(false);
+    const drain = drainSettingsWindow(new AbortController().signal);
+    const request = quitRequest(settings);
+    expect(request.requestId).toBeTypeOf("string");
+    quitAckListener()({ sender: settings.webContents, senderFrame: settings.webContents.mainFrame }, {
+      ...request, status: "saved",
+    });
+    await drain;
+    expect(mockIpcRemoveListener).toHaveBeenCalledWith(SETTINGS_QUIT_DRAIN_ACK, expect.any(Function));
+    expect(settings.webContents.removeListener).toHaveBeenCalledWith("destroyed", expect.any(Function));
+    expect(settings.removeListener).toHaveBeenCalledWith("closed", expect.any(Function));
+  });
+
+  it("ignores stale, mismatched, duplicate, child-frame and wrong-window replies", async () => {
+    const { createSettingsWindow, createPopoverWindow, drainSettingsWindow } = await import("../../src/main/process/window-graph.js");
+    const { BrowserWindow } = await import("electron");
+    createPopoverWindow({ isQuitting: () => false });
+    createSettingsWindow();
+    const popover = createdWindow(BrowserWindow, 0);
+    const settings = createdWindow(BrowserWindow, 1);
+    readyUtilityDialog();
+    const drain = drainSettingsWindow(new AbortController().signal);
+    const request = quitRequest(settings);
+    const ack = quitAckListener();
+    ack({ sender: popover.webContents, senderFrame: popover.webContents.mainFrame }, { ...request, status: "saved" });
+    ack({ sender: settings.webContents, senderFrame: { parent: settings.webContents.mainFrame } }, { ...request, status: "saved" });
+    ack({ sender: settings.webContents, senderFrame: settings.webContents.mainFrame }, { requestId: "stale", status: "saved" });
+    ack({ sender: settings.webContents, senderFrame: settings.webContents.mainFrame }, { ...request, status: "invalid" });
+    expect(mockIpcRemoveListener).not.toHaveBeenCalledWith(SETTINGS_QUIT_DRAIN_ACK, ack);
+    ack({ sender: settings.webContents, senderFrame: settings.webContents.mainFrame }, { ...request, status: "saved" });
+    await drain;
+    ack({ sender: settings.webContents, senderFrame: settings.webContents.mainFrame }, { ...request, status: "saved" });
+    expect(mockIpcRemoveListener).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a renderer failure and removes the private listener", async () => {
+    const { createSettingsWindow, drainSettingsWindow } = await import("../../src/main/process/window-graph.js");
+    const { BrowserWindow } = await import("electron");
+    createSettingsWindow();
+    const settings = createdWindow(BrowserWindow);
+    readyUtilityDialog();
+    const drain = drainSettingsWindow(new AbortController().signal);
+    quitAckListener()({ sender: settings.webContents, senderFrame: settings.webContents.mainFrame }, {
+      ...quitRequest(settings), status: "failed",
+    });
+    await expect(drain).rejects.toThrow("Settings renderer save failed");
+    expect(mockIpcRemoveListener).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects renderer destruction or deadline cancellation during a drain", async () => {
+    const { createSettingsWindow, drainSettingsWindow } = await import("../../src/main/process/window-graph.js");
+    const { BrowserWindow } = await import("electron");
+    createSettingsWindow();
+    const settings = createdWindow(BrowserWindow);
+    readyUtilityDialog();
+    const controller = new AbortController();
+    const drain = drainSettingsWindow(controller.signal);
+    const destroyed = vi.mocked(settings.webContents.once).mock.calls.at(-1)?.[1] as unknown as (() => void) | undefined;
+    destroyed?.();
+    await expect(drain).rejects.toThrow("Settings window closed");
+    const nextDrain = drainSettingsWindow(controller.signal);
+    controller.abort();
+    await expect(nextDrain).rejects.toThrow("timed out");
+    expect(mockIpcRemoveListener).toHaveBeenCalledTimes(2);
   });
 
   it("showAbout uses secure triad with shared preload", async () => {

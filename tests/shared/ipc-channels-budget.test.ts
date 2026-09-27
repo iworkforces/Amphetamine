@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { IPC_CHANNELS, PUSH_CHANNELS, type IpcChannelMap } from "../../src/shared/types.js";
+import { SETTINGS_QUIT_DRAIN_ACK, SETTINGS_QUIT_DRAIN_REQUEST } from "../../src/shared/settings-quit.js";
 
 describe("IPC channel budget contract", () => {
   it("has exactly 16 named channels", () => {
@@ -22,5 +23,13 @@ describe("IPC channel budget contract", () => {
       expect(all.has(push)).toBe(true);
     }
     expect(PUSH_CHANNELS).toHaveLength(5);
+  });
+
+  it("keeps quit lifecycle messages private and disjoint from public IPC and pushes", () => {
+    const publicChannels = new Set<string>(Object.values(IPC_CHANNELS));
+    for (const channel of [SETTINGS_QUIT_DRAIN_ACK, SETTINGS_QUIT_DRAIN_REQUEST]) {
+      expect(publicChannels.has(channel)).toBe(false);
+      expect(PUSH_CHANNELS).not.toContain(channel);
+    }
   });
 });

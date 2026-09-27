@@ -17,7 +17,7 @@ Both entries are produced by multi-entry Rslib (`rslib.config.preload.ts`, filen
 |-----------|---------|---------|
 | `window` | `setHeight(n)` | validated fire-and-forget send |
 | `app` | `getVersion()`, `getAbout()`, `quit()` | `ipcRenderer.invoke` |
-| `settings` | `get()`, `set(partial)`, `open()` | invoke |
+| `settings` | `get()`, `set(partial)`, `open()`; `onQuitDrain(cb)`, `ackQuitDrain(ack)` | invoke; private correlated quit request/ack bridge |
 | `session` | `start`, `cancel`, `getStatus` | invoke |
 | `autoUpdater` | `checkForUpdates()`, `onStatus(cb)` | invoke + push |
 | `benchmark` | `isEnabled()` | env bridge read-only (`AMPHETAMINE_BENCHMARK`) |
@@ -35,6 +35,7 @@ onXxx: (callback: (data: T) => void) => {
 ```
 
 Always return unsubscribe. Payload types from `IpcChannelMap` / push responses.
+`settings.onQuitDrain` also returns an unsubscribe function; its private channel names and payload types come from `src/shared/settings-quit.ts`, not the public channel map.
 
 ## Utility dialog API (`utilityDialogApi`)
 
