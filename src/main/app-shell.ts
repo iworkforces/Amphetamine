@@ -44,68 +44,74 @@ export function createAppShell(): AppShell {
   let cleanupTray: (() => void) | null = null;
   let mainWindow: BrowserWindow | null = null;
   let isQuitting = false;
-  let didRunCleanup = false;
   let ready = false;
+  let initOperation: Promise<void> | null = null;
+  let cleanupOperation: Promise<void> | null = null;
+  const isClosing = (): boolean => isQuitting;
 
-  const init = async (): Promise<void> => {
-    if (ready) {
-      log.warn("[app-shell] init() called while already ready — ignoring");
-      return;
-    }
+  const init = (): Promise<void> => {
+    if (cleanupOperation !== null || isQuitting) return Promise.resolve();
+    if (initOperation !== null) return initOperation;
+    initOperation = (async () => {
+      try {
+        enterTrayOnlyMode();
+        mainWindow = createPopoverWindow({ isQuitting: () => isQuitting });
+        composition = createAppComposition();
+        await composition.init();
+        if (isClosing()) return;
 
-    // Tray-only shell: macOS accessory policy; Windows uses skipTaskbar per window
-    enterTrayOnlyMode();
-    mainWindow = createPopoverWindow({ isQuitting: () => isQuitting });
-
-    // Composition before IPC: handlers receive injected session handle.
-    composition = createAppComposition();
-    await composition.init();
-
-    registerIpcHandlers(mainWindow, composition.getIpcDeps());
-    cleanupTray = setupTray(composition.getTrayDeps());
-
-    if (!isBenchmarkMode()) {
-      composition.initUpdater();
-    }
-
-    ready = true;
-    log.info("[app-shell] Initialized");
+        registerIpcHandlers(mainWindow, composition.getIpcDeps());
+        cleanupTray = setupTray(composition.getTrayDeps());
+        if (!isBenchmarkMode()) composition.initUpdater();
+        ready = true;
+        log.info("[app-shell] Initialized");
+      } catch (err) {
+        await cleanup();
+        throw err;
+      }
+    })();
+    return initOperation;
   };
 
-  const cleanup = async (): Promise<void> => {
-    if (didRunCleanup) return;
-    didRunCleanup = true;
+  const cleanup = (): Promise<void> => {
+    if (cleanupOperation !== null) return cleanupOperation;
     isQuitting = true;
+    cleanupOperation = (async () => {
+      let flushTimeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          flushSettingsWriteChain(),
+          new Promise<void>((resolve) => {
+            flushTimeout = setTimeout(resolve, SETTINGS_FLUSH_TIMEOUT_MS);
+          }),
+        ]);
+      } catch (err) {
+        log.error("[app-shell] Settings flush on quit failed:", err);
+      } finally {
+        if (flushTimeout !== undefined) clearTimeout(flushTimeout);
+      }
 
-    try {
-      await Promise.race([
-        flushSettingsWriteChain(),
-        new Promise<void>((resolve) => {
-          setTimeout(resolve, SETTINGS_FLUSH_TIMEOUT_MS);
-        }),
-      ]);
-    } catch (err) {
-      log.error("[app-shell] Settings flush on quit failed:", err);
-    }
-
-    try {
-      cleanupTray?.();
-    } catch (err) {
-      log.error("[app-shell] Tray cleanup on quit failed:", err);
-    }
-    cleanupTray = null;
-
-    try {
-      composition?.cleanup();
-    } catch (err) {
-      log.error("[app-shell] Composition cleanup on quit failed:", err);
-    }
-    composition = null;
-
-    destroyAllWindows();
-    mainWindow = null;
-    ready = false;
-    log.info("[app-shell] Cleaned up");
+      try {
+        cleanupTray?.();
+      } catch (err) {
+        log.error("[app-shell] Tray cleanup on quit failed:", err);
+      }
+      cleanupTray = null;
+      try {
+        composition?.cleanup();
+      } catch (err) {
+        log.error("[app-shell] Composition cleanup on quit failed:", err);
+      }
+      composition = null;
+      try {
+        destroyAllWindows();
+      } finally {
+        mainWindow = null;
+        ready = false;
+      }
+      log.info("[app-shell] Cleaned up");
+    })();
+    return cleanupOperation;
   };
 
   return {
@@ -114,8 +120,9 @@ export function createAppShell(): AppShell {
     get ready() {
       return ready;
     },
-    getMainWindow: () => getPopoverWindow() ?? mainWindow,
+    getMainWindow: () => (isQuitting ? null : (getPopoverWindow() ?? mainWindow)),
     showMainWindow: () => {
+      if (isQuitting) return;
       const win = getPopoverWindow() ?? mainWindow;
       win?.show();
     },
