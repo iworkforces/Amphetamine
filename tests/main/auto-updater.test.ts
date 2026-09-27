@@ -17,6 +17,7 @@ const mockDownloadUpdate = vi.hoisted(() => vi.fn().mockResolvedValue(undefined)
 const mockQuitAndInstall = vi.hoisted(() => vi.fn());
 const mockGetAllWindows = vi.hoisted(() => vi.fn().mockReturnValue([]));
 const mockIpcMainHandle = vi.hoisted(() => vi.fn());
+const mockIpcMainRemoveHandler = vi.hoisted(() => vi.fn());
 const mockGetAppPath = vi.hoisted(() => vi.fn().mockReturnValue("/path/to/app.asar"));
 const mockLogInfo = vi.hoisted(() => vi.fn());
 const mockLogError = vi.hoisted(() => vi.fn());
@@ -67,6 +68,7 @@ vi.mock("electron", () => ({
   },
   ipcMain: {
     handle: mockIpcMainHandle,
+    removeHandler: mockIpcMainRemoveHandler,
   },
 }));
 
@@ -87,7 +89,7 @@ function getHandler(eventName: string): (...args: unknown[]) => void {
 describe("auto-updater (hybrid infrastructure)", () => {
   let initAutoUpdater: () => void;
   let stopAutoUpdater: () => void;
-  let registerAutoUpdaterIpc: () => void;
+  let registerAutoUpdaterIpc: () => () => void;
   let checkForUpdatesNow: () => void;
 
   beforeEach(async () => {
@@ -103,9 +105,8 @@ describe("auto-updater (hybrid infrastructure)", () => {
 
     const hybrid = await import("../../src/infrastructure/updater/hybrid-auto-updater.js");
     const { broadcastToWindows } = await import("../../src/main/utils/broadcast.js");
-    const { createBroadcastNotifier } = await import(
-      "../../src/infrastructure/notification/broadcast-notifier.js"
-    );
+    const { createBroadcastNotifier } =
+      await import("../../src/infrastructure/notification/broadcast-notifier.js");
     const notifier = createBroadcastNotifier(broadcastToWindows);
     hybrid.configureHybridAutoUpdater({
       publish: (event) => {
@@ -131,14 +132,17 @@ describe("auto-updater (hybrid infrastructure)", () => {
       const { app } = await import("electron");
       const originalDescriptor = Object.getOwnPropertyDescriptor(app, "isPackaged");
       try {
-        Object.defineProperty(app, "isPackaged", { value: false, configurable: true, writable: true });
+        Object.defineProperty(app, "isPackaged", {
+          value: false,
+          configurable: true,
+          writable: true,
+        });
 
         vi.resetModules();
         const freshHybrid = await import("../../src/infrastructure/updater/hybrid-auto-updater.js");
         const { broadcastToWindows: bcast } = await import("../../src/main/utils/broadcast.js");
-        const { createBroadcastNotifier: makeN } = await import(
-          "../../src/infrastructure/notification/broadcast-notifier.js"
-        );
+        const { createBroadcastNotifier: makeN } =
+          await import("../../src/infrastructure/notification/broadcast-notifier.js");
         const n = makeN(bcast);
         freshHybrid.configureHybridAutoUpdater({
           publish: (event) => {
@@ -154,7 +158,11 @@ describe("auto-updater (hybrid infrastructure)", () => {
         if (originalDescriptor) {
           Object.defineProperty(app, "isPackaged", originalDescriptor);
         } else {
-          Object.defineProperty(app, "isPackaged", { value: true, configurable: true, writable: true });
+          Object.defineProperty(app, "isPackaged", {
+            value: true,
+            configurable: true,
+            writable: true,
+          });
         }
         vi.resetModules();
         await import("../../src/infrastructure/updater/hybrid-auto-updater.js");
@@ -639,20 +647,38 @@ describe("auto-updater (hybrid infrastructure)", () => {
   });
 
   describe("registerAutoUpdaterIpc", () => {
+    it("returns an idempotent disposer for the updater invoke channel", () => {
+      const unregister = registerAutoUpdaterIpc();
+
+      unregister();
+      unregister();
+
+      expect(mockIpcMainRemoveHandler).toHaveBeenCalledExactlyOnceWith("auto-updater:check");
+    });
+
+    it("unregisters its handler if setup throws after registration", () => {
+      const setupError = new Error("updater log failed");
+      mockLogInfo.mockImplementationOnce(() => {
+        throw setupError;
+      });
+
+      expect(() => registerAutoUpdaterIpc()).toThrow(setupError);
+
+      expect(mockIpcMainHandle).toHaveBeenCalledWith("auto-updater:check", expect.any(Function));
+      expect(mockIpcMainRemoveHandler).toHaveBeenCalledExactlyOnceWith("auto-updater:check");
+    });
+
     it("registers AUTO_UPDATER_CHECK handler", () => {
       registerAutoUpdaterIpc();
-      expect(mockIpcMainHandle).toHaveBeenCalledWith(
-        "auto-updater:check",
-        expect.any(Function),
-      );
+      expect(mockIpcMainHandle).toHaveBeenCalledWith("auto-updater:check", expect.any(Function));
     });
 
     it("IPC handler returns null when checkForUpdates returns no updateInfo", async () => {
       mockCheckForUpdates.mockResolvedValueOnce(null);
       registerAutoUpdaterIpc();
-      const handler = mockIpcMainHandle.mock.calls.find((c) => c[0] === "auto-updater:check")![1] as (
-        event: unknown,
-      ) => Promise<unknown>;
+      const handler = mockIpcMainHandle.mock.calls.find(
+        (c) => c[0] === "auto-updater:check",
+      )![1] as (event: unknown) => Promise<unknown>;
 
       const result = await handler({
         senderFrame: { parent: null, url: "file:///path/to/app.asar/lib/renderer/index.html" },
@@ -757,9 +783,8 @@ describe("auto-updater (hybrid infrastructure)", () => {
         vi.resetModules();
         const freshMod = await import("../../src/infrastructure/updater/hybrid-auto-updater.js");
         const { broadcastToWindows: bcast2 } = await import("../../src/main/utils/broadcast.js");
-        const { createBroadcastNotifier: makeN2 } = await import(
-          "../../src/infrastructure/notification/broadcast-notifier.js"
-        );
+        const { createBroadcastNotifier: makeN2 } =
+          await import("../../src/infrastructure/notification/broadcast-notifier.js");
         const n2 = makeN2(bcast2);
         freshMod.configureHybridAutoUpdater({
           publish: (event) => {

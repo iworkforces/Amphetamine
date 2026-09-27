@@ -19,13 +19,19 @@ export {
  * Register the auto-updater IPC handler.
  * Allows renderer to manually trigger an update check (same hybrid path as tray).
  */
-export function registerAutoUpdaterIpc(): void {
-  typedHandle(
+export function registerAutoUpdaterIpc(): () => void {
+  const unregister = typedHandle(
     IPC_CHANNELS.AUTO_UPDATER_CHECK,
     () => null,
     async () => {
       return await checkForUpdatesForIpc();
     },
   );
-  log.info("[auto-updater] IPC handler registered");
+  try {
+    log.info("[auto-updater] IPC handler registered");
+  } catch (error) {
+    unregister();
+    throw error;
+  }
+  return unregister;
 }

@@ -78,9 +78,15 @@ export function typedHandle<K extends keyof IpcChannelMap>(
   channel: K,
   rejectedResponse: () => IpcChannelMap[K]["response"],
   handler: IpcHandler<K>,
-): void {
+): () => void {
   ipcMain.handle(channel, (event, request: IpcChannelMap[K]["request"]) => {
     if (!validateSender(event)) return rejectedResponse();
     return handler(event, request);
   });
+  let registered = true;
+  return () => {
+    if (!registered) return;
+    registered = false;
+    ipcMain.removeHandler(channel);
+  };
 }
