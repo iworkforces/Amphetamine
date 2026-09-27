@@ -18,6 +18,7 @@ const mockTrayConstructor = vi.hoisted(() =>
     this.popUpContextMenu = vi.fn();
     this.setContextMenu = vi.fn();
     this.setIgnoreDoubleClickEvents = vi.fn();
+    this.destroy = vi.fn();
   }),
 );
 const mockNativeThemeOn = vi.hoisted(() => vi.fn());
@@ -113,6 +114,7 @@ describe("tray", () => {
       this.popUpContextMenu = vi.fn();
       this.setContextMenu = vi.fn();
       this.setIgnoreDoubleClickEvents = vi.fn();
+      this.destroy = vi.fn();
     });
     mockCreateFromPath.mockReturnValue({
       toPNG: vi.fn().mockReturnValue(Buffer.alloc(0)),
@@ -153,9 +155,7 @@ describe("tray", () => {
       setupTray(createTrayDeps());
 
       const trayInstance = mockTrayConstructor.mock.results[0]!.value;
-      expect(trayInstance.setToolTip).toHaveBeenCalledWith(
-        expect.stringContaining("Amphetamine"),
-      );
+      expect(trayInstance.setToolTip).toHaveBeenCalledWith(expect.stringContaining("Amphetamine"));
     });
 
     it("registers click handler on tray", async () => {
@@ -241,9 +241,7 @@ describe("tray", () => {
         const setImageCalls = trayInstance.setImage.mock.calls.length;
 
         // Get the nativeTheme updated handler and call it
-        const themeHandler = mockNativeThemeOn.mock.calls.find(
-          (call) => call[0] === "updated",
-        )![1];
+        const themeHandler = mockNativeThemeOn.mock.calls.find((call) => call[0] === "updated")![1];
         themeHandler();
 
         // Theme updates are debounced (50ms) — flush timer
@@ -338,14 +336,11 @@ describe("tray", () => {
     });
 
     it("Quit menu item has CommandOrControl+Q accelerator", async () => {
-
       const { setupTray } = await import("../../src/main/tray.js");
       setupTray(createTrayDeps());
 
       const template = mockBuildFromTemplate.mock.calls[0]![0];
-      const quitItem = template.find(
-        (item: { label?: string }) => item.label === MENU_QUIT,
-      );
+      const quitItem = template.find((item: { label?: string }) => item.label === MENU_QUIT);
       expect(quitItem.accelerator).toBe(ACCELERATOR_QUIT);
     });
 
@@ -456,6 +451,98 @@ describe("tray", () => {
       // synchronously rather than crashing the process asynchronously.
       expect(() => setupTray(createTrayDeps())).toThrow("Tray init failed");
     });
+
+    it("rolls back subscriptions, theme listener, and tray when menu setup fails", async () => {
+      const failure = new Error("menu failed");
+      mockBuildFromTemplate.mockImplementationOnce(() => {
+        throw failure;
+      });
+      const { setupTray, measureBenchmarkTrayMenuProxy } = await import("../../src/main/tray.js");
+
+      expect(() => setupTray(createTrayDeps())).toThrow(failure);
+      expect(settingsChangeCallbacks).toHaveLength(0);
+      expect(activeStateChangeCallbacks).toHaveLength(0);
+      expect(mockNativeThemeRemoveListener).toHaveBeenCalledWith(
+        "updated",
+        mockNativeThemeOn.mock.calls[0]![1],
+      );
+      expect(mockTrayConstructor.mock.results[0]!.value.destroy).toHaveBeenCalledOnce();
+      expect(measureBenchmarkTrayMenuProxy()).toBeNull();
+    });
+
+    it("rolls back the first subscription if registering the second throws", async () => {
+      const failure = new Error("active registration failed");
+      const deps = createTrayDeps();
+      deps.onActiveStateChanged = () => {
+        throw failure;
+      };
+      const { setupTray } = await import("../../src/main/tray.js");
+
+      expect(() => setupTray(deps)).toThrow(failure);
+      expect(settingsChangeCallbacks).toHaveLength(0);
+      expect(mockTrayConstructor.mock.results[0]!.value.destroy).toHaveBeenCalledOnce();
+    });
+
+    it("cancels a theme timer and keeps callbacks inert when teardown itself fails", async () => {
+      vi.useFakeTimers();
+      try {
+        const failure = new Error("click registration failed");
+        const deps = createTrayDeps();
+        const originalSubscribe = deps.onActiveStateChanged;
+        deps.onActiveStateChanged = (callback) => {
+          const unsubscribe = originalSubscribe(callback);
+          const themeCallback = mockNativeThemeOn.mock.calls[0]![1] as () => void;
+          themeCallback();
+          return () => {
+            unsubscribe();
+            throw new Error("unsubscribe failed");
+          };
+        };
+        mockTrayConstructor.mockImplementationOnce(function (
+          this: Record<string, ReturnType<typeof vi.fn>>,
+        ) {
+          this.setToolTip = vi.fn();
+          this.setContextMenu = vi.fn();
+          this.setIgnoreDoubleClickEvents = vi.fn();
+          this.on = vi.fn(() => {
+            throw failure;
+          });
+          this.destroy = vi.fn();
+        });
+        const { setupTray } = await import("../../src/main/tray.js");
+
+        expect(() => setupTray(deps)).toThrow(failure);
+        expect(mockTrayConstructor.mock.results[0]!.value.destroy).toHaveBeenCalledOnce();
+        expect(settingsChangeCallbacks).toHaveLength(0);
+        expect(activeStateChangeCallbacks).toHaveLength(0);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("destroys the tray and releases remaining resources if an unsubscribe throws", async () => {
+      const deps = createTrayDeps();
+      const originalSubscribe = deps.onSettingsChanged;
+      deps.onSettingsChanged = (callback) => {
+        const unsubscribe = originalSubscribe(callback);
+        return () => {
+          unsubscribe();
+          throw new Error("unsubscribe failed");
+        };
+      };
+      const { setupTray, measureBenchmarkTrayMenuProxy } = await import("../../src/main/tray.js");
+      const cleanup = setupTray(deps);
+      const trayInstance = mockTrayConstructor.mock.results[0]!.value;
+
+      expect(() => cleanup()).not.toThrow();
+      expect(trayInstance.destroy).toHaveBeenCalledOnce();
+      expect(activeStateChangeCallbacks).toHaveLength(0);
+      expect(mockNativeThemeRemoveListener).toHaveBeenCalledOnce();
+      expect(measureBenchmarkTrayMenuProxy()).toBeNull();
+      cleanup();
+      expect(trayInstance.destroy).toHaveBeenCalledOnce();
+    });
   });
 
   describe("theme debounce", () => {
@@ -468,9 +555,7 @@ describe("tray", () => {
         const trayInstance = mockTrayConstructor.mock.results[0]!.value;
         const initialSetImageCalls = trayInstance.setImage.mock.calls.length;
 
-        const themeHandler = mockNativeThemeOn.mock.calls.find(
-          (call) => call[0] === "updated",
-        )![1];
+        const themeHandler = mockNativeThemeOn.mock.calls.find((call) => call[0] === "updated")![1];
 
         // Fire 5 rapid theme update events
         themeHandler();

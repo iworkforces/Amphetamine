@@ -259,18 +259,55 @@ describe("window-graph", () => {
   });
 
   it("destroyAllWindows destroys utility windows and popover", async () => {
-    const {
-      createPopoverWindow,
-      createSettingsWindow,
-      showAbout,
-      destroyAllWindows,
-    } = await import("../../src/main/process/window-graph.js");
+    const { createPopoverWindow, createSettingsWindow, showAbout, destroyAllWindows } =
+      await import("../../src/main/process/window-graph.js");
     createPopoverWindow({ isQuitting: () => false });
     createSettingsWindow();
     showAbout();
     destroyAllWindows();
     // Utility windows force-destroy (warm cache must not survive quit).
     expect(mockDestroy.mock.calls.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("attempts every tracked window when individual destroy calls throw", async () => {
+    const {
+      createPopoverWindow,
+      createSettingsWindow,
+      showAbout,
+      presentUtilityDialog,
+      destroyAllWindows,
+      getPopoverWindow,
+    } = await import("../../src/main/process/window-graph.js");
+    const { BrowserWindow } = await import("electron");
+    const popover = createPopoverWindow({ isQuitting: () => false });
+    const settings = createSettingsWindow();
+    showAbout();
+    const about = createdWindow(BrowserWindow, 2);
+    const dialog = presentUtilityDialog({ ...dialogOptions, cancelId: 1 });
+    const utility = createdWindow(BrowserWindow, 3);
+    const failure = new Error("utility destroy failed");
+    const utilityDestroy = vi.fn(() => {
+      throw failure;
+    });
+    const settingsDestroy = vi.fn(() => {
+      throw new Error("settings destroy failed");
+    });
+    const aboutDestroy = vi.fn();
+    const popoverDestroy = vi.fn();
+    utility.destroy = utilityDestroy;
+    settings.destroy = settingsDestroy;
+    about.destroy = aboutDestroy;
+    popover.destroy = popoverDestroy;
+
+    expect(() => destroyAllWindows()).toThrow(failure);
+    await expect(dialog).resolves.toEqual({ response: 1, checkboxChecked: false });
+    expect(utilityDestroy).toHaveBeenCalledOnce();
+    expect(settingsDestroy).toHaveBeenCalledOnce();
+    expect(aboutDestroy).toHaveBeenCalledOnce();
+    expect(popoverDestroy).toHaveBeenCalledOnce();
+    expect(mockIpcRemoveHandler).toHaveBeenCalledTimes(3);
+    expect(getPopoverWindow()).toBeNull();
+    expect(() => destroyAllWindows()).not.toThrow();
   });
 
   it("hides settings on user close and reuses the cached window", async () => {
@@ -292,8 +329,7 @@ describe("window-graph", () => {
     expect(mockAcquireUtility).toHaveBeenCalledTimes(1);
 
     const closeHandler = mockOn.mock.calls.find((c) => c[0] === "close")?.[1] as
-      | ((e: { preventDefault: () => void }) => void)
-      | undefined;
+      ((e: { preventDefault: () => void }) => void) | undefined;
     expect(closeHandler).toBeTypeOf("function");
     const preventDefault = vi.fn();
     closeHandler?.({ preventDefault });
@@ -343,8 +379,7 @@ describe("window-graph", () => {
     expect(mockAcquireUtility).toHaveBeenCalledTimes(1);
 
     const closeHandler = mockOn.mock.calls.find((c) => c[0] === "close")?.[1] as
-      | ((e: { preventDefault: () => void }) => void)
-      | undefined;
+      ((e: { preventDefault: () => void }) => void) | undefined;
     closeHandler?.({ preventDefault: vi.fn() });
     expect(mockHide).toHaveBeenCalled();
     expect(mockReleaseUtility).toHaveBeenCalledTimes(1);
@@ -382,8 +417,7 @@ describe("window-graph", () => {
     expect(BrowserWindow).toHaveBeenCalledTimes(1);
 
     const closeHandler = mockOn.mock.calls.find((c) => c[0] === "close")?.[1] as
-      | ((e: { preventDefault: () => void }) => void)
-      | undefined;
+      ((e: { preventDefault: () => void }) => void) | undefined;
     closeHandler?.({ preventDefault: vi.fn() });
     expect(mockHide).toHaveBeenCalled();
 
@@ -411,15 +445,13 @@ describe("window-graph", () => {
       mockIsVisible.mockReturnValue(false);
     });
 
-    const { createSettingsWindow, isSettingsWindowOpen } = await import(
-      "../../src/main/process/window-graph.js"
-    );
+    const { createSettingsWindow, isSettingsWindowOpen } =
+      await import("../../src/main/process/window-graph.js");
     createSettingsWindow();
     expect(isSettingsWindowOpen()).toBe(true);
 
     const closeHandler = mockOn.mock.calls.find((c) => c[0] === "close")?.[1] as
-      | ((e: { preventDefault: () => void }) => void)
-      | undefined;
+      ((e: { preventDefault: () => void }) => void) | undefined;
     closeHandler?.({ preventDefault: vi.fn() });
     expect(isSettingsWindowOpen()).toBe(false);
   });
@@ -551,18 +583,15 @@ describe("window-graph", () => {
 
     it("blur/minimize bursts create at most one pending hide and one broadcast", async () => {
       vi.useFakeTimers();
-      const { createPopoverWindow, hasPendingPopoverHide } = await import(
-        "../../src/main/process/window-graph.js"
-      );
+      const { createPopoverWindow, hasPendingPopoverHide } =
+        await import("../../src/main/process/window-graph.js");
       const { broadcastToWindows } = await import("../../src/main/utils/broadcast.js");
       createPopoverWindow({ isQuitting: () => false });
 
       const blurHandler = mockOn.mock.calls.find((c) => c[0] === "blur")?.[1] as
-        | (() => void)
-        | undefined;
+        (() => void) | undefined;
       const minimizeHandler = mockOn.mock.calls.find((c) => c[0] === "minimize")?.[1] as
-        | (() => void)
-        | undefined;
+        (() => void) | undefined;
       expect(blurHandler).toBeTypeOf("function");
       expect(minimizeHandler).toBeTypeOf("function");
 
@@ -586,17 +615,14 @@ describe("window-graph", () => {
 
     it("showing before hide expiry cancels stale hide", async () => {
       vi.useFakeTimers();
-      const { createPopoverWindow, hasPendingPopoverHide } = await import(
-        "../../src/main/process/window-graph.js"
-      );
+      const { createPopoverWindow, hasPendingPopoverHide } =
+        await import("../../src/main/process/window-graph.js");
       createPopoverWindow({ isQuitting: () => false });
 
       const minimizeHandler = mockOn.mock.calls.find((c) => c[0] === "minimize")?.[1] as
-        | (() => void)
-        | undefined;
+        (() => void) | undefined;
       const showHandler = mockOn.mock.calls.find((c) => c[0] === "show")?.[1] as
-        | (() => void)
-        | undefined;
+        (() => void) | undefined;
       expect(showHandler).toBeTypeOf("function");
 
       minimizeHandler?.();
@@ -611,13 +637,11 @@ describe("window-graph", () => {
 
     it("destroyAllWindows clears pending hide timer", async () => {
       vi.useFakeTimers();
-      const { createPopoverWindow, destroyAllWindows, hasPendingPopoverHide } = await import(
-        "../../src/main/process/window-graph.js"
-      );
+      const { createPopoverWindow, destroyAllWindows, hasPendingPopoverHide } =
+        await import("../../src/main/process/window-graph.js");
       createPopoverWindow({ isQuitting: () => false });
       const minimizeHandler = mockOn.mock.calls.find((c) => c[0] === "minimize")?.[1] as
-        | (() => void)
-        | undefined;
+        (() => void) | undefined;
       minimizeHandler?.();
       expect(hasPendingPopoverHide()).toBe(true);
       destroyAllWindows();
@@ -627,9 +651,8 @@ describe("window-graph", () => {
 
     it("does not hide a destroyed popover when its delayed minimize expires", async () => {
       vi.useFakeTimers();
-      const { createPopoverWindow, getPopoverWindow, hasPendingPopoverHide } = await import(
-        "../../src/main/process/window-graph.js"
-      );
+      const { createPopoverWindow, getPopoverWindow, hasPendingPopoverHide } =
+        await import("../../src/main/process/window-graph.js");
       createPopoverWindow({ isQuitting: () => false });
       const minimize = mockOn.mock.calls.find(([event]) => event === "minimize")?.[1];
       minimize?.({ preventDefault: vi.fn() });
@@ -643,9 +666,8 @@ describe("window-graph", () => {
     });
 
     it("reuses a live popover and ignores late events from its replaced predecessor", async () => {
-      const { createPopoverWindow, getPopoverWindow, hasPendingPopoverHide } = await import(
-        "../../src/main/process/window-graph.js"
-      );
+      const { createPopoverWindow, getPopoverWindow, hasPendingPopoverHide } =
+        await import("../../src/main/process/window-graph.js");
       const { BrowserWindow } = await import("electron");
       const first = createPopoverWindow({ isQuitting: () => false });
       expect(createPopoverWindow({ isQuitting: () => false })).toBe(first);
@@ -674,8 +696,7 @@ describe("window-graph", () => {
       createSettingsWindow();
 
       const closedHandler = mockOn.mock.calls.find((c) => c[0] === "closed")?.[1] as
-        | (() => void)
-        | undefined;
+        (() => void) | undefined;
       expect(closedHandler).toBeTypeOf("function");
       // Never fire ready-to-show → heldForeground stays false
       closedHandler?.();
@@ -695,17 +716,15 @@ describe("window-graph", () => {
       expect(mockAcquireUtility).toHaveBeenCalledTimes(1);
 
       const closeHandler = mockOn.mock.calls.find((c) => c[0] === "close")?.[1] as
-        | ((e: { preventDefault: () => void }) => void)
-        | undefined;
+        ((e: { preventDefault: () => void }) => void) | undefined;
       closeHandler?.({ preventDefault: vi.fn() });
       expect(mockReleaseUtility).toHaveBeenCalledTimes(1);
       expect(mockHide).toHaveBeenCalled();
     });
 
     it("leaves an unpainted settings window hidden when the user closes it", async () => {
-      const { createSettingsWindow, isSettingsWindowOpen } = await import(
-        "../../src/main/process/window-graph.js"
-      );
+      const { createSettingsWindow, isSettingsWindowOpen } =
+        await import("../../src/main/process/window-graph.js");
       createSettingsWindow();
 
       expect(closeUtilityDialog()).toHaveBeenCalledTimes(1);
@@ -850,9 +869,9 @@ describe("window-graph", () => {
       const newWindow = createdWindow(BrowserWindow, 1);
       expect(BrowserWindow).toHaveBeenCalledTimes(2);
       expect(mockIpcHandle).toHaveBeenCalledTimes(3);
-      expect(() => invokeUtilityDialog(UTILITY_DIALOG_GET_PAYLOAD, oldWindow.webContents.id)).toThrow(
-        "No active dialog payload",
-      );
+      expect(() =>
+        invokeUtilityDialog(UTILITY_DIALOG_GET_PAYLOAD, oldWindow.webContents.id),
+      ).toThrow("No active dialog payload");
       expect(invokeUtilityDialog(UTILITY_DIALOG_GET_PAYLOAD, newWindow.webContents.id)).toEqual(
         nextOptions,
       );
@@ -1164,6 +1183,63 @@ describe("window-graph", () => {
       expect(mockDestroy).toHaveBeenCalledTimes(1);
       expect(mockIpcRemoveHandler).toHaveBeenCalledTimes(3);
       expect(mockReleaseUtility).toHaveBeenCalledTimes(1);
+    });
+
+    it("settles an active dialog and attempts every release when private IPC removal fails", async () => {
+      const { presentUtilityDialog, destroyAllWindows } =
+        await import("../../src/main/process/window-graph.js");
+      const { BrowserWindow } = await import("electron");
+      const result = presentUtilityDialog({ ...dialogOptions, cancelId: 1 });
+      const window = createdWindow(BrowserWindow);
+      const removalError = new Error("payload handler removal failed");
+      mockIpcRemoveHandler.mockImplementationOnce(() => {
+        throw removalError;
+      });
+      const destroyWindow = vi.fn(() => {
+        throw new Error("window destroy failed");
+      });
+      window.destroy = destroyWindow;
+
+      expect(() => destroyAllWindows()).toThrow(removalError);
+      await expect(result).resolves.toEqual({ response: 1, checkboxChecked: false });
+      expect(mockIpcRemoveHandler.mock.calls.map(([channel]) => channel)).toEqual([
+        UTILITY_DIALOG_GET_PAYLOAD,
+        UTILITY_DIALOG_RESPOND,
+        UTILITY_DIALOG_SET_HEIGHT,
+      ]);
+      expect(destroyWindow).toHaveBeenCalledOnce();
+      expect(mockReleaseUtility).toHaveBeenCalledOnce();
+      expect(() => destroyAllWindows()).not.toThrow();
+      expect(mockIpcRemoveHandler).toHaveBeenCalledTimes(3);
+      expect(destroyWindow).toHaveBeenCalledOnce();
+    });
+
+    it("attempts every release for an idle cached dialog when private IPC removal fails", async () => {
+      const { presentUtilityDialog, closeUtilityDialogWindow, destroyAllWindows } =
+        await import("../../src/main/process/window-graph.js");
+      const { BrowserWindow } = await import("electron");
+      const result = presentUtilityDialog(dialogOptions);
+      const window = createdWindow(BrowserWindow);
+      readyUtilityDialog();
+      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, window.webContents.id, 1);
+      await expect(result).resolves.toEqual({ response: 1, checkboxChecked: false });
+      const removalError = new Error("payload handler removal failed");
+      mockIpcRemoveHandler.mockImplementationOnce(() => {
+        throw removalError;
+      });
+      const destroyWindow = vi.fn();
+      window.destroy = destroyWindow;
+
+      expect(() => closeUtilityDialogWindow()).toThrow(removalError);
+      expect(mockIpcRemoveHandler.mock.calls.map(([channel]) => channel)).toEqual([
+        UTILITY_DIALOG_GET_PAYLOAD,
+        UTILITY_DIALOG_RESPOND,
+        UTILITY_DIALOG_SET_HEIGHT,
+      ]);
+      expect(destroyWindow).toHaveBeenCalledOnce();
+      expect(() => destroyAllWindows()).not.toThrow();
+      expect(mockIpcRemoveHandler).toHaveBeenCalledTimes(3);
+      expect(destroyWindow).toHaveBeenCalledOnce();
     });
 
     it("settles an active dialog and destroys its shell on app-wide window teardown", async () => {

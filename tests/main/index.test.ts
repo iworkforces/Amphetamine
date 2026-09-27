@@ -161,6 +161,8 @@ describe("main index - AppShell bootstrap", () => {
 
     // Reset mocks
     mockGetSettings.mockReturnValue({ launchAtLogin: false, preventSleep: false });
+    mockCompositionInit.mockResolvedValue(undefined);
+    mockWhenReady.mockResolvedValue(undefined);
   });
 
   it("creates BrowserWindow with correct width and height", async () => {
@@ -209,5 +211,23 @@ describe("main index - AppShell bootstrap", () => {
     const callArgs = BrowserWindow.mock.calls[0]![0] as { webPreferences: Record<string, unknown> };
     expect(callArgs.webPreferences.preload).toContain("preload");
     expect(callArgs.webPreferences.preload).toContain("index.cjs");
+  });
+
+  it("routes startup rejection through the sole before-quit cleanup owner", async () => {
+    const startup = Promise.withResolvers<void>();
+    mockCompositionInit.mockReturnValue(startup.promise);
+    const { app } = await import("electron");
+    await import("../../src/main/index.js");
+    startup.reject(new Error("settings failed"));
+    await vi.waitFor(() => expect(app.quit).toHaveBeenCalledTimes(1));
+    const quitHandlers = mockOn.mock.calls.filter((call) => call[0] === "before-quit");
+    expect(quitHandlers).toHaveLength(1);
+    const event = { preventDefault: vi.fn() };
+    quitHandlers[0]?.[1](event);
+    await vi.waitFor(() => expect(mockExit).toHaveBeenCalledWith(0));
+    expect(event.preventDefault).toHaveBeenCalledTimes(1);
+    expect(mockCompositionCleanup).toHaveBeenCalledTimes(1);
+    expect(mockRegisterIpcHandlers).not.toHaveBeenCalled();
+    expect(mockSetupTray).not.toHaveBeenCalled();
   });
 });

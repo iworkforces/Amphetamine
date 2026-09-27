@@ -6,12 +6,7 @@
 import log from "electron-log";
 import { powerMonitor } from "electron/main";
 import type { AppSettings } from "../shared/types.js";
-import {
-  initSettings,
-  getSettings,
-  getSettingsStore,
-  onSettingsChanged,
-} from "./settings.js";
+import { initSettings, getSettings, getSettingsStore, onSettingsChanged } from "./settings.js";
 import { getAutoLaunchPort } from "./auto-launch.js";
 import {
   registerGlobalShortcut,
@@ -19,14 +14,8 @@ import {
   type ShortcutDeps,
 } from "./global-shortcut.js";
 import { isPreventingSleep, stopPreventingSleep, getSleepBlockerPort } from "./sleep-prevention.js";
-import {
-  createBatteryMonitor,
-  type BatteryMonitorHandle,
-} from "./battery-monitor.js";
-import {
-  createSessionTimer,
-  type SessionTimerHandle,
-} from "./session-timer.js";
+import { createBatteryMonitor, type BatteryMonitorHandle } from "./battery-monitor.js";
+import { createSessionTimer, type SessionTimerHandle } from "./session-timer.js";
 import type { TrayDeps } from "./tray.js";
 import { createSettingsWindow, closeSettingsWindow } from "./settings-window.js";
 import { closeAboutWindow } from "./about-window.js";
@@ -71,6 +60,9 @@ export function createAppComposition(): AppComposition {
   let sessionActiveCache = false;
   let effectiveActive = false;
   let ready = false;
+  let closing = false;
+  let initOperation: Promise<void> | null = null;
+  const isClosing = (): boolean => closing;
   const effectiveActiveListeners = new Set<() => void>();
 
   const logger = createElectronLogger();
@@ -140,93 +132,115 @@ export function createAppComposition(): AppComposition {
     return sessionTimer;
   };
 
-  const init = async (): Promise<void> => {
-    await initSettings();
-    const settings = getSettings();
-    prevSettings = { ...settings };
+  const init = (): Promise<void> => {
+    if (closing) return Promise.resolve();
+    if (initOperation !== null) return initOperation;
+    initOperation = (async () => {
+      try {
+        await initSettings();
+        if (isClosing()) return;
+        const settings = getSettings();
+        prevSettings = { ...settings };
 
-    getAutoLaunchPort().sync(settings.launchAtLogin);
-    sessionActiveCache = false;
-    effectiveActive = false;
-    recomputeSleepPrevention();
-
-    sessionTimer = createSessionTimer({
-      broadcast: broadcastToWindows,
-      onSessionActiveChange: (active) => {
-        sessionActiveCache = active;
+        getAutoLaunchPort().sync(settings.launchAtLogin);
+        sessionActiveCache = false;
+        effectiveActive = false;
         recomputeSleepPrevention();
-      },
-      powerMonitor,
-    });
 
-    batteryMonitor = createBatteryMonitor({
-      getThreshold: () => getSettings().batteryThreshold,
-      onAutoStop: handleLowBatteryAutoStop,
-      isPreventingSleep,
-      onPercentSample: (percent) => {
-        lastBatteryPercent = percent;
-      },
-    });
-    void batteryMonitor
-      .initBatteryMonitoring()
-      .catch((err) => log.error("[composition] Battery init failed:", err));
+        sessionTimer = createSessionTimer({
+          broadcast: broadcastToWindows,
+          onSessionActiveChange: (active) => {
+            sessionActiveCache = active;
+            recomputeSleepPrevention();
+          },
+          powerMonitor,
+        });
 
-    shortcutDeps = {
-      getShortcut: () => getSettings().shortcut,
-      getPreventSleep: () => getSettings().preventSleep,
-      togglePreventSleep,
-    };
-    registerGlobalShortcut(shortcutDeps);
+        batteryMonitor = createBatteryMonitor({
+          getThreshold: () => getSettings().batteryThreshold,
+          onAutoStop: handleLowBatteryAutoStop,
+          isPreventingSleep,
+          onPercentSample: (percent) => {
+            lastBatteryPercent = percent;
+          },
+        });
+        void batteryMonitor
+          .initBatteryMonitoring()
+          .catch((err) => log.error("[composition] Battery init failed:", err));
 
-    const reactions = createSettingsReactionService({
-      recomputeSleepPrevention,
-      autoLaunch: getAutoLaunchPort(),
-      isPreventingSleep,
-      getSessionActive: () => sessionActiveCache,
-      reconfigureBattery: () => {
-        batteryMonitor?.reconfigure();
-      },
-      registerShortcut: () => {
-        if (shortcutDeps) {
-          registerGlobalShortcut(shortcutDeps);
-        }
-      },
-      reconcileSession: () => {
-        sessionTimer?.reconcileSessionState();
-      },
-      notifier,
-      logger,
-      logTag: "[settings-reactions]",
-    });
+        shortcutDeps = {
+          getShortcut: () => getSettings().shortcut,
+          getPreventSleep: () => getSettings().preventSleep,
+          togglePreventSleep,
+        };
+        registerGlobalShortcut(shortcutDeps);
 
-    unsubscribeSettings = onSettingsChanged((next: AppSettings) => {
-      const prev = prevSettings;
-      reactions.handleChange(next, prev);
-      prevSettings = { ...next };
-    });
+        const reactions = createSettingsReactionService({
+          recomputeSleepPrevention,
+          autoLaunch: getAutoLaunchPort(),
+          isPreventingSleep,
+          getSessionActive: () => sessionActiveCache,
+          reconfigureBattery: () => {
+            batteryMonitor?.reconfigure();
+          },
+          registerShortcut: () => {
+            if (shortcutDeps) {
+              registerGlobalShortcut(shortcutDeps);
+            }
+          },
+          reconcileSession: () => {
+            sessionTimer?.reconcileSessionState();
+          },
+          notifier,
+          logger,
+          logTag: "[settings-reactions]",
+        });
 
-    ready = true;
-    log.info("[composition] Initialized");
+        unsubscribeSettings = onSettingsChanged((next: AppSettings) => {
+          const prev = prevSettings;
+          reactions.handleChange(next, prev);
+          prevSettings = { ...next };
+        });
+
+        ready = true;
+        log.info("[composition] Initialized");
+      } catch (err) {
+        cleanup();
+        throw err;
+      }
+    })();
+    return initOperation;
   };
 
   const cleanup = (): void => {
-    closeSettingsWindow();
-    closeAboutWindow();
-    unsubscribeSettings?.();
+    if (closing) return;
+    closing = true;
+    ready = false;
+    const disposers = [
+      closeSettingsWindow,
+      closeAboutWindow,
+      () => unsubscribeSettings?.(),
+      () => batteryMonitor?.cleanupBatteryMonitoring(),
+      () => sessionTimer?.cleanup(),
+      stopPreventingSleep,
+      unregisterGlobalShortcut,
+      () => updaterPort.stop(),
+    ];
+    for (const dispose of disposers) {
+      try {
+        dispose();
+      } catch (err) {
+        log.error("[composition] Cleanup failed:", err);
+      }
+    }
     unsubscribeSettings = null;
-    batteryMonitor?.cleanupBatteryMonitoring();
     batteryMonitor = null;
-    sessionTimer?.cleanup();
     sessionTimer = null;
     sessionActiveCache = false;
     effectiveActive = false;
     effectiveActiveListeners.clear();
     prevSettings = null;
     shortcutDeps = null;
-    stopPreventingSleep();
-    unregisterGlobalShortcut();
-    updaterPort.stop();
-    ready = false;
     log.info("[composition] Cleaned up");
   };
 
@@ -265,6 +279,7 @@ export function createAppComposition(): AppComposition {
   });
 
   const initUpdater = (): void => {
+    if (closing || !ready) return;
     updaterPort.init();
   };
 

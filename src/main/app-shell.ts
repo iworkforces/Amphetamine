@@ -24,7 +24,7 @@ export interface AppShell {
   /** Ready order: tray-only mode → popover → composition → IPC → tray → updater. */
   init(): Promise<void>;
   /**
-   * Quit order: flush settings → tray → composition.cleanup → destroy windows.
+   * Quit order: flush settings → tray → IPC → composition.cleanup → destroy windows.
    * Idempotent.
    */
   cleanup(): Promise<void>;
@@ -42,70 +42,89 @@ export interface AppShell {
 export function createAppShell(): AppShell {
   let composition: AppComposition | null = null;
   let cleanupTray: (() => void) | null = null;
+  let cleanupIpc: (() => void) | null = null;
   let mainWindow: BrowserWindow | null = null;
   let isQuitting = false;
-  let didRunCleanup = false;
   let ready = false;
+  let initOperation: Promise<void> | null = null;
+  let cleanupOperation: Promise<void> | null = null;
+  const isClosing = (): boolean => isQuitting;
 
-  const init = async (): Promise<void> => {
-    if (ready) {
-      log.warn("[app-shell] init() called while already ready — ignoring");
-      return;
-    }
+  const init = (): Promise<void> => {
+    if (cleanupOperation !== null || isQuitting) return Promise.resolve();
+    if (initOperation !== null) return initOperation;
+    initOperation = (async () => {
+      try {
+        enterTrayOnlyMode();
+        mainWindow = createPopoverWindow({ isQuitting: () => isQuitting });
+        composition = createAppComposition();
+        await composition.init();
+        if (isClosing()) return;
 
-    // Tray-only shell: macOS accessory policy; Windows uses skipTaskbar per window
-    enterTrayOnlyMode();
-    mainWindow = createPopoverWindow({ isQuitting: () => isQuitting });
-
-    // Composition before IPC: handlers receive injected session handle.
-    composition = createAppComposition();
-    await composition.init();
-
-    registerIpcHandlers(mainWindow, composition.getIpcDeps());
-    cleanupTray = setupTray(composition.getTrayDeps());
-
-    if (!isBenchmarkMode()) {
-      composition.initUpdater();
-    }
-
-    ready = true;
-    log.info("[app-shell] Initialized");
+        cleanupIpc = registerIpcHandlers(mainWindow, composition.getIpcDeps());
+        cleanupTray = setupTray(composition.getTrayDeps());
+        if (!isBenchmarkMode()) composition.initUpdater();
+        ready = true;
+        log.info("[app-shell] Initialized");
+      } catch (err) {
+        try {
+          await cleanup();
+        } catch (cleanupError) {
+          log.error("[app-shell] Cleanup after failed init failed:", cleanupError);
+        }
+        throw err;
+      }
+    })();
+    return initOperation;
   };
 
-  const cleanup = async (): Promise<void> => {
-    if (didRunCleanup) return;
-    didRunCleanup = true;
+  const cleanup = (): Promise<void> => {
+    if (cleanupOperation !== null) return cleanupOperation;
     isQuitting = true;
+    cleanupOperation = (async () => {
+      let flushTimeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          flushSettingsWriteChain(),
+          new Promise<void>((resolve) => {
+            flushTimeout = setTimeout(resolve, SETTINGS_FLUSH_TIMEOUT_MS);
+          }),
+        ]);
+      } catch (err) {
+        log.error("[app-shell] Settings flush on quit failed:", err);
+      } finally {
+        if (flushTimeout !== undefined) clearTimeout(flushTimeout);
+      }
 
-    try {
-      await Promise.race([
-        flushSettingsWriteChain(),
-        new Promise<void>((resolve) => {
-          setTimeout(resolve, SETTINGS_FLUSH_TIMEOUT_MS);
-        }),
-      ]);
-    } catch (err) {
-      log.error("[app-shell] Settings flush on quit failed:", err);
-    }
-
-    try {
-      cleanupTray?.();
-    } catch (err) {
-      log.error("[app-shell] Tray cleanup on quit failed:", err);
-    }
-    cleanupTray = null;
-
-    try {
-      composition?.cleanup();
-    } catch (err) {
-      log.error("[app-shell] Composition cleanup on quit failed:", err);
-    }
-    composition = null;
-
-    destroyAllWindows();
-    mainWindow = null;
-    ready = false;
-    log.info("[app-shell] Cleaned up");
+      try {
+        cleanupTray?.();
+      } catch (err) {
+        log.error("[app-shell] Tray cleanup on quit failed:", err);
+      }
+      cleanupTray = null;
+      try {
+        cleanupIpc?.();
+      } catch (err) {
+        log.error("[app-shell] IPC cleanup on quit failed:", err);
+      }
+      cleanupIpc = null;
+      try {
+        composition?.cleanup();
+      } catch (err) {
+        log.error("[app-shell] Composition cleanup on quit failed:", err);
+      }
+      composition = null;
+      try {
+        destroyAllWindows();
+      } catch (err) {
+        log.error("[app-shell] Window cleanup on quit failed:", err);
+      } finally {
+        mainWindow = null;
+        ready = false;
+      }
+      log.info("[app-shell] Cleaned up");
+    })();
+    return cleanupOperation;
   };
 
   return {
@@ -114,8 +133,9 @@ export function createAppShell(): AppShell {
     get ready() {
       return ready;
     },
-    getMainWindow: () => getPopoverWindow() ?? mainWindow,
+    getMainWindow: () => (isQuitting ? null : (getPopoverWindow() ?? mainWindow)),
     showMainWindow: () => {
+      if (isQuitting) return;
       const win = getPopoverWindow() ?? mainWindow;
       win?.show();
     },

@@ -148,7 +148,10 @@ vi.mock("../../src/main/auto-updater.js", () => ({
 
 describe("ipc additional coverage", () => {
   let registerIpcHandlers: (
-    _win: { setSize?: (_w: number, _h: number, _animate?: boolean) => void },
+    _win: {
+      setSize?: (_w: number, _h: number, _animate?: boolean) => void;
+      on?: ReturnType<typeof vi.fn>;
+    },
     _deps: unknown,
   ) => void;
   let registeredHandlers: Map<string, (..._args: unknown[]) => unknown>;
@@ -159,7 +162,7 @@ describe("ipc additional coverage", () => {
       getSettings: mockGetSettings,
       updateSettings: mockUpdateSettings,
       createSettingsWindow: mockCreateSettingsWindow,
-      registerAutoUpdaterIpc: vi.fn(),
+      registerAutoUpdaterIpc: vi.fn(() => vi.fn()),
       sessionTimer: {
         startSession: mockStartSession,
         cancelSession: mockCancelSession,
@@ -169,7 +172,7 @@ describe("ipc additional coverage", () => {
   }
 
   const validEvent = {
-      senderFrame: { url: "file:///path/to/app.asar/lib/renderer/index.html" },
+    senderFrame: { url: "file:///path/to/app.asar/lib/renderer/index.html" },
   } as unknown as IpcMainInvokeEvent;
   const invalidEvent = {
     senderFrame: { url: "https://evil.com/" },
@@ -211,23 +214,54 @@ describe("ipc additional coverage", () => {
     });
 
     registeredHandlers = new Map();
-    vi.mocked(electron.ipcMain.handle).mockImplementation(
-      ((channel: string, handler: (..._args: unknown[]) => unknown) => {
-        registeredHandlers.set(channel, handler);
-      }) as typeof electron.ipcMain.handle
-    );
-    vi.mocked(electron.ipcMain.on).mockImplementation(
-      ((channel: string, handler: (..._args: unknown[]) => unknown) => {
-        registeredHandlers.set(channel, handler);
-        return electron.ipcMain;
-      }) as typeof electron.ipcMain.on,
-    );
+    Object.assign(electron.ipcMain, {
+      removeHandler: vi.fn((channel: string) => registeredHandlers.delete(channel)),
+    });
+    vi.mocked(electron.ipcMain.handle).mockImplementation(((
+      channel: string,
+      handler: (..._args: unknown[]) => unknown,
+    ) => {
+      registeredHandlers.set(channel, handler);
+    }) as typeof electron.ipcMain.handle);
+    vi.mocked(electron.ipcMain.on).mockImplementation(((
+      channel: string,
+      handler: (..._args: unknown[]) => unknown,
+    ) => {
+      registeredHandlers.set(channel, handler);
+      return electron.ipcMain;
+    }) as typeof electron.ipcMain.on);
 
     const mod = await import("../../src/main/ipc.js");
-    registerIpcHandlers = mod.registerIpcHandlers as unknown as typeof registerIpcHandlers;
+    registerIpcHandlers = (win, deps) =>
+      (mod.registerIpcHandlers as unknown as typeof registerIpcHandlers)(
+        { on: vi.fn(), ...win },
+        deps,
+      );
   });
 
   describe("ipcMain.on sender validation (WINDOW_SET_HEIGHT)", () => {
+    it("removes only its listener and cancels queued resize when window is destroyed", async () => {
+      vi.useFakeTimers();
+      try {
+        const electron = await import("electron");
+        const mockWindow = { setSize: vi.fn(), on: vi.fn(), removeListener: vi.fn() };
+        registerIpcHandlers(mockWindow, makeIpcDeps());
+        const handler = registeredHandlers.get(IPC_CHANNELS.WINDOW_SET_HEIGHT);
+        const destroyed = mockWindow.on.mock.calls.find(([name]) => name === "closed")?.[1];
+        expect(destroyed).toBeTypeOf("function");
+
+        handler?.(validEvent, 320);
+        destroyed();
+        await vi.advanceTimersByTimeAsync(16);
+
+        expect(electron.ipcMain.off).toHaveBeenCalledWith(IPC_CHANNELS.WINDOW_SET_HEIGHT, handler);
+        expect(mockWindow.removeListener).toHaveBeenCalledWith("closed", destroyed);
+        expect(mockWindow.setSize).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("valid file:// origin: invokes window.setSize", () => {
       const mockWindow = { setSize: vi.fn() };
       registerIpcHandlers(mockWindow, makeIpcDeps());
@@ -279,27 +313,26 @@ describe("ipc additional coverage", () => {
     it.each([
       { firstHeight: 300, latestHeight: 100, expectedHeight: 220 },
       { firstHeight: 300, latestHeight: 1000, expectedHeight: 480 },
-    ])("clamps the latest height in a coalesced burst to $expectedHeight", async ({
-      firstHeight,
-      latestHeight,
-      expectedHeight,
-    }) => {
-      vi.useFakeTimers();
-      try {
-        const mockWindow = { setSize: vi.fn() };
-        registerIpcHandlers(mockWindow, makeIpcDeps());
-        const handler = registeredHandlers.get(IPC_CHANNELS.WINDOW_SET_HEIGHT);
-        expect(handler).toBeDefined();
+    ])(
+      "clamps the latest height in a coalesced burst to $expectedHeight",
+      async ({ firstHeight, latestHeight, expectedHeight }) => {
+        vi.useFakeTimers();
+        try {
+          const mockWindow = { setSize: vi.fn() };
+          registerIpcHandlers(mockWindow, makeIpcDeps());
+          const handler = registeredHandlers.get(IPC_CHANNELS.WINDOW_SET_HEIGHT);
+          expect(handler).toBeDefined();
 
-        handler?.(validEvent, firstHeight);
-        handler?.(validEvent, latestHeight);
-        await vi.advanceTimersByTimeAsync(16);
+          handler?.(validEvent, firstHeight);
+          handler?.(validEvent, latestHeight);
+          await vi.advanceTimersByTimeAsync(16);
 
-        expect(mockWindow.setSize).toHaveBeenCalledExactlyOnceWith(360, expectedHeight, false);
-      } finally {
-        vi.useRealTimers();
-      }
-    });
+          expect(mockWindow.setSize).toHaveBeenCalledExactlyOnceWith(360, expectedHeight, false);
+        } finally {
+          vi.useRealTimers();
+        }
+      },
+    );
 
     it.each(["320", 320.5, Number.NaN])("ignores invalid height %s", async (height) => {
       vi.useFakeTimers();
@@ -357,18 +390,19 @@ describe("ipc additional coverage", () => {
       expect(mockGetPackageInfo).toHaveBeenCalledTimes(1);
     });
 
-    it("returns blank about fields without reading package metadata for a rejected sender", async () => {
+    it("returns the public fallback without reading package metadata for a rejected sender", async () => {
       const electron = await import("electron");
       registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
 
       const result = registeredHandlers.get(IPC_CHANNELS.APP_GET_ABOUT)?.(invalidEvent);
 
       expect(result).toEqual({
-        productName: "",
-        version: "",
-        description: "",
+        productName: "Amphetamine",
+        version: "2.0.0",
+        description:
+          "A tray app that keeps your computer awake on macOS and Windows. Lives in the system tray, prevents the system from going to sleep, and stays out of the Dock/taskbar when idle.",
         repository: "",
-        author: "",
+        author: "iworkforces Engineers",
       });
       expect(electron.app.getVersion).not.toHaveBeenCalled();
       expect(mockGetPackageInfo).not.toHaveBeenCalled();
@@ -507,6 +541,29 @@ describe("ipc additional coverage", () => {
 
   describe("SESSION_START with invalid durationMinutes", () => {
     const invalidDurationResponse = { ok: false, reason: "invalid-duration" } as const;
+
+    it.each([null, [], 42, "30", undefined, {}, { durationMinutes: undefined }])(
+      "malformed envelope %s: returns invalid-duration without starting session",
+      async (request) => {
+        registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+        const handler = registeredHandlers.get(IPC_CHANNELS.SESSION_START);
+
+        const result = await handler?.(validEvent, request);
+
+        expect(result).toEqual(invalidDurationResponse);
+        expect(mockStartSession).not.toHaveBeenCalled();
+      },
+    );
+
+    it("rejects an unauthorized sender before inspecting a malformed envelope", async () => {
+      registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+      const handler = registeredHandlers.get(IPC_CHANNELS.SESSION_START);
+
+      const result = await handler?.(invalidEvent, null);
+
+      expect(result).toEqual({ ok: false, reason: "rejected" });
+      expect(mockStartSession).not.toHaveBeenCalled();
+    });
 
     it("negative number: returns invalid-duration failure and does not start session", async () => {
       const mockWindow = { setSize: vi.fn() };
@@ -701,11 +758,17 @@ describe("ipc additional coverage", () => {
 
     beforeEach(async () => {
       const electron = await import("electron");
-      vi.mocked(electron.app.getAppPath).mockReturnValue("C:\\Program Files\\Amphetamine\\app.asar");
+      vi.mocked(electron.app.getAppPath).mockReturnValue(
+        "C:\\Program Files\\Amphetamine\\app.asar",
+      );
       Object.defineProperty(electron.app, "isPackaged", { configurable: true, value: true });
       vi.resetModules();
       const mod = await import("../../src/main/ipc.js");
-      registerIpcHandlers = mod.registerIpcHandlers as unknown as typeof registerIpcHandlers;
+      registerIpcHandlers = (win, deps) =>
+        (mod.registerIpcHandlers as unknown as typeof registerIpcHandlers)(
+          { on: vi.fn(), ...win },
+          deps,
+        );
       registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
     });
 
@@ -750,7 +813,10 @@ describe("ipc additional coverage", () => {
 
     it.each([
       ["outside bundle", "file:///C:/Other/Amphetamine/app.asar/lib/renderer/index.html"],
-      ["similar bundle prefix", "file:///C:/Program%20Files/Amphetamine/app.asar.evil/lib/renderer/index.html"],
+      [
+        "similar bundle prefix",
+        "file:///C:/Program%20Files/Amphetamine/app.asar.evil/lib/renderer/index.html",
+      ],
       ["unlisted renderer", `${rendererRoot}utility-dialog.html`],
       ["traversal", `${rendererRoot}../../index.html`],
       ["malformed escape", `${rendererRoot}index%ZZ.html`],
@@ -765,7 +831,10 @@ describe("ipc additional coverage", () => {
 
     it("rejects a child frame even when its URL is allowlisted", () => {
       const event = {
-        senderFrame: { url: `${rendererRoot}index.html`, parent: { url: `${rendererRoot}index.html` } },
+        senderFrame: {
+          url: `${rendererRoot}index.html`,
+          parent: { url: `${rendererRoot}index.html` },
+        },
       };
 
       const result = registeredHandlers.get(IPC_CHANNELS.APP_GET_VERSION)?.(event);
@@ -794,7 +863,11 @@ describe("ipc additional coverage", () => {
       Object.defineProperty(electron.app, "isPackaged", { configurable: true, value: false });
       vi.resetModules();
       const mod = await import("../../src/main/ipc.js");
-      registerIpcHandlers = mod.registerIpcHandlers as unknown as typeof registerIpcHandlers;
+      registerIpcHandlers = (win, deps) =>
+        (mod.registerIpcHandlers as unknown as typeof registerIpcHandlers)(
+          { on: vi.fn(), ...win },
+          deps,
+        );
       registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
       const event = { senderFrame: { url: "http://localhost:5173/index.html", parent: null } };
 

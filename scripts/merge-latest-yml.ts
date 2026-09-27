@@ -13,24 +13,21 @@ import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 
 type FeedFile = {
-  url: string;
-  sha512: string;
-  size: number;
+  readonly url: string;
+  readonly sha512: string;
+  readonly size: number | null;
 };
 
 type Feed = {
-  version: string;
-  files: FeedFile[];
-  path: string;
-  sha512: string;
-  releaseDate: string;
-  [key: string]: unknown;
+  readonly version: string;
+  readonly files: readonly FeedFile[];
+  readonly path: string;
+  readonly sha512: string;
+  readonly releaseDate: string;
 };
 
 function usage(): never {
-  process.stderr.write(
-    "Usage: bun run scripts/merge-latest-yml.ts <yml...> --out <path>\n",
-  );
+  process.stderr.write("Usage: bun run scripts/merge-latest-yml.ts <yml...> --out <path>\n");
   process.exit(2);
 }
 
@@ -58,74 +55,109 @@ function parseArgs(argv: readonly string[]): { inputs: string[]; outPath: string
  * Supports the fixed shape electron-builder emits for GitHub provider feeds.
  */
 export function parseLatestYml(raw: string): Feed {
-  const version = matchScalar(raw, "version");
-  const pathValue = matchScalar(raw, "path");
-  const sha512 = matchScalar(raw, "sha512");
-  const releaseDate = matchScalar(raw, "releaseDate");
-  if (version === null || pathValue === null || sha512 === null || releaseDate === null) {
-    throw new Error("latest.yml missing required top-level fields (version/path/sha512/releaseDate)");
-  }
-
+  const scalars = new Map<string, string>();
   const files: FeedFile[] = [];
-  const filesBlock = raw.match(/^files:\n((?:[ \t]+.*\n?)*)/m);
-  if (filesBlock?.[1] !== undefined) {
-    const entries = filesBlock[1].split(/^[ \t]*-[ \t]+url:/m).slice(1);
-    for (const entry of entries) {
-      const url = matchInlineOrNext(entry, "url") ?? entry.split("\n")[0]?.trim();
-      const fileSha = matchInlineOrNext(entry, "sha512");
-      const sizeRaw = matchInlineOrNext(entry, "size");
-      if (url === undefined || url.length === 0 || fileSha === null || sizeRaw === null) {
-        throw new Error(`latest.yml file entry incomplete:\n${entry}`);
-      }
-      const size = Number(sizeRaw);
-      if (!Number.isFinite(size)) {
-        throw new Error(`latest.yml file size is not a number: ${sizeRaw}`);
-      }
-      files.push({ url: stripQuotes(url), sha512: stripQuotes(fileSha), size });
+  let inFiles = false;
+  let fileFields = new Map<string, string>();
+  const finishFile = (): void => {
+    if (fileFields.size === 0) return;
+    const url = fileFields.get("url");
+    const sha512 = fileFields.get("sha512");
+    const sizeRaw = fileFields.get("size");
+    if (url === undefined || sha512 === undefined) {
+      throw new Error("latest.yml file entry incomplete (url/sha512)");
     }
-  }
+    if (sizeRaw !== undefined && !/^(0|[1-9][0-9]*)$/.test(sizeRaw)) {
+      throw new Error(`latest.yml invalid file size: ${sizeRaw}`);
+    }
+    const size = sizeRaw === undefined ? null : Number(sizeRaw);
+    if (size !== null && !Number.isSafeInteger(size)) {
+      throw new Error(`latest.yml invalid file size: ${sizeRaw}`);
+    }
+    files.push({ url, sha512, size });
+    fileFields = new Map<string, string>();
+  };
 
-  if (files.length === 0) {
-    // Some feeds only use path/sha512 without a files list — synthesize one entry.
-    files.push({ url: pathValue, sha512, size: 0 });
+  for (const line of raw.replaceAll("\r\n", "\n").split("\n")) {
+    if (line.trim() === "") continue;
+    if (line.startsWith("files:")) {
+      if (scalars.has("files")) throw new Error("latest.yml duplicate files field");
+      if (line !== "files:") throw new Error("latest.yml files must be a nonempty list");
+      scalars.set("files", "present");
+      inFiles = true;
+      continue;
+    }
+    if (line.startsWith("  ")) {
+      if (!inFiles) throw new Error(`latest.yml unexpected file entry: ${line}`);
+      const start = line.match(/^  - url: (.+)$/);
+      if (start !== null) {
+        finishFile();
+        fileFields.set("url", parseScalar(start[1] ?? ""));
+        continue;
+      }
+      const field = line.match(/^    (sha512|size): (.+)$/);
+      if (field === null || fileFields.size === 0 || fileFields.has(field[1] ?? "")) {
+        throw new Error(`latest.yml malformed file entry: ${line}`);
+      }
+      fileFields.set(field[1] ?? "", parseScalar(field[2] ?? ""));
+      continue;
+    }
+    if (!/^[a-zA-Z][a-zA-Z0-9]*:/.test(line)) {
+      throw new Error(`latest.yml malformed field: ${line}`);
+    }
+    if (inFiles) finishFile();
+    inFiles = false;
+    const scalar = line.match(/^([a-zA-Z][a-zA-Z0-9]*): (.+)$/);
+    if (scalar === null) throw new Error(`latest.yml malformed field: ${line}`);
+    const key = scalar[1] ?? "";
+    if (scalars.has(key)) throw new Error(`latest.yml duplicate field: ${key}`);
+    scalars.set(key, parseScalar(scalar[2] ?? ""));
   }
+  finishFile();
 
+  const version = scalars.get("version");
+  const pathValue = scalars.get("path");
+  const sha512 = scalars.get("sha512");
+  const releaseDate = scalars.get("releaseDate");
+  if (
+    version === undefined ||
+    pathValue === undefined ||
+    sha512 === undefined ||
+    releaseDate === undefined
+  ) {
+    throw new Error(
+      "latest.yml missing required top-level fields (version/path/sha512/releaseDate)",
+    );
+  }
+  if (scalars.has("files") && files.length === 0) {
+    throw new Error("latest.yml files must be a nonempty list");
+  }
   return {
-    version: stripQuotes(version),
-    files,
-    path: stripQuotes(pathValue),
-    sha512: stripQuotes(sha512),
-    releaseDate: stripQuotes(releaseDate),
+    version,
+    files: files.length > 0 ? files : [{ url: pathValue, sha512, size: null }],
+    path: pathValue,
+    sha512,
+    releaseDate,
   };
 }
 
-function matchScalar(raw: string, key: string): string | null {
-  const re = new RegExp(`^${key}:\\s*(.+)$`, "m");
-  const m = raw.match(re);
-  return m?.[1]?.trim() ?? null;
-}
-
-function matchInlineOrNext(block: string, key: string): string | null {
-  // "url: value" on first line after split, or "  key: value" later
-  if (key === "url") {
-    const first = block.split("\n")[0]?.trim();
-    if (first !== undefined && first.length > 0 && !first.includes(":")) {
-      return first;
-    }
-  }
-  const re = new RegExp(`^\\s*${key}:\\s*(.+)$`, "m");
-  const m = block.match(re);
-  return m?.[1]?.trim() ?? null;
-}
-
-function stripQuotes(value: string): string {
+function parseScalar(raw: string): string {
+  const value = raw.trim();
+  const quote = value[0];
+  const parsed =
+    quote === "'" || quote === '"'
+      ? value.length >= 2 && value.at(-1) === quote
+        ? value.slice(1, -1)
+        : ""
+      : value;
   if (
-    (value.startsWith("'") && value.endsWith("'")) ||
-    (value.startsWith('"') && value.endsWith('"'))
+    parsed.length === 0 ||
+    /[\r\n]/.test(parsed) ||
+    (quote !== "'" && quote !== '"' && /['"]/.test(parsed))
   ) {
-    return value.slice(1, -1);
+    throw new Error(`latest.yml invalid scalar: ${raw}`);
   }
-  return value;
+  return parsed;
 }
 
 export function mergeFeeds(feeds: readonly Feed[]): Feed {
@@ -133,9 +165,7 @@ export function mergeFeeds(feeds: readonly Feed[]): Feed {
     throw new Error("mergeFeeds requires at least one feed");
   }
   const first = feeds[0];
-  if (first === undefined) {
-    throw new Error("mergeFeeds requires at least one feed");
-  }
+  if (first === undefined) throw new Error("mergeFeeds requires at least one feed");
   const version = first.version;
   for (const feed of feeds) {
     if (feed.version !== version) {
@@ -143,27 +173,49 @@ export function mergeFeeds(feeds: readonly Feed[]): Feed {
         `Refusing to merge feeds with different versions: ${version} vs ${feed.version}`,
       );
     }
+    const topFile = feed.files.find((file) => file.url === feed.path);
+    if (topFile === undefined) throw new Error(`latest.yml path has no file entry: ${feed.path}`);
+    if (topFile.sha512 !== feed.sha512) {
+      throw new Error(`latest.yml path/sha512 mismatch: ${feed.path}`);
+    }
   }
 
   const byUrl = new Map<string, FeedFile>();
   for (const feed of feeds) {
     for (const file of feed.files) {
-      byUrl.set(file.url, file);
+      const existing = byUrl.get(file.url);
+      if (existing !== undefined) {
+        if (existing.sha512 !== file.sha512) {
+          throw new Error(`latest.yml conflicting sha512 for ${file.url}`);
+        }
+        if (existing.size !== null && file.size !== null && existing.size !== file.size) {
+          throw new Error(`latest.yml conflicting size for ${file.url}`);
+        }
+        byUrl.set(file.url, { ...file, size: existing.size ?? file.size });
+      } else {
+        byUrl.set(file.url, file);
+      }
     }
   }
-  const files = [...byUrl.values()].sort((a, b) => a.url.localeCompare(b.url));
+  const files = [...byUrl.values()].sort((a, b) => (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
 
-  // Prefer a non-arm64 path as the generic `path` when present (electron-builder convention).
-  const preferred =
-    feeds.map((f) => f.path).find((p) => !p.includes("arm64")) ?? first.path;
-  const preferredMeta =
-    feeds.find((f) => f.path === preferred) ?? first;
+  const preferredMeta = [...feeds].sort((a, b) => {
+    const armOrder = Number(a.path.includes("arm64")) - Number(b.path.includes("arm64"));
+    if (armOrder !== 0) return armOrder;
+    if (a.path !== b.path) return a.path < b.path ? -1 : 1;
+    return a.releaseDate < b.releaseDate ? -1 : a.releaseDate > b.releaseDate ? 1 : 0;
+  })[0];
+  if (preferredMeta === undefined) throw new Error("mergeFeeds requires at least one feed");
+  const preferredFile = byUrl.get(preferredMeta.path);
+  if (preferredFile === undefined) {
+    throw new Error(`latest.yml path has no file entry: ${preferredMeta.path}`);
+  }
 
   return {
     version,
     files,
-    path: preferred,
-    sha512: preferredMeta.sha512,
+    path: preferredMeta.path,
+    sha512: preferredFile.sha512,
     releaseDate: preferredMeta.releaseDate,
   };
 }
@@ -175,7 +227,7 @@ export function serializeLatestYml(feed: Feed): string {
   for (const file of feed.files) {
     lines.push(`  - url: ${file.url}`);
     lines.push(`    sha512: ${file.sha512}`);
-    lines.push(`    size: ${file.size}`);
+    if (file.size !== null) lines.push(`    size: ${file.size}`);
   }
   lines.push(`path: ${feed.path}`);
   lines.push(`sha512: ${feed.sha512}`);

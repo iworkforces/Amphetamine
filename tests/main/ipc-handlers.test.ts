@@ -6,6 +6,8 @@ const mockGetVersion = vi.hoisted(() => vi.fn().mockReturnValue("1.0.0"));
 const mockGetAppPath = vi.hoisted(() => vi.fn().mockReturnValue("/mock/app"));
 const mockIpcMainHandle = vi.hoisted(() => vi.fn());
 const mockIpcMainOn = vi.hoisted(() => vi.fn());
+const mockIpcMainOff = vi.hoisted(() => vi.fn());
+const mockIpcMainRemoveHandler = vi.hoisted(() => vi.fn());
 const mockBrowserWindowGetAllWindows = vi.hoisted(() => vi.fn().mockReturnValue([]));
 
 vi.mock("electron", () => ({
@@ -16,6 +18,8 @@ vi.mock("electron", () => ({
   ipcMain: {
     handle: mockIpcMainHandle,
     on: mockIpcMainOn,
+    off: mockIpcMainOff,
+    removeHandler: mockIpcMainRemoveHandler,
   },
   BrowserWindow: {
     getAllWindows: mockBrowserWindowGetAllWindows,
@@ -24,10 +28,12 @@ vi.mock("electron", () => ({
 
 // Mock dependencies
 const mockGetSettings = vi.fn().mockReturnValue({ ...DEFAULT_SETTINGS });
-const mockUpdateSettings = vi.fn().mockImplementation((partial: Partial<typeof DEFAULT_SETTINGS>) => ({
-  ...DEFAULT_SETTINGS,
-  ...partial,
-}));
+const mockUpdateSettings = vi
+  .fn()
+  .mockImplementation((partial: Partial<typeof DEFAULT_SETTINGS>) => ({
+    ...DEFAULT_SETTINGS,
+    ...partial,
+  }));
 const mockOnSettingsChanged = vi.fn();
 const mockCreateSettingsWindow = vi.fn();
 const mockStartSession = vi.fn().mockReturnValue({
@@ -55,8 +61,6 @@ vi.mock("../../src/main/settings.js", () => ({
   onSettingsChanged: mockOnSettingsChanged,
 }));
 
-
-
 vi.mock("../../src/main/settings-window.js", () => ({
   createSettingsWindow: mockCreateSettingsWindow,
 }));
@@ -78,7 +82,7 @@ vi.mock("../../src/main/session-timer.js", () => ({
 }));
 
 describe("ipc-handlers", () => {
-  let registerIpcHandlers: (_win: unknown, _deps: unknown) => void;
+  let registerIpcHandlers: (_win: unknown, _deps: unknown) => () => void;
   let registeredHandlers: Map<string, (..._args: unknown[]) => unknown>;
 
   function makeIpcDeps(): unknown {
@@ -86,7 +90,7 @@ describe("ipc-handlers", () => {
       getSettings: mockGetSettings,
       updateSettings: mockUpdateSettings,
       createSettingsWindow: mockCreateSettingsWindow,
-      registerAutoUpdaterIpc: vi.fn(),
+      registerAutoUpdaterIpc: vi.fn(() => vi.fn()),
       sessionTimer: {
         startSession: mockStartSession,
         cancelSession: mockCancelSession,
@@ -115,16 +119,259 @@ describe("ipc-handlers", () => {
 
     // Clear and setup handler registry
     registeredHandlers = new Map();
-    mockIpcMainHandle.mockImplementation((channel: string, handler: (..._args: unknown[]) => unknown) => {
-      registeredHandlers.set(channel, handler);
-    });
-    mockIpcMainOn.mockImplementation((channel: string, handler: (..._args: unknown[]) => unknown) => {
-      registeredHandlers.set(channel, handler);
+    mockIpcMainHandle.mockImplementation(
+      (channel: string, handler: (..._args: unknown[]) => unknown) => {
+        registeredHandlers.set(channel, handler);
+      },
+    );
+    mockIpcMainOn.mockImplementation(
+      (channel: string, handler: (..._args: unknown[]) => unknown) => {
+        registeredHandlers.set(channel, handler);
+      },
+    );
+    mockIpcMainOff.mockImplementation(
+      (channel: string, handler: (..._args: unknown[]) => unknown) => {
+        if (registeredHandlers.get(channel) === handler) registeredHandlers.delete(channel);
+      },
+    );
+    mockIpcMainRemoveHandler.mockImplementation((channel: string) => {
+      registeredHandlers.delete(channel);
     });
 
     // Import the module
     const mod = await import("../../src/main/ipc.js");
-    registerIpcHandlers = mod.registerIpcHandlers as unknown as (_win: unknown, _deps: unknown) => void;
+    registerIpcHandlers = (win, deps) =>
+      (mod.registerIpcHandlers as unknown as (_win: unknown, _deps: unknown) => () => void)(
+        { on: vi.fn(), removeListener: vi.fn(), ...(win as object) },
+        deps,
+      );
+  });
+
+  describe("registration lifetime", () => {
+    it("unregisters public channels and pending resize once without touching private channels", async () => {
+      vi.useFakeTimers();
+      try {
+        const privateHandler = vi.fn();
+        registeredHandlers.set("utility-dialog:close", privateHandler);
+        const mockWindow = { setSize: vi.fn(), on: vi.fn(), removeListener: vi.fn() };
+        const deps = {
+          ...(makeIpcDeps() as object),
+          registerAutoUpdaterIpc: () => {
+            mockIpcMainHandle(IPC_CHANNELS.AUTO_UPDATER_CHECK, vi.fn());
+            return () => mockIpcMainRemoveHandler(IPC_CHANNELS.AUTO_UPDATER_CHECK);
+          },
+        };
+        const unregister = registerIpcHandlers(mockWindow, deps);
+        const onClosed = mockWindow.on.mock.calls.find(([event]) => event === "closed")?.[1];
+        const resize = registeredHandlers.get(IPC_CHANNELS.WINDOW_SET_HEIGHT);
+        expect(registeredHandlers.has(IPC_CHANNELS.SESSION_STATUS)).toBe(true);
+        expect(registeredHandlers.has(IPC_CHANNELS.AUTO_UPDATER_CHECK)).toBe(true);
+
+        resize?.({ senderFrame: { url: "file:///mock/app/lib/renderer/index.html" } }, 320);
+        unregister();
+        unregister();
+        onClosed?.();
+        await vi.advanceTimersByTimeAsync(16);
+
+        expect(registeredHandlers).toEqual(new Map([["utility-dialog:close", privateHandler]]));
+        expect(mockIpcMainRemoveHandler).toHaveBeenCalledTimes(10);
+        expect(mockIpcMainOff).toHaveBeenCalledExactlyOnceWith(
+          IPC_CHANNELS.WINDOW_SET_HEIGHT,
+          resize,
+        );
+        expect(mockWindow.removeListener).toHaveBeenCalledExactlyOnceWith("closed", onClosed);
+        expect(mockWindow.setSize).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("rolls back previously installed handlers when an invoke registration throws", () => {
+      const registrationError = new Error("settings registration failed");
+      mockIpcMainHandle.mockImplementation(
+        (channel: string, handler: (..._args: unknown[]) => unknown) => {
+          if (channel === IPC_CHANNELS.SETTINGS_SET) throw registrationError;
+          registeredHandlers.set(channel, handler);
+        },
+      );
+      const mockWindow = { on: vi.fn(), removeListener: vi.fn() };
+
+      expect(() => registerIpcHandlers(mockWindow, makeIpcDeps())).toThrow(registrationError);
+
+      expect(registeredHandlers.size).toBe(0);
+      expect(mockIpcMainRemoveHandler.mock.calls.map(([channel]) => channel)).toEqual([
+        IPC_CHANNELS.SETTINGS_GET,
+        IPC_CHANNELS.APP_QUIT,
+        IPC_CHANNELS.APP_GET_ABOUT,
+        IPC_CHANNELS.APP_GET_VERSION,
+      ]);
+      expect(mockIpcMainOff).toHaveBeenCalledWith(
+        IPC_CHANNELS.WINDOW_SET_HEIGHT,
+        expect.any(Function),
+      );
+      expect(mockWindow.removeListener).toHaveBeenCalledWith("closed", expect.any(Function));
+    });
+
+    it("attempts every cleanup and preserves registration error when a disposer throws", () => {
+      const registrationError = new Error("settings registration failed");
+      const cleanupError = new Error("session cleanup failed");
+      const privateHandler = vi.fn();
+      registeredHandlers.set("utility-dialog:close", privateHandler);
+      mockIpcMainHandle.mockImplementation(
+        (channel: string, handler: (..._args: unknown[]) => unknown) => {
+          if (channel === IPC_CHANNELS.SETTINGS_SET) throw registrationError;
+          registeredHandlers.set(channel, handler);
+        },
+      );
+      mockIpcMainRemoveHandler.mockImplementation((channel: string) => {
+        registeredHandlers.delete(channel);
+        if (channel === IPC_CHANNELS.SETTINGS_GET) throw cleanupError;
+      });
+
+      expect(() => registerIpcHandlers({}, makeIpcDeps())).toThrow(registrationError);
+
+      expect(registeredHandlers).toEqual(new Map([["utility-dialog:close", privateHandler]]));
+      expect(mockIpcMainRemoveHandler).toHaveBeenCalledTimes(4);
+      expect(mockIpcMainOff).toHaveBeenCalledWith(
+        IPC_CHANNELS.WINDOW_SET_HEIGHT,
+        expect.any(Function),
+      );
+    });
+
+    it("attempts every cleanup and rethrows first cleanup error only once", () => {
+      const cleanupError = new Error("updater cleanup failed");
+      const privateHandler = vi.fn();
+      registeredHandlers.set("utility-dialog:close", privateHandler);
+      const deps = {
+        ...(makeIpcDeps() as object),
+        registerAutoUpdaterIpc: () => {
+          mockIpcMainHandle(IPC_CHANNELS.AUTO_UPDATER_CHECK, vi.fn());
+          return () => {
+            mockIpcMainRemoveHandler(IPC_CHANNELS.AUTO_UPDATER_CHECK);
+            throw cleanupError;
+          };
+        },
+      };
+      const unregister = registerIpcHandlers({}, deps);
+
+      expect(() => unregister()).toThrow(cleanupError);
+      expect(() => unregister()).not.toThrow();
+
+      expect(registeredHandlers).toEqual(new Map([["utility-dialog:close", privateHandler]]));
+      expect(mockIpcMainRemoveHandler).toHaveBeenCalledTimes(10);
+      expect(mockIpcMainOff).toHaveBeenCalledTimes(1);
+    });
+
+    it("unregisters invoke handlers when the window closes before shell cleanup", () => {
+      const mockWindow = { on: vi.fn(), removeListener: vi.fn() };
+      const unregister = registerIpcHandlers(mockWindow, makeIpcDeps());
+      const onClosed = mockWindow.on.mock.calls.find(([event]) => event === "closed")?.[1];
+
+      onClosed?.();
+      unregister();
+
+      expect(registeredHandlers.size).toBe(0);
+      expect(mockIpcMainRemoveHandler).toHaveBeenCalledTimes(9);
+      expect(mockIpcMainOff).toHaveBeenCalledTimes(1);
+    });
+
+    it("rolls back all earlier handlers when updater registration throws", () => {
+      const registrationError = new Error("updater registration failed");
+      const deps = {
+        ...(makeIpcDeps() as object),
+        registerAutoUpdaterIpc: () => {
+          throw registrationError;
+        },
+      };
+
+      expect(() => registerIpcHandlers({}, deps)).toThrow(registrationError);
+
+      expect(registeredHandlers.size).toBe(0);
+      expect(mockIpcMainRemoveHandler).toHaveBeenCalledTimes(9);
+      expect(mockIpcMainOff).toHaveBeenCalledWith(
+        IPC_CHANNELS.WINDOW_SET_HEIGHT,
+        expect.any(Function),
+      );
+    });
+
+    it("rolls back when updater setup fails after installing its own handler", () => {
+      const registrationError = new Error("updater logging failed");
+      const deps = {
+        ...(makeIpcDeps() as object),
+        registerAutoUpdaterIpc: () => {
+          mockIpcMainHandle(IPC_CHANNELS.AUTO_UPDATER_CHECK, vi.fn());
+          mockIpcMainRemoveHandler(IPC_CHANNELS.AUTO_UPDATER_CHECK);
+          throw registrationError;
+        },
+      };
+
+      expect(() => registerIpcHandlers({}, deps)).toThrow(registrationError);
+
+      expect(registeredHandlers.size).toBe(0);
+      expect(mockIpcMainRemoveHandler).toHaveBeenCalledTimes(10);
+      expect(mockIpcMainOff).toHaveBeenCalledTimes(1);
+    });
+
+    it("rolls back the resize listener when subscribing to window close throws", () => {
+      const registrationError = new Error("window closed subscription failed");
+      const mockWindow = {
+        on: () => {
+          throw registrationError;
+        },
+        removeListener: vi.fn(),
+      };
+
+      expect(() => registerIpcHandlers(mockWindow, makeIpcDeps())).toThrow(registrationError);
+
+      expect(registeredHandlers.size).toBe(0);
+      expect(mockIpcMainOff).toHaveBeenCalledWith(
+        IPC_CHANNELS.WINDOW_SET_HEIGHT,
+        expect.any(Function),
+      );
+    });
+
+    it("cancels a queued resize if registration fails after the resize listener runs", async () => {
+      vi.useFakeTimers();
+      try {
+        const registrationError = new Error("window closed subscription failed");
+        const mockWindow = {
+          on: () => {
+            throw registrationError;
+          },
+          removeListener: vi.fn(),
+          setSize: vi.fn(),
+        };
+        mockIpcMainOn.mockImplementation(
+          (channel: string, handler: (..._args: unknown[]) => unknown) => {
+            registeredHandlers.set(channel, handler);
+            handler({ senderFrame: { url: "file:///mock/app/lib/renderer/index.html" } }, 320);
+          },
+        );
+
+        expect(() => registerIpcHandlers(mockWindow, makeIpcDeps())).toThrow(registrationError);
+        await vi.advanceTimersByTimeAsync(16);
+
+        expect(registeredHandlers.size).toBe(0);
+        expect(mockWindow.setSize).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("rolls back if the resize listener registration throws after subscribing", () => {
+      const registrationError = new Error("resize registration failed");
+      mockIpcMainOn.mockImplementation(
+        (channel: string, handler: (..._args: unknown[]) => unknown) => {
+          registeredHandlers.set(channel, handler);
+          throw registrationError;
+        },
+      );
+
+      expect(() => registerIpcHandlers({}, makeIpcDeps())).toThrow(registrationError);
+
+      expect(registeredHandlers.size).toBe(0);
+      expect(mockIpcMainOff).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe("WINDOW_SET_HEIGHT handler", () => {
@@ -200,6 +447,37 @@ describe("ipc-handlers", () => {
   });
 
   describe("APP_GET_VERSION handler", () => {
+    it("typedHandle rejects before invoking an unguarded protected callback", async () => {
+      const { typedHandle } = await import("../../src/main/ipc-utils.js");
+      const protectedHandler = vi.fn().mockReturnValue("private-version");
+      typedHandle(IPC_CHANNELS.APP_GET_VERSION, () => "", protectedHandler);
+      const handler = registeredHandlers.get(IPC_CHANNELS.APP_GET_VERSION);
+
+      const result = await handler?.({ senderFrame: { url: "https://evil.com/" } });
+
+      expect(result).toBe("");
+      expect(protectedHandler).not.toHaveBeenCalled();
+    });
+
+    it("typedHandle returns an idempotent disposer for its own channel", async () => {
+      const { typedHandle } = await import("../../src/main/ipc-utils.js");
+      const unregister = typedHandle(
+        IPC_CHANNELS.APP_GET_VERSION,
+        () => "",
+        () => "1.0.0",
+      );
+      registeredHandlers.set("utility-dialog:close", vi.fn());
+
+      unregister();
+      unregister();
+
+      expect(registeredHandlers.has(IPC_CHANNELS.APP_GET_VERSION)).toBe(false);
+      expect(registeredHandlers.has("utility-dialog:close")).toBe(true);
+      expect(mockIpcMainRemoveHandler).toHaveBeenCalledExactlyOnceWith(
+        IPC_CHANNELS.APP_GET_VERSION,
+      );
+    });
+
     it("returns app version for valid sender", async () => {
       const mockWindow = {};
       registerIpcHandlers(mockWindow, makeIpcDeps());
@@ -267,7 +545,10 @@ describe("ipc-handlers", () => {
         senderFrame: { url: "file:///mock/app/lib/renderer/index.html" },
       };
 
-      mockUpdateSettings.mockReturnValue({ settings: { ...DEFAULT_SETTINGS, preventSleep: true }, rejectedKeys: [] });
+      mockUpdateSettings.mockReturnValue({
+        settings: { ...DEFAULT_SETTINGS, preventSleep: true },
+        rejectedKeys: [],
+      });
 
       await handler!(mockEvent, { preventSleep: true });
 

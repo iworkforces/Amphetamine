@@ -49,6 +49,7 @@ app.setAboutPanelOptions({
 
 let shell: AppShell | null = null;
 let didRunQuitCleanup = false;
+const hasQuitCleanupStarted = (): boolean => didRunQuitCleanup;
 
 app.on("second-instance", () => {
   shell?.showMainWindow();
@@ -59,23 +60,31 @@ if (!app.requestSingleInstanceLock()) {
   process.exit(0);
 }
 
-void app.whenReady().then(async () => {
-  const appReadyMs = performance.now() - mainProcessStartMs;
-  shell = createAppShell();
-  await shell.init();
+void app
+  .whenReady()
+  .then(async () => {
+    if (didRunQuitCleanup) return;
+    const appReadyMs = performance.now() - mainProcessStartMs;
+    shell = createAppShell();
+    await shell.init();
+    if (hasQuitCleanupStarted() || !shell.ready) return;
 
-  const mainWindow = shell.getMainWindow();
-  if (mainWindow !== null) {
-    void runBenchmarkIfRequested({
-      mainWindow,
-      appReadyMs,
-      bootstrapReadyMs: performance.now() - mainProcessStartMs,
-    }).catch((err: unknown) => {
-      log.error("[benchmark] Benchmark run failed:", err);
-      app.exit(1);
-    });
-  }
-});
+    const mainWindow = shell.getMainWindow();
+    if (mainWindow !== null) {
+      void runBenchmarkIfRequested({
+        mainWindow,
+        appReadyMs,
+        bootstrapReadyMs: performance.now() - mainProcessStartMs,
+      }).catch((err: unknown) => {
+        log.error("[benchmark] Benchmark run failed:", err);
+        app.exit(1);
+      });
+    }
+  })
+  .catch((err: unknown) => {
+    log.error("[main] Startup failed:", err);
+    app.quit();
+  });
 
 app.on("window-all-closed", () => {
   // Tray-only app stays alive when all windows close

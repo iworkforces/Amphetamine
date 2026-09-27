@@ -123,6 +123,33 @@ describe("battery-monitor", () => {
   });
 
   describe("on-battery event", () => {
+    it("discards a battery read completing after disposal", async () => {
+      const read = Promise.withResolvers<number | null>();
+      const onPercentSample = vi.fn();
+      mockIsActive.mockReturnValue(true);
+      mockGetThreshold.mockReturnValue(80);
+      mockGetBatteryPercent.mockReturnValue(read.promise);
+      const { createBatteryMonitor } = await import("../../src/main/battery-monitor.js");
+      const monitor = createBatteryMonitor({
+        getThreshold: () => mockGetThreshold(),
+        onAutoStop: mockOnAutoStop,
+        isPreventingSleep: () => mockIsActive(),
+        onPercentSample,
+      });
+      await monitor.initBatteryMonitoring();
+      const onBattery = mockPowerMonitor.on.mock.calls.find(
+        (call) => call[0] === "on-battery",
+      )?.[1];
+      expect(onBattery).toBeTypeOf("function");
+      onBattery();
+      monitor.cleanupBatteryMonitoring();
+      read.resolve(5);
+      await vi.advanceTimersByTimeAsync(0);
+      monitor.reconfigure();
+      expect(onPercentSample).not.toHaveBeenCalled();
+      expect(mockOnAutoStop).not.toHaveBeenCalled();
+      expect(mockGetBatteryPercent).toHaveBeenCalledTimes(1);
+    });
     it("checks battery when on-battery fires and threshold is set", async () => {
       mockIsActive.mockReturnValue(true);
       mockGetThreshold.mockReturnValue(80);
@@ -488,8 +515,7 @@ describe("battery-monitor", () => {
 
       // Fire on-battery listener for a check
       const onBattery = mockPowerMonitor.on.mock.calls.find((c) => c[0] === "on-battery")?.[1] as
-        | (() => void)
-        | undefined;
+        (() => void) | undefined;
       onBattery?.();
       await vi.advanceTimersByTimeAsync(0);
       await Promise.resolve();
@@ -509,8 +535,7 @@ describe("battery-monitor", () => {
 
       await handle.initBatteryMonitoring();
       const onBattery = mockPowerMonitor.on.mock.calls.find((c) => c[0] === "on-battery")?.[1] as
-        | (() => void)
-        | undefined;
+        (() => void) | undefined;
       onBattery?.();
       await vi.advanceTimersByTimeAsync(0);
       await Promise.resolve();
