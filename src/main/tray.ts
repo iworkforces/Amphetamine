@@ -1,10 +1,4 @@
-import {
-  Tray,
-  nativeTheme,
-  Menu,
-  app,
-  type MenuItemConstructorOptions,
-} from "electron/main";
+import { Tray, nativeTheme, Menu, app, type MenuItemConstructorOptions } from "electron/main";
 import { nativeImage } from "electron/common";
 import log from "electron-log";
 import path from "node:path";
@@ -34,9 +28,7 @@ function tooltipForState(effectiveActive: boolean, sessionActive: boolean): stri
       ? "Amphetamine — Session active (preventing sleep)"
       : "Amphetamine — Session active";
   }
-  return effectiveActive
-    ? "Amphetamine — Preventing sleep"
-    : "Amphetamine — Sleep prevention off";
+  return effectiveActive ? "Amphetamine — Preventing sleep" : "Amphetamine — Sleep prevention off";
 }
 
 /**
@@ -134,129 +126,157 @@ export function setupTray(deps: TrayDeps): () => void {
 
   const initialPreventSleep = deps.getPreventSleep();
   const initialEffectiveActive = deps.getEffectiveActive();
-  tray = new Tray(buildIcon(nativeTheme.shouldUseDarkColors, initialEffectiveActive));
-  tray.setToolTip(tooltipForState(initialEffectiveActive, deps.getSessionActive()));
+  let unsubscribeSettings: (() => void) | null = null;
+  let unsubscribeActiveState: (() => void) | null = null;
+  let themeRegistered = false;
+  let disposed = false;
 
   // Update icon whenever the system theme changes or settings change (debounced)
   const onThemeUpdated = (): void => {
+    if (disposed) return;
     if (themeDebounceTimer) clearTimeout(themeDebounceTimer);
     themeDebounceTimer = setTimeout(() => {
       themeDebounceTimer = null;
-      refreshTrayIcon();
+      if (!disposed) refreshTrayIcon();
     }, 50);
   };
-  nativeTheme.on("updated", onThemeUpdated);
+
+  const cleanup = (): void => {
+    if (disposed) return;
+    disposed = true;
+    for (const release of [unsubscribeSettings, unsubscribeActiveState]) {
+      try {
+        release?.();
+      } catch (err) {
+        log.error("[tray] Failed to unsubscribe:", err);
+      }
+    }
+    if (themeRegistered) {
+      try {
+        nativeTheme.removeListener("updated", onThemeUpdated);
+      } catch (err) {
+        log.error("[tray] Failed to remove theme listener:", err);
+      }
+    }
+    if (themeDebounceTimer) {
+      clearTimeout(themeDebounceTimer);
+      themeDebounceTimer = null;
+    }
+    const currentTray = tray;
+    tray = null;
+    cachedMenu = null;
+    iconCache.clear();
+    if (currentTray !== null) {
+      try {
+        currentTray.destroy();
+      } catch (err) {
+        log.error("[tray] Failed to destroy tray:", err);
+      }
+    }
+  };
 
   // Store unsubscribes for cleanup robustness.
   // Track BOTH user intent (drives menu checkbox + cache rebuild) and effective
   // active state (drives icon) so each updates only when its own input changes.
   let lastPreventSleep = initialPreventSleep;
   let lastEffectiveActive = initialEffectiveActive;
-  let lastSessionActive = deps.getSessionActive();
-  const unsubscribeSettings = deps.onSettingsChanged(() => {
-    const currentPreventSleep = deps.getPreventSleep();
-    const currentEffectiveActive = deps.getEffectiveActive();
-    let iconNeedsRefresh = false;
-    if (currentEffectiveActive !== lastEffectiveActive) {
-      lastEffectiveActive = currentEffectiveActive;
-      iconNeedsRefresh = true;
-    }
-    if (currentPreventSleep !== lastPreventSleep) {
-      lastPreventSleep = currentPreventSleep;
-      cachedMenu = buildMenu();
-      tray?.setContextMenu(cachedMenu);
-      iconNeedsRefresh = true;
-    }
-    if (iconNeedsRefresh) {
-      refreshTrayIcon();
-    }
-  });
-  const unsubscribeActiveState = deps.onActiveStateChanged(() => {
-    // Effective active / session can change without settings change.
-    // Refresh icon + tooltip; rebuild menu only when session presence flips
-    // (Cancel session item).
-    const currentEffectiveActive = deps.getEffectiveActive();
-    const sessionActive = deps.getSessionActive();
-    if (currentEffectiveActive !== lastEffectiveActive) {
-      lastEffectiveActive = currentEffectiveActive;
-      refreshTrayIcon();
-    } else {
-      tray?.setToolTip(tooltipForState(currentEffectiveActive, sessionActive));
-    }
-    if (sessionActive !== lastSessionActive) {
-      lastSessionActive = sessionActive;
-      cachedMenu = buildMenu();
-      tray?.setContextMenu(cachedMenu);
-    }
-  });
+  let lastSessionActive = false;
 
-  // Listener is cleaned up on process exit (app.before-quit destroys the tray).
-
-  function buildMenu(): Menu {
-    const preventSleep = deps.getPreventSleep();
-    const sessionActive = deps.getSessionActive();
-
-    const template: MenuItemConstructorOptions[] = [
-      {
-        label: MENU_PREVENT_SLEEP,
-        type: "checkbox",
-        checked: preventSleep,
-        click: () => {
-          deps.togglePreventSleep();
-        },
-      },
-      { type: "separator" },
-    ];
-    if (sessionActive && deps.cancelSession !== undefined) {
-      template.push({
-        label: "Cancel session",
-        click: () => {
-          deps.cancelSession?.();
-        },
-      });
-      template.push({ type: "separator" });
-    }
-    template.push(
-      { label: MENU_SETTINGS, click: () => deps.openSettings() },
-      { label: MENU_ABOUT, click: () => showAbout() },
-      { label: MENU_CHECK_UPDATES, click: () => deps.checkForUpdates() },
-      { label: MENU_QUIT, accelerator: ACCELERATOR_QUIT, click: () => app.quit() },
-    );
-    return Menu.buildFromTemplate(template);
-  }
-
-  cachedMenu = buildMenu();
-  // Classic tray menu: setContextMenu so OS left/right click show menu items.
-  // Explicit click handler keeps left-click reliable across macOS/Windows.
-  tray.setContextMenu(cachedMenu);
-  // Windows: avoid double-click firing click twice (opens menu then dismisses).
-  tray.setIgnoreDoubleClickEvents(true);
-
-  tray.on("click", () => {
-    if (tray !== null && cachedMenu !== null) {
-      tray.popUpContextMenu(cachedMenu);
-    }
-  });
-
-  return () => {
-    unsubscribeSettings();
-    unsubscribeActiveState();
-    nativeTheme.removeListener("updated", onThemeUpdated);
-    if (themeDebounceTimer) {
-      clearTimeout(themeDebounceTimer);
-      themeDebounceTimer = null;
-    }
-    if (tray !== null) {
-      try {
-        tray.destroy();
-      } catch (err) {
-        log.error("[tray] Failed to destroy tray:", err);
+  try {
+    tray = new Tray(buildIcon(nativeTheme.shouldUseDarkColors, initialEffectiveActive));
+    tray.setToolTip(tooltipForState(initialEffectiveActive, deps.getSessionActive()));
+    themeRegistered = true;
+    nativeTheme.on("updated", onThemeUpdated);
+    lastSessionActive = deps.getSessionActive();
+    unsubscribeSettings = deps.onSettingsChanged(() => {
+      if (disposed) return;
+      const currentPreventSleep = deps.getPreventSleep();
+      const currentEffectiveActive = deps.getEffectiveActive();
+      let iconNeedsRefresh = false;
+      if (currentEffectiveActive !== lastEffectiveActive) {
+        lastEffectiveActive = currentEffectiveActive;
+        iconNeedsRefresh = true;
       }
-      tray = null;
+      if (currentPreventSleep !== lastPreventSleep) {
+        lastPreventSleep = currentPreventSleep;
+        cachedMenu = buildMenu();
+        tray?.setContextMenu(cachedMenu);
+        iconNeedsRefresh = true;
+      }
+      if (iconNeedsRefresh) {
+        refreshTrayIcon();
+      }
+    });
+    unsubscribeActiveState = deps.onActiveStateChanged(() => {
+      if (disposed) return;
+      // Effective active / session can change without settings change.
+      // Refresh icon + tooltip; rebuild menu only when session presence flips
+      // (Cancel session item).
+      const currentEffectiveActive = deps.getEffectiveActive();
+      const sessionActive = deps.getSessionActive();
+      if (currentEffectiveActive !== lastEffectiveActive) {
+        lastEffectiveActive = currentEffectiveActive;
+        refreshTrayIcon();
+      } else {
+        tray?.setToolTip(tooltipForState(currentEffectiveActive, sessionActive));
+      }
+      if (sessionActive !== lastSessionActive) {
+        lastSessionActive = sessionActive;
+        cachedMenu = buildMenu();
+        tray?.setContextMenu(cachedMenu);
+      }
+    });
+
+    function buildMenu(): Menu {
+      const preventSleep = deps.getPreventSleep();
+      const sessionActive = deps.getSessionActive();
+
+      const template: MenuItemConstructorOptions[] = [
+        {
+          label: MENU_PREVENT_SLEEP,
+          type: "checkbox",
+          checked: preventSleep,
+          click: () => {
+            deps.togglePreventSleep();
+          },
+        },
+        { type: "separator" },
+      ];
+      if (sessionActive && deps.cancelSession !== undefined) {
+        template.push({
+          label: "Cancel session",
+          click: () => {
+            deps.cancelSession?.();
+          },
+        });
+        template.push({ type: "separator" });
+      }
+      template.push(
+        { label: MENU_SETTINGS, click: () => deps.openSettings() },
+        { label: MENU_ABOUT, click: () => showAbout() },
+        { label: MENU_CHECK_UPDATES, click: () => deps.checkForUpdates() },
+        { label: MENU_QUIT, accelerator: ACCELERATOR_QUIT, click: () => app.quit() },
+      );
+      return Menu.buildFromTemplate(template);
     }
-    cachedMenu = null;
-    iconCache.clear();
-  };
+
+    cachedMenu = buildMenu();
+    // Classic tray menu: setContextMenu so OS left/right click show menu items.
+    // Explicit click handler keeps left-click reliable across macOS/Windows.
+    tray.setContextMenu(cachedMenu);
+    // Windows: avoid double-click firing click twice (opens menu then dismisses).
+    tray.setIgnoreDoubleClickEvents(true);
+
+    tray.on("click", () => {
+      if (tray !== null && cachedMenu !== null) {
+        tray.popUpContextMenu(cachedMenu);
+      }
+    });
+    return cleanup;
+  } catch (err) {
+    cleanup();
+    throw err;
+  }
 }
 
 export function measureBenchmarkTrayMenuProxy(): number | null {
