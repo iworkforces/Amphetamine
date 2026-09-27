@@ -124,7 +124,11 @@ describe("ipc-handlers", () => {
 
     // Import the module
     const mod = await import("../../src/main/ipc.js");
-    registerIpcHandlers = mod.registerIpcHandlers as unknown as (_win: unknown, _deps: unknown) => void;
+    registerIpcHandlers = (win, deps) =>
+      (mod.registerIpcHandlers as unknown as (_win: unknown, _deps: unknown) => void)(
+        { on: vi.fn(), ...(win as object) },
+        deps,
+      );
   });
 
   describe("WINDOW_SET_HEIGHT handler", () => {
@@ -200,6 +204,18 @@ describe("ipc-handlers", () => {
   });
 
   describe("APP_GET_VERSION handler", () => {
+    it("typedHandle rejects before invoking an unguarded protected callback", async () => {
+      const { typedHandle } = await import("../../src/main/ipc-utils.js");
+      const protectedHandler = vi.fn().mockReturnValue("private-version");
+      typedHandle(IPC_CHANNELS.APP_GET_VERSION, () => "", protectedHandler);
+      const handler = registeredHandlers.get(IPC_CHANNELS.APP_GET_VERSION);
+
+      const result = await handler?.({ senderFrame: { url: "https://evil.com/" } });
+
+      expect(result).toBe("");
+      expect(protectedHandler).not.toHaveBeenCalled();
+    });
+
     it("returns app version for valid sender", async () => {
       const mockWindow = {};
       registerIpcHandlers(mockWindow, makeIpcDeps());

@@ -1,4 +1,4 @@
-import { ipcMain, app, type BrowserWindow } from "electron/main";
+import { ipcMain, app, type BrowserWindow, type IpcMainEvent } from "electron/main";
 import log from "electron-log";
 import {
   IPC_CHANNELS,
@@ -40,46 +40,49 @@ function registerWindowIpc(win: BrowserWindow): void {
   let pendingResizeTimer: ReturnType<typeof setTimeout> | null = null;
   let pendingResizeHeight = 0;
 
-  ipcMain.on(
-    IPC_CHANNELS.WINDOW_SET_HEIGHT,
-    (event, height: IpcRequest<typeof IPC_CHANNELS.WINDOW_SET_HEIGHT>) => {
-      if (!validateSender(event)) return;
-      try {
-        if (typeof height === "number" && height > 0 && Number.isInteger(height)) {
-          pendingResizeHeight = height;
-          if (pendingResizeTimer === null) {
-            pendingResizeTimer = setTimeout(() => {
-              pendingResizeTimer = null;
-              const clampedHeight = Math.max(
-                MIN_POPOVER_HEIGHT,
-                Math.min(MAX_POPOVER_HEIGHT, Math.round(pendingResizeHeight)),
-              );
-              win.setSize(MAIN_WINDOW_WIDTH, clampedHeight, false);
-            }, 16);
-          }
+  const onResize = (
+    event: IpcMainEvent,
+    height: IpcRequest<typeof IPC_CHANNELS.WINDOW_SET_HEIGHT>,
+  ): void => {
+    if (!validateSender(event)) return;
+    try {
+      if (typeof height === "number" && height > 0 && Number.isInteger(height)) {
+        pendingResizeHeight = height;
+        if (pendingResizeTimer === null) {
+          pendingResizeTimer = setTimeout(() => {
+            pendingResizeTimer = null;
+            const clampedHeight = Math.max(
+              MIN_POPOVER_HEIGHT,
+              Math.min(MAX_POPOVER_HEIGHT, Math.round(pendingResizeHeight)),
+            );
+            win.setSize(MAIN_WINDOW_WIDTH, clampedHeight, false);
+          }, 16);
         }
-      } catch (err) {
-        log.error("[ipc] WINDOW_SET_HEIGHT error:", err);
       }
-    },
-  );
+    } catch (err) {
+      log.error("[ipc] WINDOW_SET_HEIGHT error:", err);
+    }
+  };
+  ipcMain.on(IPC_CHANNELS.WINDOW_SET_HEIGHT, onResize);
+  win.on("closed", () => {
+    if (pendingResizeTimer !== null) clearTimeout(pendingResizeTimer);
+    ipcMain.off(IPC_CHANNELS.WINDOW_SET_HEIGHT, onResize);
+  });
 }
 
 /** App utility IPC handlers */
 function registerAppIpc(): void {
   typedHandle(
     IPC_CHANNELS.APP_GET_VERSION,
-    (event): IpcResponse<typeof IPC_CHANNELS.APP_GET_VERSION> => {
-      if (!validateSender(event)) return "";
+    () => "",
+    (): IpcResponse<typeof IPC_CHANNELS.APP_GET_VERSION> => {
       return app.getVersion();
     },
   );
   typedHandle(
     IPC_CHANNELS.APP_GET_ABOUT,
-    (event): IpcResponse<typeof IPC_CHANNELS.APP_GET_ABOUT> => {
-      if (!validateSender(event)) {
-        return { productName: "", version: "", description: "", repository: "", author: "" };
-      }
+    () => ({ productName: "Amphetamine", version: "2.0.0", description: "A tray app that keeps your computer awake on macOS and Windows. Lives in the system tray, prevents the system from going to sleep, and stays out of the Dock/taskbar when idle.", repository: "", author: "iworkforces Engineers" }),
+    (): IpcResponse<typeof IPC_CHANNELS.APP_GET_ABOUT> => {
       const pkg = getPackageInfo();
       return {
         productName: pkg.productName,
@@ -90,86 +93,111 @@ function registerAppIpc(): void {
       };
     },
   );
-  typedHandle(IPC_CHANNELS.APP_QUIT, (event) => {
-    if (!validateSender(event)) return;
-    app.quit();
-  });
+  typedHandle(
+    IPC_CHANNELS.APP_QUIT,
+    () => undefined,
+    () => {
+      app.quit();
+    },
+  );
 }
 
 /** Settings IPC handlers */
 function registerSettingsIpc(deps: IpcDeps): void {
-  typedHandle(IPC_CHANNELS.SETTINGS_GET, (event): IpcResponse<typeof IPC_CHANNELS.SETTINGS_GET> => {
-    if (!validateSender(event)) return { ...DEFAULT_SETTINGS };
-    return deps.getSettings();
-  });
+  typedHandle(
+    IPC_CHANNELS.SETTINGS_GET,
+    () => ({ ...DEFAULT_SETTINGS }),
+    (): IpcResponse<typeof IPC_CHANNELS.SETTINGS_GET> => deps.getSettings(),
+  );
   typedHandle(
     IPC_CHANNELS.SETTINGS_SET,
+    () => ({ settings: deps.getSettings(), rejectedKeys: [] }),
     async (
-      event,
+      _event,
       partial: IpcRequest<typeof IPC_CHANNELS.SETTINGS_SET>,
     ): Promise<IpcResponse<typeof IPC_CHANNELS.SETTINGS_SET>> => {
-      if (!validateSender(event)) return { settings: deps.getSettings(), rejectedKeys: [] };
       // Coordinator handles system sync (power-saver, auto-launch, session cancel, broadcast) via settings change
       return await deps.updateSettings(partial);
     },
   );
-  typedHandle(IPC_CHANNELS.SETTINGS_OPEN, async (event) => {
-    if (!validateSender(event)) return;
-    deps.createSettingsWindow();
-  });
+  typedHandle(
+    IPC_CHANNELS.SETTINGS_OPEN,
+    () => undefined,
+    async () => {
+      deps.createSettingsWindow();
+    },
+  );
 }
 
 /** Session timer IPC handlers */
 function registerSessionIpc(deps: IpcDeps): void {
-  typedHandle(IPC_CHANNELS.SESSION_START, async (event, request) => {
-    if (!validateSender(event)) {
-      return { ok: false, reason: "rejected" };
-    }
-    const durationCheck = validateDurationMinutes(request.durationMinutes);
-    if (!durationCheck.ok) {
-      log.warn(
-        "[session] SESSION_START rejected durationMinutes:",
-        request.durationMinutes,
-        durationCheck.reason,
-      );
+  typedHandle(
+    IPC_CHANNELS.SESSION_START,
+    () => ({ ok: false, reason: "rejected" }),
+    async (_event, request) => {
+      const envelope: unknown = request;
+      if (
+        typeof envelope !== "object" ||
+        envelope === null ||
+        Array.isArray(envelope) ||
+        !("durationMinutes" in envelope)
+      ) {
+        return { ok: false, reason: "invalid-duration" };
+      }
+      const durationMinutes: unknown = envelope.durationMinutes;
+      if (durationMinutes !== null && typeof durationMinutes !== "number") {
+        return { ok: false, reason: "invalid-duration" };
+      }
+      const durationCheck = validateDurationMinutes(durationMinutes);
+      if (!durationCheck.ok) {
+        log.warn(
+          "[session] SESSION_START rejected durationMinutes:",
+          durationMinutes,
+          durationCheck.reason,
+        );
+        return {
+          ok: false,
+          reason:
+            durationCheck.reason === "Duration cannot exceed 24 hours"
+              ? "Duration cannot exceed 24 hours"
+              : "invalid-duration",
+        };
+      }
+      const result = deps.sessionTimer.startSession(durationCheck.durationMinutes);
+      // startSession() guarantees non-null startedAt; SessionState type is widened for getStatus() reuse.
+      if (result.startedAt === null) {
+        log.error(
+          "[session] SESSION_START: startSession returned null startedAt (invariant violation)",
+        );
+        return { ok: false, reason: "rejected" };
+      }
       return {
-        ok: false,
-        reason:
-          durationCheck.reason === "Duration cannot exceed 24 hours"
-            ? "Duration cannot exceed 24 hours"
-            : "invalid-duration",
+        ok: true,
+        startedAt: result.startedAt,
+        durationMinutes: result.durationMinutes,
+        expiresAt: result.expiresAt,
       };
-    }
-    const result = deps.sessionTimer.startSession(request.durationMinutes);
-    // startSession() guarantees non-null startedAt; SessionState type is widened for getStatus() reuse.
-    if (result.startedAt === null) {
-      log.error("[session] SESSION_START: startSession returned null startedAt (invariant violation)");
-      return { ok: false, reason: "rejected" };
-    }
-    return {
-      ok: true,
-      startedAt: result.startedAt,
-      durationMinutes: result.durationMinutes,
-      expiresAt: result.expiresAt,
-    };
-  });
-  typedHandle(IPC_CHANNELS.SESSION_CANCEL, async (event) => {
-    if (!validateSender(event)) return { cancelled: false };
-    deps.sessionTimer.cancelSession();
-    return { cancelled: true };
-  });
-  typedHandle(IPC_CHANNELS.SESSION_STATUS, (event) => {
-    if (!validateSender(event)) {
-      return {
-        isRunning: false,
-        startedAt: null,
-        expiresAt: null,
-        remainingSeconds: null,
-        durationMinutes: null,
-      };
-    }
-    return deps.sessionTimer.getStatus();
-  });
+    },
+  );
+  typedHandle(
+    IPC_CHANNELS.SESSION_CANCEL,
+    () => ({ cancelled: false }),
+    async () => {
+      deps.sessionTimer.cancelSession();
+      return { cancelled: true };
+    },
+  );
+  typedHandle(
+    IPC_CHANNELS.SESSION_STATUS,
+    () => ({
+      isRunning: false,
+      startedAt: null,
+      expiresAt: null,
+      remainingSeconds: null,
+      durationMinutes: null,
+    }),
+    () => deps.sessionTimer.getStatus(),
+  );
 }
 
 /** Register all IPC handlers (orchestrator) */

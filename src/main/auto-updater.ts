@@ -5,7 +5,7 @@
  */
 import log from "electron-log";
 import { IPC_CHANNELS } from "../shared/types.js";
-import { typedHandle, validateSender } from "./ipc-utils.js";
+import { typedHandle } from "./ipc-utils.js";
 import { checkForUpdatesForIpc } from "../infrastructure/updater/hybrid-auto-updater.js";
 
 export {
@@ -20,9 +20,12 @@ export {
  * Allows renderer to manually trigger an update check (same hybrid path as tray).
  */
 export function registerAutoUpdaterIpc(): void {
-  typedHandle(IPC_CHANNELS.AUTO_UPDATER_CHECK, async (event) => {
-    if (!validateSender(event)) return null;
-    return await checkForUpdatesForIpc();
-  });
+  typedHandle(
+    IPC_CHANNELS.AUTO_UPDATER_CHECK,
+    () => null,
+    async () => {
+      return await checkForUpdatesForIpc();
+    },
+  );
   log.info("[auto-updater] IPC handler registered");
 }

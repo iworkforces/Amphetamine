@@ -74,6 +74,13 @@ export type IpcHandler<K extends keyof IpcChannelMap> = (
   _request: IpcChannelMap[K]["request"],
 ) => Promise<IpcChannelMap[K]["response"]> | IpcChannelMap[K]["response"];
 
-export function typedHandle<K extends keyof IpcChannelMap>(channel: K, handler: IpcHandler<K>): void {
-  ipcMain.handle(channel, handler as Parameters<typeof ipcMain.handle>[1]);
+export function typedHandle<K extends keyof IpcChannelMap>(
+  channel: K,
+  rejectedResponse: () => IpcChannelMap[K]["response"],
+  handler: IpcHandler<K>,
+): void {
+  ipcMain.handle(channel, (event, request: IpcChannelMap[K]["request"]) => {
+    if (!validateSender(event)) return rejectedResponse();
+    return handler(event, request);
+  });
 }

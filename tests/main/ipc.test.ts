@@ -148,7 +148,10 @@ vi.mock("../../src/main/auto-updater.js", () => ({
 
 describe("ipc additional coverage", () => {
   let registerIpcHandlers: (
-    _win: { setSize?: (_w: number, _h: number, _animate?: boolean) => void },
+    _win: {
+      setSize?: (_w: number, _h: number, _animate?: boolean) => void;
+      on?: ReturnType<typeof vi.fn>;
+    },
     _deps: unknown,
   ) => void;
   let registeredHandlers: Map<string, (..._args: unknown[]) => unknown>;
@@ -224,10 +227,35 @@ describe("ipc additional coverage", () => {
     );
 
     const mod = await import("../../src/main/ipc.js");
-    registerIpcHandlers = mod.registerIpcHandlers as unknown as typeof registerIpcHandlers;
+    registerIpcHandlers = (win, deps) =>
+      (mod.registerIpcHandlers as unknown as typeof registerIpcHandlers)(
+        { on: vi.fn(), ...win },
+        deps,
+      );
   });
 
   describe("ipcMain.on sender validation (WINDOW_SET_HEIGHT)", () => {
+    it("removes only its listener and cancels queued resize when window is destroyed", async () => {
+      vi.useFakeTimers();
+      try {
+        const electron = await import("electron");
+        const mockWindow = { setSize: vi.fn(), on: vi.fn() };
+        registerIpcHandlers(mockWindow, makeIpcDeps());
+        const handler = registeredHandlers.get(IPC_CHANNELS.WINDOW_SET_HEIGHT);
+        const destroyed = mockWindow.on.mock.calls.find(([name]) => name === "closed")?.[1];
+        expect(destroyed).toBeTypeOf("function");
+
+        handler?.(validEvent, 320);
+        destroyed();
+        await vi.advanceTimersByTimeAsync(16);
+
+        expect(electron.ipcMain.off).toHaveBeenCalledWith(IPC_CHANNELS.WINDOW_SET_HEIGHT, handler);
+        expect(mockWindow.setSize).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("valid file:// origin: invokes window.setSize", () => {
       const mockWindow = { setSize: vi.fn() };
       registerIpcHandlers(mockWindow, makeIpcDeps());
@@ -508,6 +536,29 @@ describe("ipc additional coverage", () => {
   describe("SESSION_START with invalid durationMinutes", () => {
     const invalidDurationResponse = { ok: false, reason: "invalid-duration" } as const;
 
+    it.each([null, [], 42, "30", undefined, {}, { durationMinutes: undefined }])(
+      "malformed envelope %s: returns invalid-duration without starting session",
+      async (request) => {
+        registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+        const handler = registeredHandlers.get(IPC_CHANNELS.SESSION_START);
+
+        const result = await handler?.(validEvent, request);
+
+        expect(result).toEqual(invalidDurationResponse);
+        expect(mockStartSession).not.toHaveBeenCalled();
+      },
+    );
+
+    it("rejects an unauthorized sender before inspecting a malformed envelope", async () => {
+      registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
+      const handler = registeredHandlers.get(IPC_CHANNELS.SESSION_START);
+
+      const result = await handler?.(invalidEvent, null);
+
+      expect(result).toEqual({ ok: false, reason: "rejected" });
+      expect(mockStartSession).not.toHaveBeenCalled();
+    });
+
     it("negative number: returns invalid-duration failure and does not start session", async () => {
       const mockWindow = { setSize: vi.fn() };
       registerIpcHandlers(mockWindow, makeIpcDeps());
@@ -705,7 +756,11 @@ describe("ipc additional coverage", () => {
       Object.defineProperty(electron.app, "isPackaged", { configurable: true, value: true });
       vi.resetModules();
       const mod = await import("../../src/main/ipc.js");
-      registerIpcHandlers = mod.registerIpcHandlers as unknown as typeof registerIpcHandlers;
+      registerIpcHandlers = (win, deps) =>
+        (mod.registerIpcHandlers as unknown as typeof registerIpcHandlers)(
+          { on: vi.fn(), ...win },
+          deps,
+        );
       registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
     });
 
@@ -794,7 +849,11 @@ describe("ipc additional coverage", () => {
       Object.defineProperty(electron.app, "isPackaged", { configurable: true, value: false });
       vi.resetModules();
       const mod = await import("../../src/main/ipc.js");
-      registerIpcHandlers = mod.registerIpcHandlers as unknown as typeof registerIpcHandlers;
+      registerIpcHandlers = (win, deps) =>
+        (mod.registerIpcHandlers as unknown as typeof registerIpcHandlers)(
+          { on: vi.fn(), ...win },
+          deps,
+        );
       registerIpcHandlers({ setSize: vi.fn() }, makeIpcDeps());
       const event = { senderFrame: { url: "http://localhost:5173/index.html", parent: null } };
 
