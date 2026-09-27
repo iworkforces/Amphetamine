@@ -24,7 +24,7 @@ export interface AppShell {
   /** Ready order: tray-only mode → popover → composition → IPC → tray → updater. */
   init(): Promise<void>;
   /**
-   * Quit order: flush settings → tray → composition.cleanup → destroy windows.
+   * Quit order: flush settings → tray → IPC → composition.cleanup → destroy windows.
    * Idempotent.
    */
   cleanup(): Promise<void>;
@@ -42,6 +42,7 @@ export interface AppShell {
 export function createAppShell(): AppShell {
   let composition: AppComposition | null = null;
   let cleanupTray: (() => void) | null = null;
+  let cleanupIpc: (() => void) | null = null;
   let mainWindow: BrowserWindow | null = null;
   let isQuitting = false;
   let ready = false;
@@ -60,13 +61,17 @@ export function createAppShell(): AppShell {
         await composition.init();
         if (isClosing()) return;
 
-        registerIpcHandlers(mainWindow, composition.getIpcDeps());
+        cleanupIpc = registerIpcHandlers(mainWindow, composition.getIpcDeps());
         cleanupTray = setupTray(composition.getTrayDeps());
         if (!isBenchmarkMode()) composition.initUpdater();
         ready = true;
         log.info("[app-shell] Initialized");
       } catch (err) {
-        await cleanup();
+        try {
+          await cleanup();
+        } catch (cleanupError) {
+          log.error("[app-shell] Cleanup after failed init failed:", cleanupError);
+        }
         throw err;
       }
     })();
@@ -98,6 +103,12 @@ export function createAppShell(): AppShell {
       }
       cleanupTray = null;
       try {
+        cleanupIpc?.();
+      } catch (err) {
+        log.error("[app-shell] IPC cleanup on quit failed:", err);
+      }
+      cleanupIpc = null;
+      try {
         composition?.cleanup();
       } catch (err) {
         log.error("[app-shell] Composition cleanup on quit failed:", err);
@@ -105,6 +116,8 @@ export function createAppShell(): AppShell {
       composition = null;
       try {
         destroyAllWindows();
+      } catch (err) {
+        log.error("[app-shell] Window cleanup on quit failed:", err);
       } finally {
         mainWindow = null;
         ready = false;
