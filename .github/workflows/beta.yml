@@ -160,7 +160,7 @@ jobs:
           test -f lib/preload/index.cjs || { echo 'ERROR: lib/preload/index.cjs missing'; exit 1; }
 
       - name: Package macOS ${{ matrix.arch }}
-        run: bunx electron-builder --mac --${{ matrix.arch }}
+        run: bunx electron-builder --mac dmg zip --${{ matrix.arch }}
         env:
           ELECTRON_CACHE: ${{ runner.temp }}/.cache/electron
           ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/.cache/electron-builder
@@ -269,7 +269,7 @@ jobs:
           test -f lib/preload/index.cjs || { echo 'ERROR: lib/preload/index.cjs missing'; exit 1; }
 
       - name: Package Windows ${{ matrix.arch }}
-        run: bunx electron-builder --win --${{ matrix.arch }}
+        run: bunx electron-builder --win nsis portable --${{ matrix.arch }}
         env:
           ELECTRON_CACHE: ${{ runner.temp }}/.cache/electron
           ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/.cache/electron-builder
