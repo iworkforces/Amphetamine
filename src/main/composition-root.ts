@@ -15,6 +15,7 @@ import {
 } from "./global-shortcut.js";
 import { isPreventingSleep, stopPreventingSleep, getSleepBlockerPort } from "./sleep-prevention.js";
 import { createBatteryMonitor, type BatteryMonitorHandle } from "./battery-monitor.js";
+import { createBatterySensor } from "./platform/index.js";
 import { createSessionTimer, type SessionTimerHandle } from "./session-timer.js";
 import type { TrayDeps } from "./tray.js";
 import { createSettingsWindow, closeSettingsWindow } from "./settings-window.js";
@@ -157,6 +158,7 @@ export function createAppComposition(): AppComposition {
         });
 
         batteryMonitor = createBatteryMonitor({
+          sensor: createBatterySensor(),
           getThreshold: () => getSettings().batteryThreshold,
           onAutoStop: handleLowBatteryAutoStop,
           isPreventingSleep,

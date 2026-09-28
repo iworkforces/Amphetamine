@@ -8,6 +8,7 @@ Zero-runtime-dependency contracts shared by main, preload, renderer, scripts, an
 |------|------|
 | `types.ts` | `IPC_CHANNELS`, `PUSH_CHANNELS`, `IpcChannelMap`, session/updater/about wire DTOs; re-exports domain `AppSettings` / `DEFAULT_SETTINGS` / `PerfTimestamp` / `SleepBlockMode` / `asPerf` |
 | `utility-dialog.ts` | Private utility-dialog channel names + `UtilityDialogOptions` / payload / result types (not part of public `IPC_CHANNELS` budget) |
+| `settings-quit.ts` | Private correlated Settings drain request/ack contract (not part of public channel or push budgets) |
 | `settings-validators.ts` | Re-export of domain settings validation |
 | `benchmark-types.ts` | Benchmark env name, renderer counter types/defaults, runtime guard |
 
@@ -35,6 +36,7 @@ Zero-runtime-dependency contracts shared by main, preload, renderer, scripts, an
 - Adding a **public** channel requires updates in: shared types, preload `api` + `WiredChannels`, main `registerIpcHandlers()` (or updater IPC), and tests.
 - Push-only channels still need response payload types (typed listeners/broadcasts).
 - **Private** utility-dialog channels (`get-payload` / `respond` / `set-height` / push `apply`) stay out of `IPC_CHANNELS`; they are handled only by WindowGraph + the dedicated preload.
+- **Private** Settings quit drain request/ack channels stay out of `IPC_CHANNELS` and `PUSH_CHANNELS`; WindowGraph authenticates the cached Settings main frame before accepting an acknowledgement.
 
 ## Process-model note
 

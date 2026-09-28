@@ -45,8 +45,8 @@ Main process owns app lifecycle, BrowserWindows, tray, typed IPC registration, a
 **Quit (`index.ts` sole `before-quit` owner → `AppShell.cleanup()`):**
 
 1. Idempotent cleanup flags (`index` + shell)
-2. `flushSettingsWriteChain()` (2s race timeout)
-3. Tray `destroy`
+2. Drain the cached Settings renderer (including hidden windows), then `flushSettingsWriteChain()` under one absolute 2s deadline; skip absent/not-ready windows
+3. Tray `destroy`, IPC cleanup
 4. `composition.cleanup()`
 5. `destroyAllWindows()` (WindowGraph) → `app.exit(0)`
 
@@ -74,7 +74,7 @@ Do not register a second `before-quit` handler on settings or other modules.
 ## IPC and security
 
 - Use `typedHandle()` for invoke channels (validates sender).
-- Raw `ipcMain.on()` only with explicit `validateSender()`.
+- Public raw `ipcMain.on()` requires `validateSender()`; the private Settings quit acknowledgement instead checks the exact cached `webContents`, its current main frame, and the correlated request ID.
 - Packaged public senders: exact-match NFC-normalized `lib/renderer/{index,settings,about}.html`; dev: `DEV_ORIGINS`. Utility-dialog private IPC uses webContents-id binding (not URL allowlist).
 - Renderer pushes: `broadcastToWindows<K>()`; skip destroyed windows.
 - `hardenWebContents` blocks off-allowlist navigation and **denies all** `window.open` by default (popover, settings, about, utility-dialog).

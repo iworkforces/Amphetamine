@@ -583,7 +583,15 @@ function clearSaveIndicator(id: string): void {
 }
 
 async function flushSave(): Promise<void> {
-  if (disposed || isSaving || !pendingReady || Object.keys(pendingPartial).length === 0) return;
+  if (
+    disposed ||
+    isSaving ||
+    quitDrainState === "saved" ||
+    quitDrainState === "failed" ||
+    !pendingReady ||
+    Object.keys(pendingPartial).length === 0
+  )
+    return;
   isSaving = true;
   const toSend = { ...pendingPartial };
   const sentIndicators = { ...pendingIndicators };
@@ -614,6 +622,7 @@ async function flushSave(): Promise<void> {
     }
     for (const key of res.rejectedKeys) rejectedSaveKeys.add(key);
     renderErrorMessage();
+    if (quitDrainState === "draining" && res.rejectedKeys.length > 0) quitDrainState = "failed";
   } catch (err) {
     if (!isActive()) return;
     pendingPartial = { ...toSend, ...pendingPartial };
@@ -625,14 +634,29 @@ async function flushSave(): Promise<void> {
       if (Object.hasOwn(toSend, key)) writeSaveErrors.set(key, message);
     }
     renderErrorMessage();
+    if (quitDrainState === "draining") quitDrainState = "failed";
   } finally {
     isSaving = false;
-    if (isActive() && hasReadySave()) void flushSave();
+    if (isActive()) {
+      if (quitDrainState === "draining") {
+        if (saveTimer !== null) clearTimeout(saveTimer);
+        saveTimer = null;
+        pendingReady = true;
+        if (Object.keys(pendingPartial).length > 0) {
+          void flushSave();
+        } else {
+          quitDrainState = "saved";
+          acknowledgeQuitDrain("saved");
+        }
+      } else if (quitDrainState === "failed") {
+        acknowledgeQuitDrain("failed");
+      } else if (hasReadySave()) void flushSave();
+    }
   }
 }
 
 function saveSettings(partial: Partial<AppSettings>, indicatorId: string): void {
-  if (disposed) return;
+  if (disposed || quitDrainState === "saved" || quitDrainState === "failed") return;
   pendingPartial = { ...pendingPartial, ...partial };
   for (const key of SETTINGS_KEYS) {
     if (Object.hasOwn(partial, key)) {
@@ -649,6 +673,11 @@ function saveSettings(partial: Partial<AppSettings>, indicatorId: string): void 
   updateSettingsUI();
   renderErrorMessage();
 
+  if (quitDrainState === "draining") {
+    pendingReady = true;
+    void flushSave();
+    return;
+  }
   if (saveTimer !== null) clearTimeout(saveTimer);
   pendingReady = false;
   saveTimer = setTimeout(() => {
@@ -657,6 +686,30 @@ function saveSettings(partial: Partial<AppSettings>, indicatorId: string): void 
     pendingReady = true;
     void flushSave();
   }, 300);
+}
+
+let quitDrainState: "idle" | "draining" | "saved" | "failed" = "idle";
+let quitDrainRequestId: string | null = null;
+
+function acknowledgeQuitDrain(status: "saved" | "failed"): void {
+  if (quitDrainRequestId === null) return;
+  window.api.settings.ackQuitDrain({ requestId: quitDrainRequestId, status });
+  quitDrainRequestId = null;
+}
+
+function onQuitDrain(request: { readonly requestId: string }): void {
+  if (disposed || quitDrainState !== "idle") return;
+  quitDrainState = "draining";
+  quitDrainRequestId = request.requestId;
+  if (saveTimer !== null) clearTimeout(saveTimer);
+  saveTimer = null;
+  pendingReady = true;
+  if (!isSaving && Object.keys(pendingPartial).length === 0) {
+    quitDrainState = "saved";
+    acknowledgeQuitDrain("saved");
+  } else {
+    void flushSave();
+  }
 }
 
 /** Drop focus from toggles/selects after warm-cache show (no autofocus on reopen). */
@@ -684,6 +737,7 @@ function onSettingsVisibilityChange(): void {
 }
 
 async function init(): Promise<void> {
+  const cleanupQuitDrain = window.api.settings.onQuitDrain(onQuitDrain);
   const settingsReadVersion = settingsPushVersion;
   const statusReadVersion = sessionPushVersion;
   const cleanupSettings = window.api.onSettingsChanged((newSettings: AppSettings) => {
@@ -731,6 +785,7 @@ async function init(): Promise<void> {
     cleanupSettings();
     cleanupSession();
     cleanupShortcutFailed();
+    cleanupQuitDrain();
     document.removeEventListener("visibilitychange", onSettingsVisibilityChange);
     window.removeEventListener("keydown", onEscape);
     window.removeEventListener("beforeunload", dispose);

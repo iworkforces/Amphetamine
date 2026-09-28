@@ -57,6 +57,7 @@ import {
   parsePmsetOutput,
   parsePowerShellBatteryOutput,
 } from "./battery-percent.js";
+import { createBatterySensor } from "./battery-sensor.js";
 
 export type { PlatformId, ProcessPlatform, LoginItemWriteSettings, WindowChromeOptions };
 
@@ -81,6 +82,7 @@ export {
   utilityDialogWindowChrome,
   appIconFileName,
   getBatteryPercent,
+  createBatterySensor,
   parsePmsetOutput,
   parsePowerShellBatteryOutput,
 };

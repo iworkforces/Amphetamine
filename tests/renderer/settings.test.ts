@@ -18,6 +18,8 @@ const mockApi = {
     get: vi.fn<() => Promise<AppSettings>>(),
     set: vi.fn<(_partial: Partial<AppSettings>) => Promise<SettingsSetResponse>>(),
     open: vi.fn(),
+    onQuitDrain: vi.fn<(_callback: (request: { requestId: string }) => void) => () => void>(() => vi.fn()),
+    ackQuitDrain: vi.fn<(_ack: { requestId: string; status: "saved" | "failed" }) => void>(),
   },
   session: {
     start: vi.fn(),
@@ -505,6 +507,85 @@ describe("renderer settings", () => {
   });
 
   describe("latest-snapshot save queue", () => {
+    it("drains a debounced edit without waiting 300ms and freezes after acknowledgement", async () => {
+      const save = Promise.withResolvers<SettingsSetResponse>();
+      mockApi.settings.set.mockReturnValueOnce(save.promise);
+      await mountSettings();
+      const toggle = document.querySelector<HTMLInputElement>("#launch-at-login-toggle");
+      toggle?.click();
+      mockApi.settings.onQuitDrain.mock.calls.at(-1)?.[0]({ requestId: "quit-1" });
+      expect(mockApi.settings.set).toHaveBeenCalledExactlyOnceWith({ launchAtLogin: true });
+      expect(mockApi.settings.ackQuitDrain).not.toHaveBeenCalled();
+
+      save.resolve(accepted({ ...defaultSettings, launchAtLogin: true }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockApi.settings.ackQuitDrain).toHaveBeenCalledExactlyOnceWith({
+        requestId: "quit-1", status: "saved",
+      });
+      toggle?.click();
+      await vi.advanceTimersByTimeAsync(400);
+      expect(mockApi.settings.set).toHaveBeenCalledTimes(1);
+      expect(mockApi.settings.ackQuitDrain).toHaveBeenCalledTimes(1);
+    });
+
+    it("waits for an in-flight save and drains newly queued edits before acknowledging", async () => {
+      const first = Promise.withResolvers<SettingsSetResponse>();
+      const second = Promise.withResolvers<SettingsSetResponse>();
+      mockApi.settings.set.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+      await mountSettings();
+      document.querySelector<HTMLInputElement>("#launch-at-login-toggle")?.click();
+      await vi.advanceTimersByTimeAsync(300);
+      mockApi.settings.onQuitDrain.mock.calls.at(-1)?.[0]({ requestId: "quit-2" });
+      const battery = document.querySelector<HTMLSelectElement>("#battery-threshold-select");
+      if (!battery) throw new Error("Expected battery control");
+      battery.value = "20";
+      battery.dispatchEvent(new Event("change"));
+      first.resolve(accepted({ ...defaultSettings, launchAtLogin: true }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockApi.settings.set).toHaveBeenNthCalledWith(2, { batteryThreshold: 20 });
+      expect(mockApi.settings.ackQuitDrain).not.toHaveBeenCalled();
+      second.resolve(accepted({ ...defaultSettings, launchAtLogin: true, batteryThreshold: 20 }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockApi.settings.ackQuitDrain).toHaveBeenCalledExactlyOnceWith({
+        requestId: "quit-2", status: "saved",
+      });
+    });
+
+    it("fails the quit drain on a rejected save without retrying indefinitely", async () => {
+      mockApi.settings.set.mockRejectedValue(new Error("Disk full"));
+      await mountSettings();
+      document.querySelector<HTMLInputElement>("#launch-at-login-toggle")?.click();
+      mockApi.settings.onQuitDrain.mock.calls.at(-1)?.[0]({ requestId: "quit-3" });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(mockApi.settings.set).toHaveBeenCalledTimes(1);
+      expect(mockApi.settings.ackQuitDrain).toHaveBeenCalledExactlyOnceWith({
+        requestId: "quit-3", status: "failed",
+      });
+    });
+
+    it("reports a rejected settings key as a failed quit drain", async () => {
+      mockApi.settings.set.mockResolvedValueOnce({
+        settings: { ...defaultSettings }, rejectedKeys: ["preventSleep"],
+      });
+      await mountSettings();
+      document.querySelector<HTMLInputElement>("#prevent-sleep-toggle")?.click();
+      mockApi.settings.onQuitDrain.mock.calls.at(-1)?.[0]({ requestId: "quit-rejected" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockApi.settings.ackQuitDrain).toHaveBeenCalledExactlyOnceWith({
+        requestId: "quit-rejected", status: "failed",
+      });
+    });
+
+    it("acknowledges an empty hidden queue without starting a save", async () => {
+      await mountSettings();
+      vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+      mockApi.settings.onQuitDrain.mock.calls.at(-1)?.[0]({ requestId: "quit-hidden" });
+      expect(mockApi.settings.ackQuitDrain).toHaveBeenCalledExactlyOnceWith({
+        requestId: "quit-hidden", status: "saved",
+      });
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+    });
+
     it("queues the latest snapshot when a save is already in flight", async () => {
       const resolvers: Array<(v: AppSettings) => void> = [];
       mockApi.settings.set.mockImplementation(

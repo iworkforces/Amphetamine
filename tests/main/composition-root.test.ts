@@ -35,6 +35,13 @@ const mockCreateBatteryMonitor = vi.hoisted(() =>
     reconfigure: vi.fn(),
   })),
 );
+const mockCreateBatterySensor = vi.hoisted(() =>
+  vi.fn(() => ({
+    getPercent: vi.fn(),
+    isOnBatteryPower: vi.fn(),
+    onPowerSourceChange: vi.fn(),
+  })),
+);
 
 vi.mock("electron", () => ({
   powerMonitor: { on: vi.fn(), off: vi.fn(), isOnBatteryPower: vi.fn() },
@@ -114,6 +121,7 @@ vi.mock("../../src/main/utils/packageInfo.js", () => ({
   }),
 }));
 vi.mock("../../src/main/platform/index.js", () => ({
+  createBatterySensor: mockCreateBatterySensor,
   enterForegroundMode: vi.fn(),
   enterTrayOnlyMode: vi.fn(),
   acquireUtilityForeground: vi.fn(),

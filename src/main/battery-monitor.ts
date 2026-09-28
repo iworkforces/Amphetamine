@@ -1,6 +1,5 @@
-import { powerMonitor } from "electron/main";
 import log from "electron-log";
-import { getBatteryPercent } from "./platform/index.js";
+import type { BatterySensorPort } from "../application/ports/battery-sensor.port.js";
 import { isThresholdEnabled } from "../domain/battery/threshold.js";
 import { isBenchmarkMode } from "../infrastructure/benchmark/benchmark-env.js";
 import type { BatteryBenchmarkCounters } from "../shared/benchmark-types.js";
@@ -52,12 +51,13 @@ export function resetBatteryBenchmarkCounters(): void {
  * and stopping sleep prevention). The monitor never touches sleep-prevention
  * state directly.
  *
- * Charge percent is read via `platform/battery-percent` (pmset / PowerShell).
+ * Charge percent and power source are read through the injected sensor.
  *
  * All fields are required — there is no silent fallback. Wiring is enforced
  * at construction time by `createBatteryMonitor`.
  */
 export interface BatteryDeps {
+  sensor: BatterySensorPort;
   /** Returns the configured battery threshold (%). 0 / non-positive ⇒ auto-disable is OFF. */
   getThreshold: () => number;
   /** Invoked when battery drops at or below threshold; composition owns the response. */
@@ -102,14 +102,13 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
     throw new TypeError("createBatteryMonitor: deps.isPreventingSleep must be a function");
   }
 
+  const { sensor } = deps;
   const { getThreshold, onAutoStop, isPreventingSleep } = deps;
   const onPercentSample = deps.onPercentSample;
 
   let isCheckingBattery = false;
   let disposed = false;
-  let onBatteryListener: (() => void) | null = null;
-  let onAcListener: (() => void) | null = null;
-  let onResumeListener: (() => void) | null = null;
+  let unsubscribePowerSource: (() => void) | null = null;
   let batteryCheckInterval: ReturnType<typeof setInterval> | null = null;
 
   const checkBatteryAndStop = async (): Promise<void> => {
@@ -124,7 +123,7 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
     }
 
     try {
-      const percent = await getBatteryPercent();
+      const percent = await sensor.getPercent();
       recordBattery("completedRead");
       if (disposed) return;
       onPercentSample?.(percent);
@@ -163,7 +162,7 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
   const startPeriodicBatteryChecks = (): void => {
     if (disposed || batteryCheckInterval !== null) return;
     if (!isThresholdEnabled(getThreshold())) return;
-    if (!powerMonitor.isOnBatteryPower()) return;
+    if (!sensor.isOnBatteryPower()) return;
     if (!isPreventingSleep()) return;
     batteryCheckInterval = setInterval(() => {
       runGuardedBatteryCheck("[battery] Periodic battery check error:");
@@ -183,29 +182,23 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
 
   /** @internal Power monitor listeners persist for app lifetime by design. */
   const initBatteryMonitoring = async (): Promise<void> => {
-    if (disposed || onBatteryListener !== null) return;
-    onBatteryListener = () => {
-      runGuardedBatteryCheck("[battery] Battery check error:");
-      // AC→battery transition: if we're already preventing sleep, begin polling
-      // continuously so we re-evaluate the threshold as the battery drains.
-      startPeriodicBatteryChecks();
-    };
-    onAcListener = () => {
-      log.info("[battery] On AC power, battery monitoring reset");
-      // No need to keep polling while plugged in.
-      stopPeriodicBatteryChecks();
-    };
-    onResumeListener = () => {
-      // System resumed from sleep — re-evaluate the polling loop immediately;
-      // the laptop may now be on battery and our setInterval was paused.
-      if (powerMonitor.isOnBatteryPower()) {
+    if (disposed || unsubscribePowerSource !== null) return;
+    unsubscribePowerSource = sensor.onPowerSourceChange({
+      onBattery: () => {
         runGuardedBatteryCheck("[battery] Battery check error:");
-      }
-      startPeriodicBatteryChecks();
-    };
-    powerMonitor.on("on-battery", onBatteryListener);
-    powerMonitor.on("on-ac", onAcListener);
-    powerMonitor.on("resume", onResumeListener);
+        startPeriodicBatteryChecks();
+      },
+      onAc: () => {
+        log.info("[battery] On AC power, battery monitoring reset");
+        stopPeriodicBatteryChecks();
+      },
+      onResume: () => {
+        if (sensor.isOnBatteryPower()) {
+          runGuardedBatteryCheck("[battery] Battery check error:");
+        }
+        startPeriodicBatteryChecks();
+      },
+    });
 
     // If we're already on battery and preventing sleep at init time, kick off polling.
     startPeriodicBatteryChecks();
@@ -216,18 +209,8 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
     if (disposed) return;
     disposed = true;
     stopPeriodicBatteryChecks();
-    if (onBatteryListener) {
-      powerMonitor.off("on-battery", onBatteryListener);
-      onBatteryListener = null;
-    }
-    if (onAcListener) {
-      powerMonitor.off("on-ac", onAcListener);
-      onAcListener = null;
-    }
-    if (onResumeListener) {
-      powerMonitor.off("resume", onResumeListener);
-      onResumeListener = null;
-    }
+    unsubscribePowerSource?.();
+    unsubscribePowerSource = null;
   };
 
   /**

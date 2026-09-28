@@ -229,5 +229,7 @@ describe("main index - AppShell bootstrap", () => {
     expect(mockCompositionCleanup).toHaveBeenCalledTimes(1);
     expect(mockRegisterIpcHandlers).not.toHaveBeenCalled();
     expect(mockSetupTray).not.toHaveBeenCalled();
+    quitHandlers[0]?.[1]({ preventDefault: vi.fn() });
+    expect(mockExit).toHaveBeenCalledTimes(1);
   });
 });

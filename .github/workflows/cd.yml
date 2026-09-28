@@ -69,14 +69,6 @@ jobs:
             echo "No GitHub release for $TAG yet (will publish even if tag exists)"
           fi
 
-      - name: Create and push tag
-        if: steps.check_tag.outputs.exists == 'false'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag "${{ steps.version.outputs.tag }}"
-          git push origin "${{ steps.version.outputs.tag }}"
-
       - name: Resolve previous production tag
         id: prev
         run: |
@@ -189,6 +181,10 @@ jobs:
           name: dist-win-arm64
           path: artifacts/win-arm64
 
+      - name: Verify source release matrix
+        if: steps.skip_release.outputs.skip != 'true'
+        run: bun run scripts/verify-release-matrix.ts source
+
       - name: Verify release artifacts
         if: steps.skip_release.outputs.skip != 'true'
         run: |
@@ -246,6 +242,18 @@ jobs:
       - name: Stage unique release assets
         if: steps.skip_release.outputs.skip != 'true'
         run: python3 scripts/stage-release-assets.py
+
+      - name: Verify staged release matrix
+        if: steps.skip_release.outputs.skip != 'true'
+        run: bun run scripts/verify-release-matrix.ts staged
+
+      - name: Create and push tag
+        if: steps.skip_release.outputs.skip != 'true' && steps.check_tag.outputs.exists == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
 
       - name: Publish GitHub release
         if: steps.skip_release.outputs.skip != 'true'

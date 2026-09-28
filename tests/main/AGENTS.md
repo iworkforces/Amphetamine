@@ -41,7 +41,7 @@ Pure use-case / domain tests live under `tests/application` and `tests/domain` (
 
 - `reconcileSessionState` must not kill sessions when `defaultSessionDuration` is null.
 - Battery threshold change while preventing sleep re-arms polling via `reconfigure`.
-- Quit: AppShell flush → tray → `composition.cleanup()` → `destroyAllWindows()`.
+- Quit: AppShell drains cached Settings renderer → store flush under one 2s deadline → tray → `composition.cleanup()` → `destroyAllWindows()`.
 - Tray cleanup calls `destroy()`.
 - Sleep mode: `powerSaveBlocker.start` receives configured mode string.
 - Effective sleep OR matrix (4 rows) via tray effective active / recompute.
