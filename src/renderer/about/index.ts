@@ -31,6 +31,37 @@ function prefersReducedMotion(): boolean {
   }
 }
 
+/** Drop focus from the GitHub icon (first tabbable) after show. */
+function clearIconFocus(): void {
+  const active = document.activeElement;
+  if (active instanceof HTMLElement && active !== document.body) {
+    active.blur();
+  }
+}
+
+function scheduleClearIconFocus(): void {
+  const run = (): void => {
+    if (document.visibilityState === "visible") {
+      clearIconFocus();
+    }
+  };
+  if (typeof window.requestAnimationFrame === "function") {
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(run);
+    });
+  } else {
+    run();
+  }
+}
+
+function onAboutVisibilityChange(): void {
+  if (document.visibilityState !== "visible") {
+    return;
+  }
+  // Double rAF: run after Chromium's focus-restore on BrowserWindow.show().
+  scheduleClearIconFocus();
+}
+
 /**
  * Opt-in open animation (opacity only — scale lives on aurora bloom so we
  * do not double-scale the whole About surface). Default paint is always
@@ -66,6 +97,10 @@ async function bootstrap(): Promise<void> {
   bindIconAuroraStagePause(root);
   // Materialize immediately so a failed getAbout() never leaves a blank window.
   startOpenAnimation(root);
+  // Chromium focuses the first tabbable (GitHub icon) on show; About opens unfocused.
+  clearIconFocus();
+  scheduleClearIconFocus();
+  document.addEventListener("visibilitychange", onAboutVisibilityChange);
 
   const icon = requireEl<HTMLImageElement>("app-icon");
   const productNameEl = requireEl<HTMLHeadingElement>("product-name");

@@ -54,7 +54,7 @@ Pure use-case / domain tests live under `tests/application` and `tests/domain` (
 - Warm cache (Settings/About): user `close` → preventDefault + hide + release foreground; second open reuses one BrowserWindow (no recreate); `close*Window` / `destroyAllWindows` force-`destroy`.
 - Utility dialog: hide-on-close warm cache + `apply` re-present; single-flight; `showUserDialog` mocked in hybrid updater tests (payload/button HIG), not native MessageBox.
 - Dismiss-before-ready: early present then hide then late `ready-to-show` must **not** re-show or re-acquire (`*WantsVisible`).
-- Settings present: deferred `executeJavaScript` blur so warm reopen does not focus a control.
+- Settings/About present: deferred `executeJavaScript` blur so warm reopen does not focus a control (Settings form; About GitHub icon).
 - `isSettingsWindowOpen` is true only when visible (hidden cache returns false).
 - AppShell: ready order tray-only → popover → composition → IPC → tray → `initUpdater` (skipped in benchmark); quit ends with `destroyAllWindows` (includes open utility dialog).
 - Popover hide: blur/minimize bursts → one pending hide; show before expiry cancels hide.

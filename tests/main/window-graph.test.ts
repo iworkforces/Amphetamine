@@ -549,6 +549,31 @@ describe("window-graph", () => {
     expect(mockAcquireUtility).toHaveBeenCalledTimes(1);
   });
 
+  it("clears About renderer focus on present so the GitHub icon is not focused", async () => {
+    vi.useFakeTimers();
+    mockOnce.mockImplementation((event: string, cb: () => void) => {
+      if (event === "ready-to-show") cb();
+    });
+    mockShow.mockImplementation(() => {
+      mockIsVisible.mockReturnValue(true);
+    });
+
+    const { showAbout } = await import("../../src/main/process/window-graph.js");
+    const { BrowserWindow } = await import("electron");
+    showAbout();
+    await vi.advanceTimersByTimeAsync(0);
+    const instance = vi.mocked(BrowserWindow).mock.results[0]?.value as {
+      webContents: { executeJavaScript: ReturnType<typeof vi.fn> };
+    };
+    expect(instance.webContents.executeJavaScript).toHaveBeenCalledTimes(1);
+
+    showAbout();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(instance.webContents.executeJavaScript).toHaveBeenCalledTimes(2);
+    expect(BrowserWindow).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+
   it("isSettingsWindowOpen is true only when visible", async () => {
     mockOnce.mockImplementation((event: string, cb: () => void) => {
       if (event === "ready-to-show") cb();
