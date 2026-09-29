@@ -21,7 +21,7 @@ Main process owns app lifecycle, BrowserWindows, tray, typed IPC registration, a
 | `session-timer.ts` | Façade over `application/session` engine; **handle injection only** |
 | `global-shortcut.ts` | Façade over RegisterAppShortcut + GlobalShortcutPort |
 | `auto-launch.ts` | Login items + `AutoLaunchPort` view (port lives here, not infrastructure) |
-| `battery-monitor.ts` | Threshold **detector** only; percent via `platform/battery-percent`; optional `onPercentSample`; benchmark counters |
+| `battery-monitor.ts` | Threshold **detector** only; injected `BatterySensorPort` (`createBatterySensor`); optional `onPercentSample`; benchmark counters |
 | `auto-updater.ts` | IPC registration + re-exports of hybrid policy (`infrastructure/updater`) |
 | `auto-updater-utils.ts` | Façade over pure release-URL helpers + package repo lookup |
 | `settings-window.ts` | Thin re-export of WindowGraph settings APIs |
@@ -57,7 +57,7 @@ Do not register a second `before-quit` handler on settings or other modules.
 - Settings field reactions run only through `SettingsReactionService` (single store `onChange` subscriber).
 - Effective sleep: `preventSleep` **OR** session active — via `createRecomputeSleepPrevention` + domain `isEffectivelyActive`.
 - Low-battery: detector calls `HandleLowBatteryAutoStop` (clear intent + cancel session + optional OS notify via `UserNotifierPort`).
-- Battery monitor may report `onPercentSample` so low-battery messages can include the last known charge percent.
+- Battery monitor is constructed with `createBatterySensor()`; it may report `onPercentSample` so low-battery messages can include the last known charge percent.
 - Session IPC before `init` **fails closed** (throws); no module-level session globals.
 - Application → renderer pushes use `AppPushEvent` via `MainToRendererNotifierPort` (not raw `IPC_CHANNELS`).
 - OS user feedback uses `UserNotifierPort` (`createOsUserNotifier`) — not a push channel.
@@ -106,7 +106,7 @@ Do not register a second `before-quit` handler on settings or other modules.
 - Settings/About/utility-dialog use **hide-on-close warm cache**: first open creates+loads the BrowserWindow; user close hides (renderer stays warm); quit/`close*Window` force-destroys (`win.destroy()`, not hide).
 - Utility dialog is **single-flight** (concurrent `presentUtilityDialog` joins the in-flight promise). Re-present pushes payload via `utility-dialog:apply` (no reload). Present path resets content size to default then re-measures; renderer calls `set-height` **before** the open fade (avoids first-open aurora filter fringe at the window edge).
 - `*WantsVisible` intent flag (Settings/About/utility-dialog): late `ready-to-show` after user dismiss must not re-show; reopening sets intent true again.
-- Settings present path clears form focus after show (deferred `webContents.executeJavaScript` blur) so warm-cache reopen does not restore Launch at Login / last control.
+- Settings/About present path clears renderer focus after show (deferred `webContents.executeJavaScript` blur) so Settings does not restore Launch at Login / last control and About does not land on the GitHub icon.
 - `isSettingsWindowOpen()` means **visible** (not merely cached-and-hidden).
 - Login items: `buildLoginItemSettings()` — no `openAsHidden` on non-darwin.
 - Battery shell-outs only in `platform/battery-percent.ts`.

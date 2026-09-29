@@ -297,14 +297,15 @@ function setWantsVisible(kind: UtilityKind, wants: boolean): void {
 }
 
 /**
- * Drop focus from form controls after warm-cache show.
- * Chromium restores the previous active element on BrowserWindow.show();
- * Settings should open without a focused switch/select (second+ open).
+ * Drop focus from renderer controls after show.
+ * Chromium restores the previous active element (or first tabbable) on
+ * BrowserWindow.show(); Settings should open without a focused switch/select,
+ * About without the GitHub icon ring.
  */
-function clearSettingsRendererFocus(win: BrowserWindow): void {
+function clearUtilityRendererFocus(win: BrowserWindow, kind: UtilityKind): void {
   // Defer past Chromium's focus-restore pass on show/focus.
   setTimeout(() => {
-    if (win.isDestroyed() || !wantsVisible("settings") || !win.isVisible()) {
+    if (win.isDestroyed() || !wantsVisible(kind) || !win.isVisible()) {
       return;
     }
     void win.webContents
@@ -337,9 +338,7 @@ function presentCachedUtilityWindow(win: BrowserWindow, kind: UtilityKind): void
     win.show();
   }
   win.focus();
-  if (kind === "settings") {
-    clearSettingsRendererFocus(win);
-  }
+  clearUtilityRendererFocus(win, kind);
 }
 
 function hideCachedUtilityWindow(win: BrowserWindow, kind: UtilityKind): void {

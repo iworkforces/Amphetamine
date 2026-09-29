@@ -94,7 +94,7 @@ node build/flip-fuses.cjs arm64       # legacy mac alias
 - Never sign DMG by default in `electron-builder.yml`; keep local ad-hoc behavior in `build-macOS-dmg.sh`.
 - Never write generated package output under `build/`; use `dist/`.
 - Never mark develop beta prereleases as latest production; tags must stay `vX.Y.Z-beta.N` with `prerelease: true`.
-- Beta **filenames** use `-beta-N` (hyphen), e.g. `Amphetamine-1.12.1-arm64-beta-1.dmg`, matching tag sequence N.
+- Beta **filenames** use `-beta-N` (hyphen), e.g. `Amphetamine-2.0.5-arm64-beta-1.dmg`, matching tag sequence N.
 - Never assume Windows artifacts are x64-only; release notes and CD must include arm64 when packaging both.
 
 ## Commands

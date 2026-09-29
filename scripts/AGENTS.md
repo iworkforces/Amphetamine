@@ -11,6 +11,8 @@ Developer-only Bun/Node scripts. Runtime app code must not import from here. Scr
 | `benchmark-performance.ts` | Runs built app in benchmark mode; writes harness JSON; supports `--scenario idle\|active-session` |
 | `merge-latest-yml.ts` | Merge dual-arch electron-builder `latest*.yml` feeds for GitHub Releases (CD) |
 | `stage-release-assets.py` | Stage unique basenames for CD publish (`artifacts/release-staging/`; feeds + binaries) |
+| `release-matrix.ts` | Validate production artifact matrix (`source` vs `staged`); CLI `verify-release-matrix.ts` |
+| `beta-release-matrix.ts` | Validate develop-beta binaries (`-beta-N`); CLI `verify-beta-release-matrix.ts` |
 | `check-sticky-ts.mjs` | Asserts sticky TypeScript compiler flags via native `tsc --showConfig` (prefers `@typescript/native`) |
 | `check-layer-imports.mjs` | Asserts domain/application import boundaries (no Electron / outer layers) |
 | `generate-app-icon.mjs` | Generates `build/icon.icns`, `build/icon.ico`, and `src/assets/settings-hero-icon.png` |
@@ -65,12 +67,13 @@ Developer-only Bun/Node scripts. Runtime app code must not import from here. Scr
 
 - `merge-latest-yml.ts` combines per-arch `latest-mac.yml` / `latest.yml` from CI matrix jobs into one release asset.
 - Usage: `bun run scripts/merge-latest-yml.ts a.yml b.yml --out out.yml`.
-- Unit tests: `tests/main/merge-latest-yml.test.ts`.
+- Unit tests: `tests/main/merge-latest-yml.test.ts`, `tests/main/release-matrix.test.ts`.
 
 ## Release asset staging (CD)
 
 - `stage-release-assets.py` copies arch-job artifacts into a flat staging dir with unique basenames for `gh release upload`.
 - Invoked from CD (not runtime). Feeds come from `update-feed/`; binaries from arch dirs; collisions must not fail the job (see workflows AGENTS).
+- CD runs `verify-release-matrix.ts source` after artifact download, then `staged` after `stage-release-assets.py`. Beta `release` runs `verify-beta-release-matrix.ts`.
 
 ## Conventions
 
@@ -100,4 +103,6 @@ bun run typecheck:layers
 bun scripts/generate-app-icon.mjs
 bun scripts/generate-coffee-tray-icons.mjs
 bun run scripts/merge-latest-yml.ts arm64/latest-mac.yml x64/latest-mac.yml --out latest-mac.yml
+bun run scripts/verify-release-matrix.ts source
+bun run scripts/verify-beta-release-matrix.ts 2.0.5 1
 ```

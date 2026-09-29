@@ -8,7 +8,7 @@ Renderer Vitest suites run in jsdom and assert DOM behavior for vanilla TypeScri
 |------|------|
 | `index.test.ts` | Popover render, status/timer, controls, pushes, effective-active OR matrix, session-action identity, hide dedupe, benchmark API mock |
 | `settings.test.ts` | Settings form, sections, debounced save, rejectedKeys, sleep mode, shortcut-failure subscription |
-| `about.test.ts` | About metadata fill, copyright/author, Escape close (no in-content OK), icon open, fancy aurora leaf fixture + warm-cache `.is-paused` toggle, getAbout failure visibility |
+| `about.test.ts` | About metadata fill, copyright/author, Escape close (no in-content OK), icon open, no autofocus on show, fancy aurora leaf fixture + warm-cache `.is-paused` toggle, getAbout failure visibility |
 | `utility-dialog.test.ts` | Payload apply, fancy aurora leaf fixture, warm-cache `.is-paused` toggle |
 | `delegation.test.ts` | Event delegation on `#app` |
 
@@ -37,6 +37,7 @@ Settings warm-cache focus clear and main hide-on-close are covered primarily in 
 - Settings: duration select starts session + saves preference; sleep mode saves `sleepBlockMode`.
 - Settings save path handles `{ settings, rejectedKeys }` responses.
 - About / utility-dialog: visibilitychange → stage `.is-paused` toggles; fancy leaf counts (4 blobs, 2 rings, sheen, flare); `aria-hidden` on `.icon-aurora`.
+- About: GitHub icon is not `document.activeElement` after open or warm-cache `visibilitychange` → visible.
 - Utility-dialog: payload text applied; `setHeight` called after measure when scrollHeight is stubbed; `#app.ready` after height settles.
 
 ## Mocking

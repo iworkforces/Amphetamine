@@ -182,4 +182,34 @@ describe("renderer about", () => {
     expect(document.querySelector(".aurora-sheen")).not.toBeNull();
     expect(document.querySelector(".aurora-flare")).not.toBeNull();
   });
+
+  it("does not leave the GitHub icon focused after open", async () => {
+    const icon = document.getElementById("app-icon");
+    expect(icon).toBeInstanceOf(HTMLElement);
+    icon?.focus();
+    expect(document.activeElement).toBe(icon);
+
+    vi.resetModules();
+    await import("../../src/renderer/about/index.js");
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(document.activeElement).not.toBe(icon);
+  });
+
+  it("blurs the GitHub icon when the warm-cached window becomes visible", async () => {
+    vi.resetModules();
+    await import("../../src/renderer/about/index.js");
+    await vi.advanceTimersByTimeAsync(0);
+
+    const icon = document.getElementById("app-icon");
+    expect(icon).toBeInstanceOf(HTMLElement);
+    setDocumentVisibility("hidden");
+    document.dispatchEvent(new Event("visibilitychange"));
+    icon?.focus();
+    expect(document.activeElement).toBe(icon);
+
+    setDocumentVisibility("visible");
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(document.activeElement).not.toBe(icon);
+  });
 });
