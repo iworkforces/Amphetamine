@@ -10,10 +10,7 @@ import { shell } from "electron/common";
 import log from "electron-log";
 import type { AutoUpdaterStatus, UpdateMeta } from "../../shared/types.js";
 import type { AppPushEvent } from "../../application/ports/main-to-renderer-notifier.port.js";
-import type {
-  UtilityDialogOptions,
-  UtilityDialogResult,
-} from "../../shared/utility-dialog.js";
+import type { UtilityDialogOptions, UtilityDialogResult } from "../../shared/utility-dialog.js";
 import {
   categorizeUpdaterError,
   deriveReleaseUrlBase,
@@ -44,8 +41,7 @@ let downloadNotifySent = false;
  * Shared in-flight `autoUpdater.checkForUpdates()` promise.
  * Background, tray, and IPC callers join this single request.
  */
-let inFlightCheck: Promise<Awaited<ReturnType<typeof autoUpdater.checkForUpdates>>> | null =
-  null;
+let inFlightCheck: Promise<Awaited<ReturnType<typeof autoUpdater.checkForUpdates>>> | null = null;
 
 /** Last version seen as available (for browser fallback if download/install fails). */
 let lastAvailableVersion: string | null = null;
@@ -76,10 +72,70 @@ export interface HybridAutoUpdaterDeps {
 let deps: HybridAutoUpdaterDeps | null = null;
 let cachedReleaseUrlBase: string | null | undefined = undefined;
 
+type UpdaterLifecycle = {
+  started: boolean;
+  retired: boolean;
+  pending: Set<Promise<unknown>>;
+  handlers: Array<() => void>;
+  checkInProgress: boolean;
+  checkErrorReported: boolean;
+  downloadErrorReported: boolean;
+};
+
+function createLifecycle(): UpdaterLifecycle {
+  return {
+    started: false,
+    retired: false,
+    pending: new Set(),
+    handlers: [],
+    checkInProgress: false,
+    checkErrorReported: false,
+    downloadErrorReported: false,
+  };
+}
+
+let lifecycle: UpdaterLifecycle | null = null;
+let retiringLifecycle: UpdaterLifecycle | null = null;
+let restartRequested = false;
+
+function isCurrent(owner: UpdaterLifecycle): boolean {
+  return lifecycle === owner && !owner.retired;
+}
+
+function removeOwnedHandlers(owner: UpdaterLifecycle): void {
+  for (const remove of owner.handlers) remove();
+  owner.handlers.length = 0;
+}
+
+function trackOperation(owner: UpdaterLifecycle, operation: Promise<unknown>): void {
+  owner.pending.add(operation);
+  void operation.then(
+    () => {
+      finishOperation(owner, operation);
+    },
+    () => {
+      finishOperation(owner, operation);
+    },
+  );
+}
+
+function finishOperation(owner: UpdaterLifecycle, operation: Promise<unknown>): void {
+  owner.pending.delete(operation);
+  if (owner === retiringLifecycle && owner.pending.size === 0) {
+    removeOwnedHandlers(owner);
+    retiringLifecycle = null;
+    if (restartRequested) {
+      restartRequested = false;
+      initAutoUpdater();
+    }
+  }
+}
+
 /** Configure hybrid policy (idempotent; last call wins). */
 export function configureHybridAutoUpdater(next: HybridAutoUpdaterDeps): void {
   deps = next;
   cachedReleaseUrlBase = undefined;
+  lifecycle ??= createLifecycle();
 }
 
 function requireDeps(): HybridAutoUpdaterDeps {
@@ -114,9 +170,7 @@ function toUpdateMeta(info: UpdateInfo): UpdateMeta {
  * Present the aurora utility dialog (injected by composition / WindowGraph).
  * Keeps infrastructure free of BrowserWindow / Dock policy.
  */
-async function presentUserDialog(
-  options: UtilityDialogOptions,
-): Promise<UtilityDialogResult> {
+async function presentUserDialog(options: UtilityDialogOptions): Promise<UtilityDialogResult> {
   return requireDeps().showUserDialog(options);
 }
 
@@ -207,21 +261,31 @@ function stillNeedsUserFeedback(): boolean {
  * Single-flight check: concurrent callers share one `checkForUpdates()`.
  * Manual (user-initiated) joiners upgrade `userInitiatedCheck` before awaiting.
  */
-function runSharedCheckForUpdates(): Promise<
-  Awaited<ReturnType<typeof autoUpdater.checkForUpdates>>
-> {
+function runSharedCheckForUpdates(
+  owner: UpdaterLifecycle,
+): Promise<Awaited<ReturnType<typeof autoUpdater.checkForUpdates>>> {
   if (inFlightCheck !== null) {
     return inFlightCheck;
   }
+  owner.checkErrorReported = false;
+  owner.downloadErrorReported = false;
+  owner.checkInProgress = true;
   const pending = autoUpdater
     .checkForUpdates()
-    .then((result) => result)
+    .catch((error: unknown) => {
+      if (isCurrent(owner) && !owner.checkErrorReported) {
+        onError(error instanceof Error ? error : new Error(String(error)), owner);
+      }
+      throw error;
+    })
     .finally(() => {
+      owner.checkInProgress = false;
       if (inFlightCheck === pending) {
         inFlightCheck = null;
       }
     });
   inFlightCheck = pending;
+  trackOperation(owner, pending);
   return pending;
 }
 
@@ -229,10 +293,10 @@ function runSharedCheckForUpdates(): Promise<
  * Finish a failed user-initiated check with browser fallback or a dialog.
  * No-ops if event handlers already consumed the user-initiated flag.
  */
-let lastCheckErrorCategory: "network" | "feed-missing" | "signature" | "io" | "unknown" =
-  "unknown";
+let lastCheckErrorCategory: "network" | "feed-missing" | "signature" | "io" | "unknown" = "unknown";
 
-function finishUserInitiatedFailure(): void {
+function finishUserInitiatedFailure(owner: UpdaterLifecycle): void {
+  if (!isCurrent(owner)) return;
   if (!userInitiatedCheck && !pendingUserFeedback) {
     return;
   }
@@ -242,12 +306,13 @@ function finishUserInitiatedFailure(): void {
   if (version !== null) {
     openReleasePageInBrowser(version);
   } else {
-    showCheckFailedDialog(category);
+    showCheckFailedDialog(category, owner);
   }
 }
 
 /** User-facing dialog when this build is already the latest. */
-function showUpToDateDialog(version: string): void {
+function showUpToDateDialog(version: string, owner: UpdaterLifecycle): void {
+  if (!isCurrent(owner)) return;
   void presentUserDialog({
     buttons: ["OK"],
     defaultId: 0,
@@ -263,7 +328,9 @@ function showUpToDateDialog(version: string): void {
 /** User-facing dialog when a manual check fails and we have no update payload. */
 function showCheckFailedDialog(
   category: "network" | "feed-missing" | "signature" | "io" | "unknown" = "unknown",
+  owner: UpdaterLifecycle,
 ): void {
+  if (!isCurrent(owner)) return;
   const detailByCategory: Record<typeof category, string> = {
     network:
       "Amphetamine couldn’t reach the update server. Check your network connection and try again, " +
@@ -290,6 +357,7 @@ function showCheckFailedDialog(
     detail: detailByCategory[category],
   })
     .then((result) => {
+      if (!isCurrent(owner)) return;
       if (result.response === actions.secondaryResponse) {
         openReleasesListInBrowser();
       }
@@ -300,7 +368,8 @@ function showCheckFailedDialog(
 }
 
 /** User-facing dialog when update checks are unavailable (unpackaged / dev). */
-function showUpdatesUnavailableDialog(): void {
+function showUpdatesUnavailableDialog(owner: UpdaterLifecycle): void {
+  if (!isCurrent(owner)) return;
   void presentUserDialog({
     buttons: ["OK"],
     defaultId: 0,
@@ -332,7 +401,7 @@ function onCheckingForUpdate(): void {
  * - User-initiated check: try in-app download; on failure fall back to browser.
  * - Background/periodic check: do not download or open the browser (non-intrusive).
  */
-function onUpdateAvailable(info: UpdateInfo): void {
+function onUpdateAvailable(info: UpdateInfo, owner: UpdaterLifecycle): void {
   log.info("[auto-updater] Update available:", info.version);
   consecutiveFailures = 0;
   rescheduleCheckLoop();
@@ -343,28 +412,33 @@ function onUpdateAvailable(info: UpdateInfo): void {
     info: toUpdateMeta(info),
   });
 
-  if (!userInitiatedCheck) {
+  if (!userInitiatedCheck || !pendingUserFeedback) {
     log.info("[auto-updater] Background check found update; waiting for user action");
     return;
   }
 
   // Download path is the user feedback for this check (progress + install dialog later).
   markUserFeedbackDelivered();
-  startUserInitiatedDownload(info.version);
+  startUserInitiatedDownload(info.version, owner);
 }
 
-function startUserInitiatedDownload(version: string): void {
+function startUserInitiatedDownload(version: string, owner: UpdaterLifecycle): void {
+  owner.downloadErrorReported = false;
   log.info("[auto-updater] User-initiated: attempting in-app download of", version);
   if (!downloadNotifySent) {
     downloadNotifySent = true;
     notifyUserStatus(`Downloading Amphetamine ${version}…`);
   }
-  void autoUpdater
-    .downloadUpdate()
+  const download = autoUpdater.downloadUpdate();
+  trackOperation(owner, download);
+  void download
     .then(() => {
+      if (!isCurrent(owner)) return;
       log.info("[auto-updater] downloadUpdate() resolved for", version);
     })
     .catch((err: unknown) => {
+      if (!isCurrent(owner) || owner.downloadErrorReported) return;
+      owner.downloadErrorReported = true;
       log.warn("[auto-updater] In-app download failed; falling back to browser:", err);
       openReleasePageInBrowser(version);
       clearUserInitiated();
@@ -372,7 +446,7 @@ function startUserInitiatedDownload(version: string): void {
 }
 
 /** Handle "update-not-available" event */
-function onUpdateNotAvailable(info: UpdateInfo): void {
+function onUpdateNotAvailable(info: UpdateInfo, owner: UpdaterLifecycle): void {
   log.info("[auto-updater] No update available. Current version:", info.version);
   consecutiveFailures = 0;
   rescheduleCheckLoop();
@@ -386,7 +460,7 @@ function onUpdateNotAvailable(info: UpdateInfo): void {
 
   if (userInitiatedCheck || pendingUserFeedback) {
     clearUserInitiated();
-    showUpToDateDialog(info.version);
+    showUpToDateDialog(info.version, owner);
   }
 }
 
@@ -413,7 +487,7 @@ function onDownloadProgress(progress: ProgressInfo): void {
  * For user-initiated flow: offer restart to install; on decline leave staged for later.
  * If quitAndInstall is refused/fails, fall back to the GitHub release page.
  */
-function onUpdateDownloaded(info: UpdateInfo): void {
+function onUpdateDownloaded(info: UpdateInfo, owner: UpdaterLifecycle): void {
   log.info("[auto-updater] Update downloaded:", info.version);
   publishStatus({
     status: "downloaded",
@@ -440,6 +514,7 @@ function onUpdateDownloaded(info: UpdateInfo): void {
       "you can install from the Releases page instead.",
   })
     .then((result) => {
+      if (!isCurrent(owner)) return;
       if (result.response === actions.primaryResponse) {
         try {
           // isSilent=false, isForceRunAfter=true so the app relaunches after swap when possible.
@@ -453,13 +528,19 @@ function onUpdateDownloaded(info: UpdateInfo): void {
       }
     })
     .catch((err: unknown) => {
+      if (!isCurrent(owner)) return;
       log.warn("[auto-updater] Install dialog failed; falling back to browser:", err);
       openReleasePageInBrowser(info.version);
     });
 }
 
 /** Handle "error" event */
-function onError(err: Error): void {
+function onError(err: Error, owner: UpdaterLifecycle): void {
+  if (owner.checkErrorReported || owner.downloadErrorReported) return;
+  if (owner.checkInProgress) {
+    owner.checkErrorReported = true;
+  }
+  if (userInitiatedCheck && lastAvailableVersion !== null) owner.downloadErrorReported = true;
   log.error("[auto-updater] Error:", err.message);
   consecutiveFailures += 1;
   rescheduleCheckLoop();
@@ -480,19 +561,45 @@ function onError(err: Error): void {
       openReleasePageInBrowser(version);
     } else {
       log.info("[auto-updater] Error during user-initiated check with no known version");
-      showCheckFailedDialog(category);
+      showCheckFailedDialog(category, owner);
     }
   }
 }
 
 /** Register all autoUpdater event handlers */
-function registerUpdateEventHandlers(): void {
-  autoUpdater.on("checking-for-update", onCheckingForUpdate);
-  autoUpdater.on("update-available", onUpdateAvailable);
-  autoUpdater.on("update-not-available", onUpdateNotAvailable);
-  autoUpdater.on("download-progress", onDownloadProgress);
-  autoUpdater.on("update-downloaded", onUpdateDownloaded);
-  autoUpdater.on("error", onError);
+function registerUpdateEventHandlers(owner: UpdaterLifecycle): void {
+  const checking = () => {
+    if (isCurrent(owner)) onCheckingForUpdate();
+  };
+  const available = (info: UpdateInfo) => {
+    if (isCurrent(owner)) onUpdateAvailable(info, owner);
+  };
+  const unavailable = (info: UpdateInfo) => {
+    if (isCurrent(owner)) onUpdateNotAvailable(info, owner);
+  };
+  const progress = (info: ProgressInfo) => {
+    if (isCurrent(owner)) onDownloadProgress(info);
+  };
+  const downloaded = (info: UpdateInfo) => {
+    if (isCurrent(owner)) onUpdateDownloaded(info, owner);
+  };
+  const error = (reason: Error) => {
+    if (isCurrent(owner)) onError(reason, owner);
+  };
+  autoUpdater.on("checking-for-update", checking);
+  autoUpdater.on("update-available", available);
+  autoUpdater.on("update-not-available", unavailable);
+  autoUpdater.on("download-progress", progress);
+  autoUpdater.on("update-downloaded", downloaded);
+  autoUpdater.on("error", error);
+  owner.handlers.push(
+    () => autoUpdater.off("checking-for-update", checking),
+    () => autoUpdater.off("update-available", available),
+    () => autoUpdater.off("update-not-available", unavailable),
+    () => autoUpdater.off("download-progress", progress),
+    () => autoUpdater.off("update-downloaded", downloaded),
+    () => autoUpdater.off("error", error),
+  );
 }
 
 /** Compute next interval with exponential backoff capped at MAX_UPDATE_CHECK_INTERVAL_MS */
@@ -518,25 +625,25 @@ function rescheduleCheckLoop(): void {
   );
   checkIntervalId = setInterval(() => {
     log.info("[auto-updater] Running periodic update check...");
-    void runSharedCheckForUpdates();
+    if (lifecycle !== null) void runSharedCheckForUpdates(lifecycle).catch(() => undefined);
   }, nextInterval);
   checkIntervalId.unref();
 }
 
 /** Start initial delayed check and periodic update check loop */
-function startUpdateCheckLoop(): void {
+function startUpdateCheckLoop(owner: UpdaterLifecycle): void {
   // Initial check after 3-second delay (avoid startup slowdown) — not subject to backoff
   initialCheckTimerId = setTimeout(() => {
     initialCheckTimerId = null;
     log.info("[auto-updater] Running initial update check...");
-    void runSharedCheckForUpdates();
+    if (isCurrent(owner)) void runSharedCheckForUpdates(owner).catch(() => undefined);
   }, INITIAL_UPDATE_CHECK_DELAY_MS);
   initialCheckTimerId.unref();
 
   // Periodic check (base 4 hours, exponential backoff on failures up to 24 hours)
   checkIntervalId = setInterval(() => {
     log.info("[auto-updater] Running periodic update check...");
-    void runSharedCheckForUpdates();
+    if (isCurrent(owner)) void runSharedCheckForUpdates(owner).catch(() => undefined);
   }, PERIODIC_UPDATE_CHECK_INTERVAL_MS);
   checkIntervalId.unref();
 }
@@ -562,6 +669,14 @@ export function initAutoUpdater(): void {
   if (!app.isPackaged) {
     return;
   }
+  if (retiringLifecycle !== null) {
+    restartRequested = true;
+    return;
+  }
+  const owner = lifecycle ?? createLifecycle();
+  if (owner.started) return;
+  lifecycle = owner;
+  owner.started = true;
 
   autoUpdater.logger = log;
   // Keep background auto-download off. User-initiated flow calls downloadUpdate() explicitly.
@@ -581,26 +696,29 @@ export function initAutoUpdater(): void {
       owner: identity.owner,
       repo: identity.repo,
     });
-    log.info(
-      `[auto-updater] GitHub feed configured: ${identity.owner}/${identity.repo}`,
-    );
+    log.info(`[auto-updater] GitHub feed configured: ${identity.owner}/${identity.repo}`);
   } else {
     log.warn(
       "[auto-updater] Could not parse GitHub owner/repo from package repository; using packaged app-update.yml",
     );
   }
 
-  registerUpdateEventHandlers();
-  startUpdateCheckLoop();
+  registerUpdateEventHandlers(owner);
+  startUpdateCheckLoop(owner);
 
   log.info("[auto-updater] Auto-updater initialized (packaged build, hybrid install)");
 }
 
 /**
  * Stop the auto-updater.
- * Clears the periodic check interval and removes all event listeners.
+ * Clears owned timers and retires in-flight transport before removing owned listeners.
  */
 export function stopAutoUpdater(): void {
+  const owner = lifecycle;
+  restartRequested = false;
+  if (owner === null || owner.retired) return;
+  owner.retired = true;
+  lifecycle = null;
   if (initialCheckTimerId !== null) {
     clearTimeout(initialCheckTimerId);
     initialCheckTimerId = null;
@@ -609,10 +727,15 @@ export function stopAutoUpdater(): void {
     clearInterval(checkIntervalId);
     checkIntervalId = null;
   }
-  autoUpdater.removeAllListeners();
+  if (owner.pending.size > 0) {
+    retiringLifecycle = owner;
+  } else {
+    removeOwnedHandlers(owner);
+  }
   lastAvailableVersion = null;
   clearUserInitiated();
   consecutiveFailures = 0;
+  lastCheckErrorCategory = "unknown";
   // Clear shared in-flight seam so a later check is not stuck on a dead promise.
   inFlightCheck = null;
   log.info("[auto-updater] Stopped");
@@ -625,9 +748,11 @@ export function stopAutoUpdater(): void {
  * Joins any in-flight background check (upgrading user intent) rather than starting a second.
  */
 export function checkForUpdatesNow(): void {
+  const owner = lifecycle;
+  if (owner === null || owner.retired || retiringLifecycle !== null) return;
   if (!app.isPackaged) {
     log.info("[auto-updater] checkForUpdatesNow skipped (not packaged)");
-    showUpdatesUnavailableDialog();
+    showUpdatesUnavailableDialog(owner);
     return;
   }
   log.info("[auto-updater] Manual update check requested (hybrid path)");
@@ -638,7 +763,8 @@ export function checkForUpdatesNow(): void {
   notifyUserStatus("Checking for updates…");
   void (async () => {
     try {
-      const result = await runSharedCheckForUpdates();
+      const result = await runSharedCheckForUpdates(owner);
+      if (!isCurrent(owner)) return;
       // Event handlers already delivered feedback (dialog, download, or browser).
       if (!stillNeedsUserFeedback()) {
         return;
@@ -651,17 +777,18 @@ export function checkForUpdatesNow(): void {
           status: "available",
           info: toUpdateMeta(result.updateInfo),
         });
-        startUserInitiatedDownload(result.updateInfo.version);
+        startUserInitiatedDownload(result.updateInfo.version, owner);
       } else {
         clearUserInitiated();
-        showUpToDateDialog(app.getVersion());
+        showUpToDateDialog(app.getVersion(), owner);
       }
     } catch (err: unknown) {
+      if (!isCurrent(owner)) return;
       log.warn("[auto-updater] Manual update check failed:", err);
       if (err instanceof Error) {
         lastCheckErrorCategory = categorizeUpdaterError(err);
       }
-      finishUserInitiatedFailure();
+      finishUserInitiatedFailure(owner);
     }
   })();
 }
@@ -675,9 +802,11 @@ export async function checkForUpdatesForIpc(): Promise<{
   version: string;
   releaseDate: string;
 } | null> {
+  const owner = lifecycle;
+  if (owner === null || owner.retired || retiringLifecycle !== null) return null;
   if (!app.isPackaged) {
     log.info("[auto-updater] checkForUpdatesForIpc skipped (not packaged)");
-    showUpdatesUnavailableDialog();
+    showUpdatesUnavailableDialog(owner);
     return null;
   }
   userInitiatedCheck = true;
@@ -685,15 +814,16 @@ export async function checkForUpdatesForIpc(): Promise<{
   downloadNotifySent = false;
   notifyUserStatus("Checking for updates…");
   try {
-    const result = await runSharedCheckForUpdates();
+    const result = await runSharedCheckForUpdates(owner);
+    if (!isCurrent(owner)) return null;
     if (stillNeedsUserFeedback()) {
       if (result?.updateInfo) {
         lastAvailableVersion = result.updateInfo.version;
         markUserFeedbackDelivered();
-        startUserInitiatedDownload(result.updateInfo.version);
+        startUserInitiatedDownload(result.updateInfo.version, owner);
       } else {
         clearUserInitiated();
-        showUpToDateDialog(app.getVersion());
+        showUpToDateDialog(app.getVersion(), owner);
       }
     }
     if (result?.updateInfo) {
@@ -705,11 +835,12 @@ export async function checkForUpdatesForIpc(): Promise<{
     }
     return null;
   } catch (err) {
+    if (!isCurrent(owner)) return null;
     log.warn("[auto-updater] Failed to check for updates:", err);
     if (err instanceof Error) {
       lastCheckErrorCategory = categorizeUpdaterError(err);
     }
-    finishUserInitiatedFailure();
+    finishUserInitiatedFailure(owner);
     return null;
   }
 }

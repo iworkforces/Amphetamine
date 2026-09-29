@@ -11,7 +11,7 @@ function createMockWindow(): MockWindow {
 
 // --- Hoisted mocks ---
 const mockOn = vi.hoisted(() => vi.fn());
-const mockRemoveAllListeners = vi.hoisted(() => vi.fn());
+const mockOff = vi.hoisted(() => vi.fn());
 const mockCheckForUpdates = vi.hoisted(() => vi.fn().mockResolvedValue(null));
 const mockDownloadUpdate = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const mockQuitAndInstall = vi.hoisted(() => vi.fn());
@@ -39,11 +39,16 @@ const mockGetPackageInfo = vi.hoisted(() =>
 );
 
 const mockSetFeedURL = vi.hoisted(() => vi.fn());
+const emitterHandlers = new Map<string, Set<(...args: unknown[]) => void>>();
+
+function emitUpdaterEvent(event: string, ...args: unknown[]): void {
+  for (const handler of emitterHandlers.get(event) ?? []) handler(...args);
+}
 
 vi.mock("electron-updater", () => ({
   autoUpdater: {
     on: mockOn,
-    removeAllListeners: mockRemoveAllListeners,
+    off: mockOff,
     checkForUpdates: mockCheckForUpdates,
     downloadUpdate: mockDownloadUpdate,
     quitAndInstall: mockQuitAndInstall,
@@ -96,6 +101,15 @@ describe("auto-updater (hybrid infrastructure)", () => {
     vi.resetModules();
     vi.clearAllMocks();
     vi.useFakeTimers();
+    emitterHandlers.clear();
+    mockOn.mockImplementation((event: string, handler: (...args: unknown[]) => void) => {
+      const handlers = emitterHandlers.get(event) ?? new Set();
+      handlers.add(handler);
+      emitterHandlers.set(event, handlers);
+    });
+    mockOff.mockImplementation((event: string, handler: (...args: unknown[]) => void) => {
+      emitterHandlers.get(event)?.delete(handler);
+    });
 
     mockCheckForUpdates.mockResolvedValue(null);
     mockGetAppPath.mockReturnValue("/path/to/app.asar");
@@ -331,26 +345,11 @@ describe("auto-updater (hybrid infrastructure)", () => {
     });
 
     it("opens release page on error after a known available version (user-initiated)", () => {
+      mockDownloadUpdate.mockImplementationOnce(() => new Promise(() => undefined));
       initAutoUpdater();
       checkForUpdatesNow();
       getHandler("update-available")({ version: "3.0.0", releaseDate: "2025-01-01" });
-      mockShellOpenExternal.mockClear();
-      // simulate download error path via error event while still user-initiated
-      // download already started; fire error before download completes
       getHandler("error")(new Error("ENOTFOUND"));
-
-      // userInitiated may already be cleared by download path - set again
-      checkForUpdatesNow();
-      getHandler("update-available")({ version: "3.0.0", releaseDate: "2025-01-01" });
-      mockDownloadUpdate.mockImplementationOnce(() => {
-        // leave user initiated; error event
-        return new Promise(() => {
-          /* never resolves */
-        });
-      });
-      // re-fire with hanging download
-      getHandler("update-available")({ version: "3.0.0", releaseDate: "2025-01-01" });
-      getHandler("error")(new Error("certificate error"));
 
       expect(mockShellOpenExternal).toHaveBeenCalledWith(
         "https://github.com/iworkforces/Amphetamine/releases/tag/v3.0.0",
@@ -638,11 +637,237 @@ describe("auto-updater (hybrid infrastructure)", () => {
   });
 
   describe("stopAutoUpdater", () => {
-    it("clears timers and removes listeners", () => {
+    it("clears timers and removes only its own listeners once", () => {
+      const unrelated = vi.fn();
+      mockOn("error", unrelated);
       initAutoUpdater();
+      initAutoUpdater();
+      expect(mockOn).toHaveBeenCalledTimes(7);
+      stopAutoUpdater();
       stopAutoUpdater();
 
-      expect(mockRemoveAllListeners).toHaveBeenCalled();
+      expect(mockOff).toHaveBeenCalledTimes(6);
+      for (const [event, handler] of mockOn.mock.calls.slice(1)) {
+        expect(mockOff).toHaveBeenCalledWith(event, handler);
+      }
+      emitUpdaterEvent("error", new Error("unrelated"));
+      expect(unrelated).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(4 * 60 * 60 * 1000);
+      expect(mockCheckForUpdates).not.toHaveBeenCalled();
+    });
+
+    it("retires a deferred IPC check and quarantines old emitter events until it settles", async () => {
+      let resolveOld: ((value: unknown) => void) | undefined;
+      mockCheckForUpdates.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveOld = resolve;
+          }),
+      );
+      initAutoUpdater();
+      const hybrid = await import("../../src/infrastructure/updater/hybrid-auto-updater.js");
+      const pending = hybrid.checkForUpdatesForIpc();
+      const oldAvailable = getHandler("update-available");
+      stopAutoUpdater();
+      initAutoUpdater();
+      expect(mockOn).toHaveBeenCalledTimes(6);
+      emitUpdaterEvent("update-available", { version: "7.0.0", releaseDate: "2026-01-01" });
+      emitUpdaterEvent("error", new Error("stale"));
+      oldAvailable({ version: "7.0.0", releaseDate: "2026-01-01" });
+      expect(mockDownloadUpdate).not.toHaveBeenCalled();
+      resolveOld?.({ updateInfo: { version: "7.0.0", releaseDate: "2026-01-01" } });
+      expect(await pending).toBeNull();
+      await vi.waitFor(() => expect(mockOn).toHaveBeenCalledTimes(12));
+      expect(mockShowUserDialog).not.toHaveBeenCalled();
+      expect(mockShellOpenExternal).not.toHaveBeenCalled();
+      expect(mockDownloadUpdate).not.toHaveBeenCalled();
+      expect(mockOff).toHaveBeenCalledTimes(6);
+      mockCheckForUpdates.mockResolvedValueOnce(null);
+      await hybrid.checkForUpdatesForIpc();
+      expect(mockCheckForUpdates).toHaveBeenCalledTimes(2);
+    });
+
+    it("cancels a queued reinitialization when stopped again", async () => {
+      let resolveOld: ((value: unknown) => void) | undefined;
+      mockCheckForUpdates.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveOld = resolve;
+          }),
+      );
+      initAutoUpdater();
+      const hybrid = await import("../../src/infrastructure/updater/hybrid-auto-updater.js");
+      const pending = hybrid.checkForUpdatesForIpc();
+      stopAutoUpdater();
+      initAutoUpdater();
+      stopAutoUpdater();
+      resolveOld?.(null);
+      expect(await pending).toBeNull();
+      await vi.waitFor(() => expect(mockOff).toHaveBeenCalledTimes(6));
+      expect(mockOn).toHaveBeenCalledTimes(6);
+      initAutoUpdater();
+      expect(mockOn).toHaveBeenCalledTimes(12);
+      stopAutoUpdater();
+    });
+
+    it("joins a background check with tray and IPC intent without downloading twice", async () => {
+      let resolveCheck: ((value: unknown) => void) | undefined;
+      mockCheckForUpdates.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveCheck = resolve;
+          }),
+      );
+      initAutoUpdater();
+      vi.advanceTimersByTime(3000);
+      checkForUpdatesNow();
+      const hybrid = await import("../../src/infrastructure/updater/hybrid-auto-updater.js");
+      const ipc = hybrid.checkForUpdatesForIpc();
+      expect(mockCheckForUpdates).toHaveBeenCalledTimes(1);
+      const info = { version: "2.0.0", releaseDate: "2026-01-01" };
+      emitUpdaterEvent("update-available", info);
+      emitUpdaterEvent("update-available", info);
+      resolveCheck?.({ updateInfo: info });
+      expect(await ipc).toEqual(info);
+      expect(mockDownloadUpdate).toHaveBeenCalledTimes(1);
+      stopAutoUpdater();
+    });
+
+    it("drives the real updater port through join, retirement and reinitialization", async () => {
+      let resolveOld: ((value: unknown) => void) | undefined;
+      mockCheckForUpdates.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveOld = resolve;
+          }),
+      );
+      const { createElectronUpdaterPort } =
+        await import("../../src/infrastructure/updater/electron-updater-port.js");
+      const publish = vi.fn();
+      const notifyUser = vi.fn();
+      const port = createElectronUpdaterPort(
+        { publish },
+        {
+          getRepositoryUrl: () => "https://github.com/iworkforces/Amphetamine",
+          showUserDialog: mockShowUserDialog,
+          notifyUser,
+        },
+      );
+      port.init();
+      vi.advanceTimersByTime(3000);
+      port.checkNow();
+      expect(mockCheckForUpdates).toHaveBeenCalledTimes(1);
+      expect(notifyUser).toHaveBeenCalled();
+      port.stop();
+      port.init();
+      emitUpdaterEvent("update-available", { version: "9.0.0", releaseDate: "2026-01-01" });
+      expect(publish).not.toHaveBeenCalled();
+      resolveOld?.({ updateInfo: { version: "9.0.0", releaseDate: "2026-01-01" } });
+      await vi.waitFor(() => expect(mockOn).toHaveBeenCalledTimes(12));
+      expect(mockDownloadUpdate).not.toHaveBeenCalled();
+      port.checkNow();
+      emitUpdaterEvent("update-not-available", { version: "2.0.5", releaseDate: "2026-01-01" });
+      expect(mockCheckForUpdates).toHaveBeenCalledTimes(2);
+      expect(publish).toHaveBeenCalledWith({
+        type: "auto-updater-status",
+        status: { status: "not-available", info: { version: "2.0.5", releaseDate: "2026-01-01" } },
+      });
+      port.stop();
+    });
+
+    it("reports a background check rejection without an emitter error once", async () => {
+      const window = createMockWindow();
+      mockGetAllWindows.mockReturnValue([window]);
+      mockCheckForUpdates.mockRejectedValueOnce(new Error("offline"));
+      initAutoUpdater();
+      await vi.advanceTimersByTimeAsync(3000);
+      emitUpdaterEvent("error", new Error("offline"));
+      expect(
+        window.webContents.send.mock.calls.filter((call) => call[1]?.status === "error"),
+      ).toHaveLength(1);
+      expect(mockShowUserDialog).not.toHaveBeenCalled();
+      stopAutoUpdater();
+    });
+
+    it("ignores download rejection and install-dialog response after stop", async () => {
+      let rejectDownload: ((error: Error) => void) | undefined;
+      mockDownloadUpdate.mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectDownload = reject;
+          }),
+      );
+      initAutoUpdater();
+      checkForUpdatesNow();
+      getHandler("update-available")({ version: "2.0.0", releaseDate: "2026-01-01" });
+      stopAutoUpdater();
+      initAutoUpdater();
+      expect(mockOn).toHaveBeenCalledTimes(6);
+      rejectDownload?.(new Error("offline"));
+      await vi.waitFor(() => expect(mockOn).toHaveBeenCalledTimes(12));
+      expect(mockShellOpenExternal).not.toHaveBeenCalled();
+
+      let resolveDialog:
+        ((value: { response: number; checkboxChecked: boolean }) => void) | undefined;
+      mockShowUserDialog.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveDialog = resolve;
+          }),
+      );
+      checkForUpdatesNow();
+      getHandler("update-available")({ version: "3.0.0", releaseDate: "2026-01-01" });
+      getHandler("update-downloaded")({ version: "3.0.0", releaseDate: "2026-01-01" });
+      stopAutoUpdater();
+      resolveDialog?.({ response: 1, checkboxChecked: false });
+      await Promise.resolve();
+      expect(mockQuitAndInstall).not.toHaveBeenCalled();
+    });
+
+    it("handles a timer rejection once when the emitter reports the same failure", async () => {
+      let rejectCheck: ((error: Error) => void) | undefined;
+      mockCheckForUpdates.mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectCheck = reject;
+          }),
+      );
+      const window = createMockWindow();
+      mockGetAllWindows.mockReturnValue([window]);
+      initAutoUpdater();
+      vi.advanceTimersByTime(3000);
+      getHandler("error")(new Error("offline"));
+      rejectCheck?.(new Error("offline"));
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(
+        window.webContents.send.mock.calls.filter((call) => call[1]?.status === "error"),
+      ).toHaveLength(1);
+      expect(mockShowUserDialog).not.toHaveBeenCalled();
+      stopAutoUpdater();
+    });
+
+    it("reports and backs off once when the check emits an error before returning a rejection", async () => {
+      mockCheckForUpdates.mockImplementationOnce(() => {
+        emitUpdaterEvent("error", new Error("offline"));
+        return Promise.reject(new Error("offline"));
+      });
+      const window = createMockWindow();
+      mockGetAllWindows.mockReturnValue([window]);
+      const intervals = vi.spyOn(globalThis, "setInterval");
+      initAutoUpdater();
+
+      await vi.advanceTimersByTimeAsync(3000);
+
+      expect(
+        window.webContents.send.mock.calls.filter((call) => call[1]?.status === "error"),
+      ).toHaveLength(1);
+      expect(intervals).toHaveBeenCalledTimes(2);
+      expect(intervals).toHaveBeenNthCalledWith(1, expect.any(Function), 4 * 60 * 60 * 1000);
+      expect(intervals).toHaveBeenNthCalledWith(2, expect.any(Function), 8 * 60 * 60 * 1000);
+      expect(mockShowUserDialog).not.toHaveBeenCalled();
+      stopAutoUpdater();
+      intervals.mockRestore();
     });
   });
 
