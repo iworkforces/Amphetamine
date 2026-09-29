@@ -1,7 +1,7 @@
 # Amphetamine
 
-**Generated:** 2026-09-05
-**Commit:** 588e9bf
+**Generated:** 2026-09-29
+**Commit:** a8bb7ba
 **Branch:** develop
 
 Tray-only Electron app for **macOS and Windows**. Prevents system sleep through user intent or timed sessions. Battery-aware auto-disable, global shortcut, settings window, auto-updater, and benchmark harness.
@@ -12,7 +12,7 @@ Tray-only Electron app for **macOS and Windows**. Prevents system sleep through 
 |------|------|
 | Runtime | Bun 1.4.2+ / Node `>=26 <27` |
 | TypeScript | Dual: native **7.x** (`@typescript/native` owns workspace `tsc`) for typecheck; **6.x** (`typescript@6`) for the JS API / ESLint until 7.1 programmatic API lands |
-| Electron | `^44.2.0` (package pin; do not downgrade below patched 44.x) |
+| Electron | `^44.4.5` (package pin; do not downgrade below patched 44.x) |
 | Build | Rslib main/preload to CJS + Rsbuild renderer (popover + settings + about + utility-dialog) |
 | Test | Vitest 5 workspace: domain + application + main (Node) + renderer (jsdom) |
 | Lint | ESLint 10 flat; sticky type-safety rules as errors for `src/` |
@@ -53,6 +53,7 @@ Dependency rule: **domain** and **application** must not import `electron` / `el
 | OS user notifications | `UserNotifierPort` + `os-user-notifier` | Low-battery OS `Notification` (not a renderer push) |
 | Settings persistence | `src/infrastructure/settings/`, façade `src/main/settings.ts` | Atomic write; coalesced one-in-flight + one pending batch |
 | Sleep blocker | `src/infrastructure/sleep/`, façade `src/main/sleep-prevention.ts` | Sole `powerSaveBlocker` owner |
+| Battery sensor | `src/main/platform/battery-sensor.ts` | `BatterySensorPort`; percent still `battery-percent.ts` |
 | Session runtime | `src/application/session/`, façade `src/main/session-timer.ts` | Handle injection only; no module-level session globals |
 | Settings → system side effects | `SettingsReactionService` (application), wired in composition | Single `onChange` subscriber; UpdateSettings is persist-only |
 | Login items | `src/main/auto-launch.ts` (`AutoLaunchPort` view) | Implemented in main (not infrastructure) |
@@ -64,27 +65,26 @@ Dependency rule: **domain** and **application** must not import `electron` / `el
 | Hybrid auto-updater | `src/infrastructure/updater/` (+ main IPC façade) | `showUserDialog` inject; `setFeedURL` from package repo; single-flight checks; needs `latest-mac.yml` / `latest.yml` on release |
 | Utility Dock / dialogs | `src/main/platform/utility-presentation.ts` | Refcounted macOS foreground; prefer `isDarwin` / `isWin32` |
 | Benchmark mode | `src/infrastructure/benchmark/`, `scripts/benchmark-performance.ts` | `idle` \| `active-session`; requires built `lib/` |
-| Test mocking | `tests/AGENTS.md` (+ main/renderer) | Domain/application pure; main mocks Electron |
-| Dev/build/CI | `scripts/`, `build/`, `.github/workflows/` | Parallel prod build; CI must publish mac update feeds |
+| Dev/build/CI | `scripts/`, `build/`, `.github/workflows/` | Parallel prod build; CI must publish mac update feeds; mocks in `tests/AGENTS.md` |
 
 ## Code map
 
-Sentrux DSM: 163 nodes, 325 edges, all below-diagonal (downward layering). LSP unconfigured — refs from import search.
+Sentrux DSM: 173 nodes, 349 edges, all below-diagonal (downward layering). LSP unconfigured — refs from import search.
 
 | Symbol | Type | Location | Refs | Role |
 |--------|------|----------|------|------|
 | `createAppShell` | fn | `src/main/app-shell.ts` | index + tests | Ready/quit topology |
 | `createAppComposition` | fn | `src/main/composition-root.ts` | AppShell | Ports, reactions, updater inject |
 | WindowGraph | module | `src/main/process/window-graph.ts` | 4 façades + tests | Sole `BrowserWindow` factory |
-| `IPC_CHANNELS` | const | `src/shared/types.ts` | ~18 | Public 16-name wire budget |
+| `IPC_CHANNELS` | const | `src/shared/types.ts` | ~23 | Public 16-name wire budget |
 | `AppPushEvent` | union | `src/application/ports/` | application | Semantic push (no channel literals) |
-| `AppSettings` | type | `src/domain/settings/app-settings.ts` | ~11+ via shared | Settings contract |
-| `VALIDATORS` | const | `src/domain/settings-validation/` | store + tests | Disk load + merge |
+| `AppSettings` | type | `src/domain/settings/app-settings.ts` | ~26 via shared | Settings contract |
 | `isEffectivelyActive` | fn | `src/domain/session/effective-active.ts` | tray/sleep/popover | Intent OR session |
 | `createSessionEngine` | fn | `src/application/session/` | session-timer façade | Handle injection |
 | `SettingsReactionService` | factory | `src/application/settings/` | composition only | Sole `onChange` subscriber |
 | `configureHybridAutoUpdater` | fn | `src/infrastructure/updater/` | UpdaterPort | Single-flight + injected dialogs |
 | `presentUtilityDialog` | fn | WindowGraph | composition `showUserDialog` | Aurora alerts |
+| `createBatterySensor` | fn | `src/main/platform/battery-sensor.ts` | composition + monitor | `BatterySensorPort` adapter |
 
 ## Log tags (production)
 
@@ -138,7 +138,7 @@ bun run clean                  # remove lib/dist outputs
 
 ## Notes
 
-- **Version:** `1.12.1` (tags `v1.12.1`; beta `v1.12.1-beta.N`). Electron pin `^44.2.0`. Runtime deps: `electron-log` + `electron-updater` only.
+- **Version:** `2.0.5` (tags `v2.0.5`; beta `v2.0.5-beta.N`). Electron pin `^44.4.5`. Runtime deps: `electron-log` + `electron-updater` only. CI Node `26.10.0`.
 - Effective sleep = `preventSleep` **OR** session. Tray **icon** = effective; checkbox = intent. Low-battery auto-stop clears both + OS `UserNotifierPort`.
 - Popover chips start a session only (do not write preference). Settings duration select starts **and** writes `defaultSessionDuration`.
 - Utility surfaces share `--utility-window-bg` (`#0D1117` only in `utility-tokens.css`). Fancy aurora bloom on `.icon-aurora` only; `bindIconAuroraStagePause` before any About await. Settings stays `icon-aurora--static`.

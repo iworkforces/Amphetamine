@@ -29,7 +29,7 @@ Electron-free application services. Depends on **domain** and **port interfaces*
 | `SchedulePort` | Delay + cancel | `infrastructure/schedule` |
 | `AutoLaunchPort` | Login-item sync | **`main/auto-launch.ts`** (not infrastructure) |
 | `GlobalShortcutPort` | Register / unregister | `infrastructure/shortcut` |
-| `BatterySensorPort` | Percent + power-source events | **Reserved** — battery monitor still uses main platform shell-outs |
+| `BatterySensorPort` | Percent + power-source events | **`main/platform/battery-sensor.ts`** (`createBatterySensor`; percent via `battery-percent`) |
 | `LoggerPort` | Structured logs | `infrastructure/logging` |
 | `UpdaterPort` | `init` / `stop` / `checkNow` | `infrastructure/updater` |
 

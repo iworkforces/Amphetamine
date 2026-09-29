@@ -5,7 +5,7 @@ Thin main-process helpers that gate OS-specific Electron and shell behavior. Pro
 **Public entry:** import from `platform/index.js` at production call sites.
 
 ```ts
-import { isDarwin, enterTrayOnlyMode, getBatteryPercent } from "./platform/index.js";
+import { isDarwin, enterTrayOnlyMode, getBatteryPercent, createBatterySensor } from "./platform/index.js";
 ```
 
 Implementation files remain importable for focused unit tests (e.g. `battery-percent.test.ts` → `battery-percent.js`).
@@ -20,6 +20,7 @@ Implementation files remain importable for focused unit tests (e.g. `battery-per
 | `utility-presentation.ts` | Refcounted Dock / foreground for Settings, About, and updater dialogs |
 | `window-chrome.ts` | BrowserWindow chrome fragments (popover / settings / about / utility-dialog) + `appIconFileName` |
 | `battery-percent.ts` | Charge percent: pmset (darwin) / PowerShell CIM (win32) |
+| `battery-sensor.ts` | `BatterySensorPort`: percent + `powerMonitor` AC/battery/resume |
 
 Shortcut defaults, reserved keys, and accelerator validation live in domain validators + application shortcut registration; settings UI labels use preload `platform.os`.
 
@@ -41,7 +42,7 @@ Shortcut defaults, reserved keys, and accelerator validation live in domain vali
 | Settings / About Dock + foreground | WindowGraph show/close | `setUtilityDockIcon` + `acquireUtilityForeground` on ready-to-show; `releaseUtilityForeground` on closed |
 | Popover / settings / about / utility-dialog chrome | `process/window-graph.ts` | `*WindowChrome()` / `utilityDialogWindowChrome()` |
 | Login items | `auto-launch.ts` | `buildLoginItemSettings` |
-| Battery % | `battery-monitor.ts` | `getBatteryPercent` |
+| Battery % | `battery-monitor.ts` | `createBatterySensor()` → `getBatteryPercent` + `powerMonitor` |
 | Updater dialog presentation | composition → `presentUtilityDialog` | WindowGraph acquires/releases utility foreground for the dialog lifetime |
 | App / window icons | WindowGraph | `appIconFileName`, `settings-hero-icon.png` |
 

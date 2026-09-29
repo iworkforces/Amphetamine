@@ -37,9 +37,9 @@ Workflow definitions for lint/test/build, production release publishing, and dev
   `GET /repos/{owner}/{repo}/releases/generate-notes` for auto release notes.
 - Release body includes a short production preamble plus the generated "What's Changed" section.
 - It downloads `dist-mac-arm64`, `dist-mac-x64`, `dist-win-x64`, and `dist-win-arm64` artifacts from that CI run.
-- It verifies at least one DMG, ZIP, or EXE before `softprops/action-gh-release` publishes.
+- After download: `bun run scripts/verify-release-matrix.ts source` (feeds, hashes, required binaries per arch). Also fail-closed if no DMG/ZIP/EXE exist.
 - It **merges** multi-arch `latest-mac.yml` / `latest.yml` via `scripts/merge-latest-yml.ts` before attaching release assets (unique basenames on GitHub).
-- Staging: `python3 scripts/stage-release-assets.py` → `artifacts/release-staging/` (feeds from `update-feed/`; binaries from arch dirs; collisions never fail the job).
+- Staging: `python3 scripts/stage-release-assets.py` → `artifacts/release-staging/` (feeds from `update-feed/`; binaries from arch dirs; collisions never fail the job). Then `verify-release-matrix.ts staged`.
 - Publish uses `gh release create|upload --clobber` (not softprops) so existing tags without assets can recover cleanly.
 - Do **not** embed large Python heredocs in `cd.yml` — GitHub can reject the workflow file as invalid YAML.
 - Do **not** put Actions expression markers (dollar-brace-brace) in `run:` script comments; the workflow linter still parses them (`An expression was expected`).
@@ -52,8 +52,8 @@ Workflow definitions for lint/test/build, production release publishing, and dev
 - **Why not `workflow_run`?** GitHub only registers `workflow_run` listeners from workflow files on the **default branch** (`main`). `beta.yml` is develop-oriented and is not required on `main`, so a `workflow_run` listener would never fire.
 - Jobs: `lint` + `test` → **`prepare`** (version + beta N) → `package` / `package-windows` → **`release`**.
 - Packaging: mac arm64/x64 plus Windows x64/arm64 (`package` + `package-windows` matrix).
-- After `electron-builder`, basenames get a **`-beta-{N}`** suffix (e.g. `Amphetamine-1.10.9-arm64-beta-1.dmg`).
-  Tag uses a dot (`v1.10.9-beta.1`); filenames use a hyphen before N (`-beta-1`).
+- After `electron-builder`, basenames get a **`-beta-{N}`** suffix (e.g. `Amphetamine-2.0.5-arm64-beta-1.dmg`).
+  Tag uses a dot (`v2.0.5-beta.1`); filenames use a hyphen before N (`-beta-1`).
 - Artifacts: `dist-mac-beta-{arch}` and `dist-win-beta-{arch}` (`x64` / `arm64`) for 14 days.
 - **`prepare` job** (after lint/test) computes a single N for the run so tags and filenames match.
 - **`release` job** publishes a GitHub **prerelease** (not latest production):
@@ -63,6 +63,7 @@ Workflow definitions for lint/test/build, production release publishing, and dev
   - Body: beta preamble + generated "What's Changed"
   - `prerelease: true`, `make_latest: false` so it does not replace production `vX.Y.Z` releases
   - Attaches `*-beta-{N}.dmg` / `*-beta-{N}.zip` / `*-beta-{N}.exe`
+  - Before publish: `bun run scripts/verify-beta-release-matrix.ts <version> <N>`
 - Production CD still owns non-prerelease tags `vX.Y.Z` from `main`.
 - Concurrency group is `beta-${{ github.ref }}` with `cancel-in-progress: true`.
 - Local equivalent suffix: `./build-macOS-dmg.sh --environment beta --arch arm64`.

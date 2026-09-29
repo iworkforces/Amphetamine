@@ -25,7 +25,7 @@ Implements application ports with Electron/Node. May import domain types and app
 | Port / concern | Where it lives | Why |
 |----------------|----------------|-----|
 | `AutoLaunchPort` | `main/auto-launch.ts` | Login items are a main-process OS façade |
-| `BatterySensorPort` | reserved | Battery monitor uses `main/platform/battery-percent` shell-outs |
+| `BatterySensorPort` | `main/platform/battery-sensor.ts` | `createBatterySensor`; percent still `battery-percent` shell-outs |
 | Tray / BrowserWindow | `main/tray.ts`, `main/process/` | Presentation chrome, not application ports |
 
 ## Settings write coalescing
