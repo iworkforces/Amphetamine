@@ -16,7 +16,7 @@ Workflow definitions for lint/test/build, production release publishing, and dev
 - Concurrency: PR runs cancel outdated checks for the same PR number; push runs use
   `github.sha` and do **not** cancel in-progress work (avoids aborted develop/main
   merges when a second request for the same ref is queued).
-- Node is pinned to `26.3.0`; Bun is pinned to `1.4.2`.
+- Node is pinned to `26.10.0`; Bun is pinned to `1.4.2`.
 - Install uses `bun install --frozen-lockfile`.
 - Lint job includes a source guard: fail if `OCWorkforces` appears under `src/`.
 - Lint job runs: `typecheck`, `typecheck:tests`, `typecheck:sticky`, `typecheck:layers`, then `lint`.
