@@ -4,6 +4,9 @@ import { asPerf, DEFAULT_SETTINGS } from "../../src/shared/types.js";
 import {
   STATUS_PREVENTING_SLEEP,
   STATUS_SLEEP_PREVENTION_OFF,
+  STATUS_UNAVAILABLE,
+  ERROR_SETTINGS_UNAVAILABLE,
+  ERROR_PREFERENCE_SAVE_FAILED,
 } from "../../src/renderer/constants.js";
 
 const mockApi = {
@@ -21,8 +24,8 @@ const mockApi = {
   },
   onSettingsChanged: vi.fn<(_cb: (s: AppSettings) => void) => () => void>(() => vi.fn()),
   onWindowHide: vi.fn<(_cb: () => void) => () => void>(() => vi.fn()),
-  onSessionStatusUpdate: vi.fn<(_cb: (s: SessionStatusResponse) => void) => () => void>(
-    () => vi.fn(),
+  onSessionStatusUpdate: vi.fn<(_cb: (s: SessionStatusResponse) => void) => () => void>(() =>
+    vi.fn(),
   ),
   autoUpdater: {
     checkForUpdates: vi.fn(),
@@ -48,6 +51,14 @@ function getStatusText(): string | null {
 
 function getStatusDot(): HTMLElement | null {
   return document.querySelector("#status-dot");
+}
+
+function getToggle(): HTMLInputElement | null {
+  return document.querySelector<HTMLInputElement>("#prevent-sleep-toggle");
+}
+
+function getErrorText(): string | null {
+  return document.getElementById("status-error")?.textContent ?? null;
 }
 
 function timedSessionStatus(remainingSeconds = 25 * 60): SessionStatusResponse {
@@ -104,6 +115,14 @@ describe("renderer popover (index.ts)", () => {
     vi.clearAllMocks();
     vi.useFakeTimers();
     setupDom();
+    mockApi.settings.get.mockReset();
+    mockApi.settings.set.mockReset();
+    mockApi.session.getStatus.mockReset();
+    mockApi.app.getVersion.mockReset();
+    mockApi.onSettingsChanged.mockReset().mockImplementation(() => vi.fn());
+    mockApi.onSessionStatusUpdate.mockReset().mockImplementation(() => vi.fn());
+    mockApi.onWindowHide.mockReset().mockImplementation(() => vi.fn());
+    mockApi.app.getVersion.mockResolvedValue("1.0.0");
 
     // Default: preventSleep off
     const defaultSettings: AppSettings = {
@@ -119,10 +138,10 @@ describe("renderer popover (index.ts)", () => {
       value: {
         ...globalThis.window,
         api: mockApi,
-         
+
         addEventListener: globalThis.window?.addEventListener?.bind(globalThis.window) ?? vi.fn(),
+        dispatchEvent: globalThis.window?.dispatchEvent?.bind(globalThis.window) ?? vi.fn(),
         removeEventListener:
-         
           globalThis.window?.removeEventListener?.bind(globalThis.window) ?? vi.fn(),
       },
       writable: true,
@@ -131,13 +150,15 @@ describe("renderer popover (index.ts)", () => {
   });
 
   afterEach(() => {
+    window.dispatchEvent(new Event("beforeunload"));
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
   describe("formatTimerLabel via render", () => {
     it('renders "Timer Indefinitely" when preventSleep is false', async () => {
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: false,
         defaultSessionDuration: null,
@@ -156,7 +177,8 @@ describe("renderer popover (index.ts)", () => {
     });
 
     it('renders "Timer Indefinitely" when session not running', async () => {
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: true,
         defaultSessionDuration: null,
@@ -178,7 +200,8 @@ describe("renderer popover (index.ts)", () => {
     });
 
     it('renders "Timer Indefinitely" when running with null durationMinutes', async () => {
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: true,
         defaultSessionDuration: null,
@@ -200,7 +223,8 @@ describe("renderer popover (index.ts)", () => {
     });
 
     it("renders hours and minutes remaining for large durations", async () => {
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: true,
         defaultSessionDuration: 120,
@@ -226,7 +250,8 @@ describe("renderer popover (index.ts)", () => {
     });
 
     it("renders minutes only when less than an hour", async () => {
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: true,
         defaultSessionDuration: 30,
@@ -254,7 +279,8 @@ describe("renderer popover (index.ts)", () => {
 
   describe("status UI", () => {
     it("shows active status dot and text when preventSleep is true", async () => {
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: true,
         defaultSessionDuration: null,
@@ -271,7 +297,8 @@ describe("renderer popover (index.ts)", () => {
     });
 
     it("shows inactive status when preventSleep is false", async () => {
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: false,
         defaultSessionDuration: null,
@@ -291,7 +318,8 @@ describe("renderer popover (index.ts)", () => {
   describe("render", () => {
     it("renders version in header", async () => {
       mockApi.app.getVersion.mockResolvedValue("2.5.0");
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: false,
         defaultSessionDuration: null,
@@ -307,7 +335,8 @@ describe("renderer popover (index.ts)", () => {
     });
 
     it("renders settings and quit buttons", async () => {
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: false,
         defaultSessionDuration: null,
@@ -323,7 +352,8 @@ describe("renderer popover (index.ts)", () => {
     });
 
     it("calls settings.open when settings button clicked", async () => {
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: false,
         defaultSessionDuration: null,
@@ -339,7 +369,8 @@ describe("renderer popover (index.ts)", () => {
     });
 
     it("calls app.quit when quit button clicked", async () => {
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: false,
         defaultSessionDuration: null,
@@ -354,7 +385,7 @@ describe("renderer popover (index.ts)", () => {
       expect(mockApi.app.quit).toHaveBeenCalledOnce();
     });
 
-    it("renders fallback when init throws", async () => {
+    it("keeps the successful version when settings fail", async () => {
       mockApi.settings.get.mockRejectedValue(new Error("IPC error"));
 
       vi.resetModules();
@@ -363,13 +394,365 @@ describe("renderer popover (index.ts)", () => {
       await vi.advanceTimersByTimeAsync(0);
 
       const version = document.querySelector(".app-version");
-      expect(version?.textContent).toBe("v-");
+      expect(version?.textContent).toBe("v1.0.0");
+      expect(getToggle()?.disabled).toBe(true);
+      expect(getStatusText()).toBe(STATUS_UNAVAILABLE);
+    });
+  });
+
+  describe("startup and recovery", () => {
+    it("subscribes before reads settle and enables only the authoritative settings snapshot", async () => {
+      const settingsRead = Promise.withResolvers<AppSettings>();
+      const versionRead = Promise.withResolvers<string>();
+      mockApi.settings.get.mockReturnValueOnce(settingsRead.promise);
+      mockApi.app.getVersion.mockReturnValueOnce(versionRead.promise);
+
+      await bootRenderer();
+
+      expect(mockApi.onSettingsChanged).toHaveBeenCalledOnce();
+      expect(mockApi.onSessionStatusUpdate).toHaveBeenCalledOnce();
+      expect(mockApi.onWindowHide).toHaveBeenCalledOnce();
+      expect(getToggle()?.disabled).toBe(true);
+      expect(getStatusText()).toBe(STATUS_UNAVAILABLE);
+      settingsRead.resolve({ ...DEFAULT_SETTINGS, preventSleep: true });
+      await vi.advanceTimersByTimeAsync(16);
+      expect(getToggle()?.disabled).toBe(false);
+      expect(getToggle()?.checked).toBe(true);
+      expect(getStatusText()).toBe(STATUS_PREVENTING_SLEEP);
+      expect(document.querySelector(".app-version")?.textContent).toBe("v-");
+      versionRead.resolve("2.5.0");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.querySelector(".app-version")?.textContent).toBe("v2.5.0");
+    });
+
+    it("retains loaded settings when version lookup fails", async () => {
+      mockApi.app.getVersion.mockRejectedValueOnce(new Error("version unavailable"));
+      mockApi.settings.get.mockResolvedValueOnce({ ...DEFAULT_SETTINGS, preventSleep: true });
+
+      await bootRenderer();
+      await vi.advanceTimersByTimeAsync(16);
+
+      expect(document.querySelector(".app-version")?.textContent).toBe("v-");
+      expect(getToggle()?.disabled).toBe(false);
+      expect(getToggle()?.checked).toBe(true);
+    });
+
+    it("recovers from a failed settings read via push without replaying a write", async () => {
+      mockApi.settings.get.mockRejectedValueOnce(new Error("settings unavailable"));
+      await bootRenderer();
+      await vi.advanceTimersByTimeAsync(16);
+      expect(getToggle()?.disabled).toBe(true);
+      expect(getErrorText()).toBe(ERROR_SETTINGS_UNAVAILABLE);
+
+      mockApi.onSettingsChanged.mock.calls[0]?.[0]({ ...DEFAULT_SETTINGS, preventSleep: true });
+      await vi.advanceTimersByTimeAsync(16);
+
+      expect(getToggle()?.disabled).toBe(false);
+      expect(getToggle()?.checked).toBe(true);
+      expect(getErrorText()).toBe("");
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+    });
+
+    it("retries unavailable settings on the next show without duplicating subscriptions", async () => {
+      mockApi.settings.get
+        .mockRejectedValueOnce(new Error("settings unavailable"))
+        .mockResolvedValueOnce({ ...DEFAULT_SETTINGS, preventSleep: true });
+      await bootRenderer();
+      mockApi.onWindowHide.mock.calls[0]?.[0]();
+
+      setDocumentVisibility("visible");
+      document.dispatchEvent(new Event("visibilitychange"));
+      await vi.advanceTimersByTimeAsync(16);
+
+      expect(mockApi.settings.get).toHaveBeenCalledTimes(2);
+      expect(mockApi.onSettingsChanged).toHaveBeenCalledOnce();
+      expect(mockApi.onSessionStatusUpdate).toHaveBeenCalledOnce();
+      expect(mockApi.onWindowHide).toHaveBeenCalledOnce();
+      expect(getToggle()?.checked).toBe(true);
+      expect(getToggle()?.disabled).toBe(false);
+    });
+
+    it("does not replace a newer settings push with a stale initial read", async () => {
+      const settingsRead = Promise.withResolvers<AppSettings>();
+      mockApi.settings.get.mockReturnValueOnce(settingsRead.promise);
+      await bootRenderer();
+
+      mockApi.onSettingsChanged.mock.calls[0]?.[0]({ ...DEFAULT_SETTINGS, preventSleep: true });
+      settingsRead.resolve({ ...DEFAULT_SETTINGS, preventSleep: false });
+      await vi.advanceTimersByTimeAsync(16);
+
+      expect(getToggle()?.checked).toBe(true);
+      expect(getStatusText()).toBe(STATUS_PREVENTING_SLEEP);
+    });
+
+    it("recovers a failed session read with a timed-session push and keeps its ticker visible-only", async () => {
+      mockApi.session.getStatus.mockRejectedValueOnce(new Error("session unavailable"));
+      const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+      await bootRenderer();
+      expect(setIntervalSpy).not.toHaveBeenCalled();
+
+      mockApi.onSessionStatusUpdate.mock.calls[0]?.[0](timedSessionStatus());
+      await vi.advanceTimersByTimeAsync(16);
+      expect(getStatusText()).toBe(STATUS_PREVENTING_SLEEP);
+      expect(getTimerText()).toContain("25m remaining");
+      expect(setIntervalSpy).toHaveBeenCalledOnce();
+      mockApi.onWindowHide.mock.calls[0]?.[0]();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("does not replace a newer session push with a stale initial status response", async () => {
+      const sessionRead = Promise.withResolvers<SessionStatusResponse | null>();
+      mockApi.session.getStatus.mockReturnValueOnce(sessionRead.promise);
+      await bootRenderer();
+
+      mockApi.onSessionStatusUpdate.mock.calls[0]?.[0](timedSessionStatus());
+      sessionRead.resolve(null);
+      await vi.advanceTimersByTimeAsync(16);
+
+      expect(getTimerText()).toContain("25m remaining");
+      expect(document.getElementById("cancel-session-action")).not.toBeNull();
+    });
+
+    it("retries a failed session read on the next show without duplicating its subscription", async () => {
+      mockApi.session.getStatus
+        .mockRejectedValueOnce(new Error("session unavailable"))
+        .mockResolvedValueOnce(timedSessionStatus());
+      await bootRenderer();
+      mockApi.onWindowHide.mock.calls[0]?.[0]();
+
+      setDocumentVisibility("visible");
+      document.dispatchEvent(new Event("visibilitychange"));
+      await vi.advanceTimersByTimeAsync(16);
+
+      expect(mockApi.session.getStatus).toHaveBeenCalledTimes(2);
+      expect(mockApi.onSessionStatusUpdate).toHaveBeenCalledOnce();
+      expect(getTimerText()).toContain("25m remaining");
+      expect(getStatusText()).toBe(STATUS_PREVENTING_SLEEP);
+    });
+  });
+
+  describe("preference writes", () => {
+    it("serializes rapid changes and paints only acknowledged preference values", async () => {
+      const first = Promise.withResolvers<{ settings: AppSettings; rejectedKeys: string[] }>();
+      const second = Promise.withResolvers<{ settings: AppSettings; rejectedKeys: string[] }>();
+      mockApi.settings.get.mockResolvedValueOnce({ ...DEFAULT_SETTINGS, preventSleep: true });
+      mockApi.settings.set.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+      await bootRenderer();
+      const toggle = getToggle();
+      expect(toggle?.checked).toBe(true);
+
+      if (toggle) {
+        toggle.checked = false;
+        toggle.dispatchEvent(new Event("change"));
+        toggle.checked = true;
+        toggle.dispatchEvent(new Event("change"));
+      }
+      await vi.advanceTimersByTimeAsync(16);
+      expect(mockApi.settings.set).toHaveBeenCalledTimes(1);
+      expect(getToggle()?.checked).toBe(true);
+      first.resolve({ settings: { ...DEFAULT_SETTINGS, preventSleep: false }, rejectedKeys: [] });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockApi.settings.set).toHaveBeenNthCalledWith(2, { preventSleep: true });
+      second.resolve({ settings: { ...DEFAULT_SETTINGS, preventSleep: true }, rejectedKeys: [] });
+      await vi.advanceTimersByTimeAsync(16);
+      expect(getToggle()?.checked).toBe(true);
+      expect(getStatusText()).toBe(STATUS_PREVENTING_SLEEP);
+    });
+
+    it("does not let an older write acknowledgement erase a newer settings push", async () => {
+      const write = Promise.withResolvers<{ settings: AppSettings; rejectedKeys: string[] }>();
+      mockApi.settings.set.mockReturnValueOnce(write.promise);
+      await bootRenderer();
+      const toggle = getToggle();
+      if (toggle) {
+        toggle.checked = true;
+        toggle.dispatchEvent(new Event("change"));
+      }
+      mockApi.onSettingsChanged.mock.calls[0]?.[0]({ ...DEFAULT_SETTINGS, preventSleep: true });
+
+      write.resolve({ settings: { ...DEFAULT_SETTINGS, preventSleep: false }, rejectedKeys: [] });
+      await vi.advanceTimersByTimeAsync(16);
+
+      expect(getToggle()?.checked).toBe(true);
+      expect(getStatusText()).toBe(STATUS_PREVENTING_SLEEP);
+    });
+
+    it("reconciles a rejected promise by reading main state without replaying the write", async () => {
+      mockApi.settings.set.mockRejectedValueOnce(new Error("disk error"));
+      mockApi.settings.get
+        .mockResolvedValueOnce({ ...DEFAULT_SETTINGS, preventSleep: false })
+        .mockResolvedValueOnce({ ...DEFAULT_SETTINGS, preventSleep: false });
+      await bootRenderer();
+      const toggle = getToggle();
+      if (toggle) {
+        toggle.checked = true;
+        toggle.dispatchEvent(new Event("change"));
+      }
+      await vi.advanceTimersByTimeAsync(16);
+
+      expect(getToggle()?.checked).toBe(false);
+      expect(getStatusText()).toBe(STATUS_SLEEP_PREVENTION_OFF);
+      expect(getErrorText()).toBe(ERROR_PREFERENCE_SAVE_FAILED);
+      expect(mockApi.settings.get).toHaveBeenCalledTimes(2);
+      expect(mockApi.settings.set).toHaveBeenCalledOnce();
+    });
+
+    it("shows rejection and uses returned settings when preventSleep is in rejectedKeys", async () => {
+      mockApi.settings.set.mockResolvedValueOnce({
+        settings: { ...DEFAULT_SETTINGS, preventSleep: false },
+        rejectedKeys: ["preventSleep"],
+      });
+      await bootRenderer();
+      const toggle = getToggle();
+      if (toggle) {
+        toggle.checked = true;
+        toggle.dispatchEvent(new Event("change"));
+      }
+      await vi.advanceTimersByTimeAsync(16);
+
+      expect(getToggle()?.checked).toBe(false);
+      expect(getErrorText()).toBe(ERROR_PREFERENCE_SAVE_FAILED);
+      expect(mockApi.settings.set).toHaveBeenCalledOnce();
+    });
+
+    it("does not replay a queued preference when its first write was rejected", async () => {
+      const write = Promise.withResolvers<{ settings: AppSettings; rejectedKeys: string[] }>();
+      mockApi.settings.get.mockResolvedValueOnce({ ...DEFAULT_SETTINGS, preventSleep: true });
+      mockApi.settings.set.mockReturnValueOnce(write.promise);
+      await bootRenderer();
+      const toggle = getToggle();
+      if (toggle) {
+        toggle.checked = false;
+        toggle.dispatchEvent(new Event("change"));
+        toggle.checked = false;
+        toggle.dispatchEvent(new Event("change"));
+      }
+
+      write.resolve({
+        settings: { ...DEFAULT_SETTINGS, preventSleep: true },
+        rejectedKeys: ["preventSleep"],
+      });
+      await vi.advanceTimersByTimeAsync(16);
+
+      expect(mockApi.settings.set).toHaveBeenCalledOnce();
+      expect(getToggle()?.checked).toBe(true);
+      expect(getErrorText()).toBe(ERROR_PREFERENCE_SAVE_FAILED);
+    });
+
+    it("reconciles a failed write even while an invalidated startup read is pending", async () => {
+      const startupRead = Promise.withResolvers<AppSettings>();
+      mockApi.settings.get
+        .mockReturnValueOnce(startupRead.promise)
+        .mockResolvedValueOnce({ ...DEFAULT_SETTINGS, preventSleep: true });
+      mockApi.settings.set.mockRejectedValueOnce(new Error("write failed"));
+      await bootRenderer();
+      mockApi.onSettingsChanged.mock.calls[0]?.[0]({ ...DEFAULT_SETTINGS, preventSleep: false });
+      await vi.advanceTimersByTimeAsync(16);
+      const toggle = getToggle();
+      if (toggle) {
+        toggle.checked = true;
+        toggle.dispatchEvent(new Event("change"));
+      }
+      await vi.advanceTimersByTimeAsync(16);
+
+      expect(mockApi.settings.get).toHaveBeenCalledTimes(2);
+      startupRead.resolve({ ...DEFAULT_SETTINGS, preventSleep: false });
+      await vi.advanceTimersByTimeAsync(16);
+      expect(getToggle()?.checked).toBe(true);
+      expect(getErrorText()).toBe(ERROR_PREFERENCE_SAVE_FAILED);
+    });
+
+    it("disables the toggle if reconciliation after a rejected write also fails", async () => {
+      mockApi.settings.set.mockRejectedValueOnce(new Error("write failed"));
+      mockApi.settings.get
+        .mockResolvedValueOnce({ ...DEFAULT_SETTINGS, preventSleep: false })
+        .mockRejectedValueOnce(new Error("read failed"));
+      await bootRenderer();
+      const toggle = getToggle();
+      if (toggle) {
+        toggle.checked = true;
+        toggle.dispatchEvent(new Event("change"));
+      }
+      await vi.advanceTimersByTimeAsync(16);
+
+      expect(getToggle()?.disabled).toBe(true);
+      expect(getStatusText()).toBe(STATUS_UNAVAILABLE);
+      expect(getErrorText()).toBe(ERROR_PREFERENCE_SAVE_FAILED);
+    });
+  });
+
+  describe("unload", () => {
+    it("unsubscribes, cancels countdown and RAF, and ignores late reads and pushes", async () => {
+      const settingsRead = Promise.withResolvers<AppSettings>();
+      const versionRead = Promise.withResolvers<string>();
+      mockApi.settings.get.mockReturnValueOnce(settingsRead.promise);
+      mockApi.app.getVersion.mockReturnValueOnce(versionRead.promise);
+      const unsubscribeSettings = vi.fn();
+      const unsubscribeSession = vi.fn();
+      const unsubscribeHide = vi.fn();
+      mockApi.onSettingsChanged.mockReturnValueOnce(unsubscribeSettings);
+      mockApi.onSessionStatusUpdate.mockReturnValueOnce(unsubscribeSession);
+      mockApi.onWindowHide.mockReturnValueOnce(unsubscribeHide);
+      const cancelRaf = vi.spyOn(globalThis, "cancelAnimationFrame");
+      await bootRenderer();
+      const statusPush = mockApi.onSessionStatusUpdate.mock.calls[0]?.[0];
+      statusPush?.(timedSessionStatus());
+      window.dispatchEvent(new Event("beforeunload"));
+      const appHtml = document.getElementById("app")?.innerHTML;
+
+      settingsRead.resolve({ ...DEFAULT_SETTINGS, preventSleep: true });
+      versionRead.resolve("3.0.0");
+      statusPush?.(timedSessionStatus());
+      await vi.advanceTimersByTimeAsync(32);
+
+      expect(unsubscribeSettings).toHaveBeenCalledOnce();
+      expect(unsubscribeSession).toHaveBeenCalledOnce();
+      expect(unsubscribeHide).toHaveBeenCalledOnce();
+      expect(cancelRaf).toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(document.getElementById("app")?.innerHTML).toBe(appHtml);
+    });
+
+    it("does not paint an acknowledgement that resolves after unload", async () => {
+      const write = Promise.withResolvers<{ settings: AppSettings; rejectedKeys: string[] }>();
+      mockApi.settings.set.mockReturnValueOnce(write.promise);
+      await bootRenderer();
+      const toggle = getToggle();
+      if (toggle) {
+        toggle.checked = true;
+        toggle.dispatchEvent(new Event("change"));
+      }
+      window.dispatchEvent(new Event("beforeunload"));
+      const appHtml = document.getElementById("app")?.innerHTML;
+
+      write.resolve({ settings: { ...DEFAULT_SETTINGS, preventSleep: true }, rejectedKeys: [] });
+      await vi.advanceTimersByTimeAsync(32);
+
+      expect(document.getElementById("app")?.innerHTML).toBe(appHtml);
+      expect(mockApi.settings.set).toHaveBeenCalledOnce();
+    });
+
+    it("does not restart the ticker when a stale session read finishes after unload", async () => {
+      const sessionRead = Promise.withResolvers<SessionStatusResponse | null>();
+      mockApi.session.getStatus.mockReturnValueOnce(sessionRead.promise);
+      const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+      await bootRenderer();
+      mockApi.onSessionStatusUpdate.mock.calls[0]?.[0](timedSessionStatus());
+      expect(setIntervalSpy).toHaveBeenCalledOnce();
+      window.dispatchEvent(new Event("beforeunload"));
+
+      sessionRead.resolve(null);
+      await vi.advanceTimersByTimeAsync(16);
+
+      expect(setIntervalSpy).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
     });
   });
 
   describe("resize", () => {
     it("calls window.api.window.setHeight after render", async () => {
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: false,
         defaultSessionDuration: null,
@@ -385,10 +768,24 @@ describe("renderer popover (index.ts)", () => {
 
       expect(mockApi.window.setHeight).toHaveBeenCalled();
     });
-
   });
 
   describe("countdown ticker", () => {
+    it("keeps a pending settings repaint when a countdown tick lands before its frame", async () => {
+      mockApi.session.getStatus.mockResolvedValue(timedSessionStatus(24 * 60 + 1));
+      await bootRenderer();
+      await vi.advanceTimersByTimeAsync(16);
+
+      setTimeout(() => {
+        mockApi.onSettingsChanged.mock.calls[0]?.[0]({ ...DEFAULT_SETTINGS, preventSleep: true });
+      }, 983);
+      await vi.advanceTimersByTimeAsync(1000);
+
+      expect(getTimerText()).toContain("24m remaining");
+      expect(getToggle()?.checked).toBe(true);
+      expect(getStatusText()).toBe(STATUS_PREVENTING_SLEEP);
+    });
+
     it("does not create a countdown interval on idle init", async () => {
       // Given: no timed session exists when the popover initializes.
       mockApi.session.getStatus.mockResolvedValue(null);
@@ -480,7 +877,8 @@ describe("renderer popover (index.ts)", () => {
     });
 
     it("updates status when settings push arrives (preventSleep on)", async () => {
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: false,
         defaultSessionDuration: null,
@@ -510,7 +908,8 @@ describe("renderer popover (index.ts)", () => {
     });
 
     it("updates timer when session status push arrives", async () => {
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: true,
         defaultSessionDuration: 30,
@@ -546,7 +945,8 @@ describe("renderer popover (index.ts)", () => {
     });
 
     it("keeps session active when preventSleep is turned off via push while session running", async () => {
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: true,
         defaultSessionDuration: 30,
@@ -584,7 +984,8 @@ describe("renderer popover (index.ts)", () => {
     });
 
     it("shows active status and remaining timer for running timed session even when preventSleep is false", async () => {
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: false,
         defaultSessionDuration: 30,
@@ -610,7 +1011,8 @@ describe("renderer popover (index.ts)", () => {
     });
 
     it("fetches session.getStatus during init even when preventSleep is false", async () => {
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: false,
         defaultSessionDuration: null,
@@ -683,9 +1085,9 @@ describe("renderer popover (index.ts)", () => {
       });
       await vi.advanceTimersByTimeAsync(16);
       expect(document.getElementById("cancel-session-action")).toBeNull();
-      expect(document.querySelectorAll(".session-chip:not(.session-chip--cancel)").length).toBeGreaterThan(
-        0,
-      );
+      expect(
+        document.querySelectorAll(".session-chip:not(.session-chip--cancel)").length,
+      ).toBeGreaterThan(0);
     });
 
     it("chip click invokes session.start exactly once via delegation", async () => {
@@ -699,9 +1101,7 @@ describe("renderer popover (index.ts)", () => {
       await bootRenderer();
       await vi.advanceTimersByTimeAsync(16);
 
-      const chip = document.querySelector<HTMLButtonElement>(
-        '.session-chip[data-duration="15"]',
-      );
+      const chip = document.querySelector<HTMLButtonElement>('.session-chip[data-duration="15"]');
       expect(chip).not.toBeNull();
       chip?.click();
       await vi.advanceTimersByTimeAsync(0);
@@ -744,7 +1144,8 @@ describe("renderer popover (index.ts)", () => {
 
   describe("session display", () => {
     it("renders seconds when less than a minute", async () => {
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: true,
         defaultSessionDuration: 15,
@@ -769,7 +1170,8 @@ describe("renderer popover (index.ts)", () => {
     });
 
     it("renders zero remaining as 0m", async () => {
-      mockApi.settings.get.mockResolvedValue({ ...DEFAULT_SETTINGS,
+      mockApi.settings.get.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
         launchAtLogin: false,
         preventSleep: true,
         defaultSessionDuration: 15,

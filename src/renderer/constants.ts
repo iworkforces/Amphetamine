@@ -1,6 +1,9 @@
 /** UI status strings shown in the popover. */
 export const STATUS_PREVENTING_SLEEP = "Preventing Sleep" as const;
 export const STATUS_SLEEP_PREVENTION_OFF = "Sleep Prevention Off" as const;
+export const STATUS_UNAVAILABLE = "Status unavailable" as const;
+export const ERROR_SETTINGS_UNAVAILABLE = "Settings unavailable" as const;
+export const ERROR_PREFERENCE_SAVE_FAILED = "Could not save Prevent Sleep" as const;
 
 /** Primary control labels */
 export const LABEL_PREVENT_SLEEP = "Prevent Sleep" as const;
