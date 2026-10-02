@@ -6,7 +6,9 @@ import {
   UTILITY_DIALOG_GET_PAYLOAD,
   UTILITY_DIALOG_RESPOND,
   UTILITY_DIALOG_SET_HEIGHT,
+  type UtilityDialogApplyMessage,
   type UtilityDialogOptions,
+  type UtilityDialogPayload,
 } from "../../src/shared/utility-dialog.js";
 
 const mockFocus = vi.fn();
@@ -25,12 +27,7 @@ const mockSetWindowOpenHandler =
   vi.fn<(handler: (details: { url: string }) => { action: string }) => void>();
 const mockHarden = vi.fn();
 const mockIpcHandle =
-  vi.fn<
-    (
-      channel: string,
-      handler: (event: { sender: { id: number } }, value?: unknown) => unknown,
-    ) => void
-  >();
+  vi.fn<(channel: string, handler: (event: unknown, ...args: unknown[]) => unknown) => void>();
 const mockIpcRemoveHandler = vi.fn();
 const mockIpcOn = vi.fn<(_channel: string, _listener: (_event: { sender: unknown; senderFrame: { parent: unknown } | null }, _value: unknown) => void) => void>();
 const mockIpcRemoveListener = vi.fn();
@@ -64,7 +61,7 @@ vi.mock("electron", () => ({
     this.setContentSize = vi.fn();
     this.webContents = {
       id: ++mockWebContentsId,
-      mainFrame: { parent: null },
+      mainFrame: { parent: null, detached: false, isDestroyed: vi.fn().mockReturnValue(false) },
       setWindowOpenHandler: mockSetWindowOpenHandler,
       on: vi.fn(),
       once: vi.fn(),
@@ -145,10 +142,76 @@ function createdWindow(windowConstructor: typeof BrowserWindow, index = 0) {
   return result.value;
 }
 
-function invokeUtilityDialog(channel: string, senderId: number, value?: unknown): unknown {
+/** Invoke event from a window's live contents and current main frame. */
+function fromMainFrame(window: BrowserWindow): { sender: unknown; senderFrame: unknown } {
+  return { sender: window.webContents, senderFrame: window.webContents.mainFrame };
+}
+
+function invokeUtilityDialog(channel: string, event: unknown, ...args: unknown[]): unknown {
   const handler = mockIpcHandle.mock.calls.findLast(([registered]) => registered === channel)?.[1];
   expect(handler).toBeTypeOf("function");
-  return handler?.({ sender: { id: senderId } }, value);
+  return handler?.(event, ...args);
+}
+
+function dialogPayload(window: BrowserWindow): UtilityDialogPayload {
+  return invokeUtilityDialog(
+    UTILITY_DIALOG_GET_PAYLOAD,
+    fromMainFrame(window),
+  ) as UtilityDialogPayload;
+}
+
+/** Respond for the active presentation, or for an explicit (possibly stale) id. */
+function respondUtilityDialog(
+  window: BrowserWindow,
+  response: unknown,
+  presentationId: unknown = dialogPayload(window).presentationId,
+): unknown {
+  return invokeUtilityDialog(
+    UTILITY_DIALOG_RESPOND,
+    fromMainFrame(window),
+    presentationId,
+    response,
+  );
+}
+
+function setUtilityDialogHeight(
+  window: BrowserWindow,
+  height: unknown,
+  presentationId: unknown = dialogPayload(window).presentationId,
+): unknown {
+  return invokeUtilityDialog(
+    UTILITY_DIALOG_SET_HEIGHT,
+    fromMainFrame(window),
+    presentationId,
+    height,
+  );
+}
+
+function presented(
+  presentationId: number,
+  options: UtilityDialogOptions = dialogOptions,
+): UtilityDialogApplyMessage {
+  return {
+    kind: "present",
+    payload: {
+      ...options,
+      defaultId: options.defaultId ?? options.buttons.length - 1,
+      cancelId: options.cancelId ?? 0,
+      presentationId,
+    },
+  };
+}
+
+function retired(presentationId: number): UtilityDialogApplyMessage {
+  return { kind: "retire", presentationId };
+}
+
+/** APPLY messages pushed to one window, in order. */
+function applyMessages(window: BrowserWindow): unknown[] {
+  return vi
+    .mocked(window.webContents.send)
+    .mock.calls.filter(([channel]) => channel === UTILITY_DIALOG_APPLY)
+    .map(([, message]) => message as unknown);
 }
 
 function readyUtilityDialog(index = 0): void {
@@ -197,6 +260,11 @@ describe("window-graph", () => {
     mockGetSize.mockReturnValue([420, 300]);
     mockShow.mockImplementation(() => mockIsVisible.mockReturnValue(true));
     mockHide.mockImplementation(() => mockIsVisible.mockReturnValue(false));
+    mockIpcHandle.mockReset();
+    mockLoadURL.mockReset();
+    mockLoadURL.mockResolvedValue(undefined);
+    mockLoadFile.mockReset();
+    mockLoadFile.mockResolvedValue(undefined);
     // Default: do not auto-fire ready-to-show (tests opt in via mockImplementation).
     mockOnce.mockReset();
     mockOn.mockReset();
@@ -650,7 +718,7 @@ describe("window-graph", () => {
       expect(mockHide).toHaveBeenCalledTimes(1);
 
       readyUtilityDialog(2);
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, dialogWindow.webContents.id, 1);
+      respondUtilityDialog(dialogWindow, 1);
       await expect(dialog).resolves.toEqual({ response: 1, checkboxChecked: false });
     } finally {
       Object.defineProperty(app, "isPackaged", { configurable: true, value: false });
@@ -958,14 +1026,13 @@ describe("window-graph", () => {
       mockIsVisible.mockReturnValue(true);
 
       readyUtilityDialog();
-      expect(window.webContents.send).toHaveBeenCalledExactlyOnceWith(UTILITY_DIALOG_APPLY, {
-        ...dialogOptions,
-      });
+      expect(applyMessages(window)).toEqual([presented(1)]);
       expect(mockShow).not.toHaveBeenCalled();
       expect(mockFocus).toHaveBeenCalledTimes(1);
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, window.webContents.id, 1);
+      respondUtilityDialog(window, 1);
       await expect(result).resolves.toEqual({ response: 1, checkboxChecked: false });
       expect(mockHide).toHaveBeenCalledTimes(1);
+      expect(applyMessages(window)).toEqual([presented(1), retired(1)]);
     });
 
     it("dismisses a visible idle shell without resolving a second dialog", async () => {
@@ -974,22 +1041,20 @@ describe("window-graph", () => {
       const first = presentUtilityDialog(dialogOptions);
       const window = createdWindow(BrowserWindow);
       readyUtilityDialog();
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, window.webContents.id, 1);
+      respondUtilityDialog(window, 1);
       await expect(first).resolves.toEqual({ response: 1, checkboxChecked: false });
 
       window.show();
       expect(closeUtilityDialog()).toHaveBeenCalledTimes(1);
       expect(mockHide).toHaveBeenCalledTimes(2);
       expect(mockReleaseUtility).toHaveBeenCalledTimes(1);
-      expect(() => invokeUtilityDialog(UTILITY_DIALOG_GET_PAYLOAD, window.webContents.id)).toThrow(
-        "No active dialog payload",
-      );
+      expect(() => dialogPayload(window)).toThrow("No active dialog payload");
 
       const nextOptions = { ...dialogOptions, title: "Second request" };
       const next = presentUtilityDialog(nextOptions);
       expect(BrowserWindow).toHaveBeenCalledTimes(1);
-      expect(window.webContents.send).toHaveBeenLastCalledWith(UTILITY_DIALOG_APPLY, nextOptions);
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, window.webContents.id, 0);
+      expect(applyMessages(window).at(-1)).toEqual(presented(2, nextOptions));
+      respondUtilityDialog(window, 0);
       await expect(next).resolves.toEqual({ response: 0, checkboxChecked: false });
     });
 
@@ -999,7 +1064,7 @@ describe("window-graph", () => {
       const first = presentUtilityDialog(dialogOptions);
       const oldWindow = createdWindow(BrowserWindow);
       readyUtilityDialog();
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, oldWindow.webContents.id, 1);
+      respondUtilityDialog(oldWindow, 1);
       await expect(first).resolves.toEqual({ response: 1, checkboxChecked: false });
 
       mockIsDestroyed.mockReturnValue(true);
@@ -1008,19 +1073,18 @@ describe("window-graph", () => {
       mockIsDestroyed.mockReturnValue(false);
       const newWindow = createdWindow(BrowserWindow, 1);
       expect(BrowserWindow).toHaveBeenCalledTimes(2);
-      expect(mockIpcHandle).toHaveBeenCalledTimes(3);
-      expect(() =>
-        invokeUtilityDialog(UTILITY_DIALOG_GET_PAYLOAD, oldWindow.webContents.id),
-      ).toThrow("No active dialog payload");
-      expect(invokeUtilityDialog(UTILITY_DIALOG_GET_PAYLOAD, newWindow.webContents.id)).toEqual(
-        nextOptions,
-      );
+      // The destroyed shell's own handlers go before the replacement registers fresh ones.
+      expect(mockIpcRemoveHandler.mock.calls.map(([channel]) => channel)).toEqual([
+        UTILITY_DIALOG_GET_PAYLOAD,
+        UTILITY_DIALOG_RESPOND,
+        UTILITY_DIALOG_SET_HEIGHT,
+      ]);
+      expect(mockIpcHandle).toHaveBeenCalledTimes(6);
+      expect(() => dialogPayload(oldWindow)).toThrow("No active dialog payload");
+      expect(dialogPayload(newWindow)).toEqual({ ...nextOptions, presentationId: 2 });
       readyUtilityDialog(1);
-      expect(newWindow.webContents.send).toHaveBeenCalledExactlyOnceWith(
-        UTILITY_DIALOG_APPLY,
-        nextOptions,
-      );
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, newWindow.webContents.id, 0);
+      expect(applyMessages(newWindow)).toEqual([presented(2, nextOptions)]);
+      respondUtilityDialog(newWindow, 0);
       await expect(next).resolves.toEqual({ response: 0, checkboxChecked: false });
     });
 
@@ -1030,7 +1094,7 @@ describe("window-graph", () => {
       const first = presentUtilityDialog(dialogOptions);
       const window = createdWindow(BrowserWindow);
       readyUtilityDialog();
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, window.webContents.id, 1);
+      respondUtilityDialog(window, 1);
       await expect(first).resolves.toEqual({ response: 1, checkboxChecked: false });
 
       closedUtilityDialog();
@@ -1045,7 +1109,7 @@ describe("window-graph", () => {
       expect(mockIpcHandle).toHaveBeenCalledTimes(6);
       readyUtilityDialog(1);
       const newWindow = createdWindow(BrowserWindow, 1);
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, newWindow.webContents.id, 1);
+      respondUtilityDialog(newWindow, 1);
       await expect(next).resolves.toEqual({ response: 1, checkboxChecked: false });
     });
 
@@ -1079,28 +1143,26 @@ describe("window-graph", () => {
       expect(mockAcquireUtility).toHaveBeenCalledTimes(1);
       expect(mockShow).not.toHaveBeenCalled();
       expect(window.webContents.send).not.toHaveBeenCalled();
-      expect(invokeUtilityDialog(UTILITY_DIALOG_GET_PAYLOAD, window.webContents.id)).toEqual({
-        ...dialogOptions,
-      });
+      expect(dialogPayload(window)).toEqual({ ...dialogOptions, presentationId: 1 });
 
       readyUtilityDialog();
       expect(window.setContentSize).toHaveBeenCalledWith(360, 280, false);
-      expect(window.webContents.send).toHaveBeenCalledExactlyOnceWith(UTILITY_DIALOG_APPLY, {
-        ...dialogOptions,
-      });
+      expect(window.webContents.send).toHaveBeenCalledExactlyOnceWith(
+        UTILITY_DIALOG_APPLY,
+        presented(1),
+      );
       expect(mockShow).toHaveBeenCalledTimes(1);
       expect(mockFocus).toHaveBeenCalledTimes(1);
       expect(app.focus).toHaveBeenCalledWith({ steal: true });
       expect(mockAcquireUtility).toHaveBeenCalledTimes(1);
 
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, window.webContents.id, 1);
+      respondUtilityDialog(window, 1);
       await expect(result).resolves.toEqual({ response: 1, checkboxChecked: false });
       expect(mockHide).toHaveBeenCalledTimes(1);
       expect(mockReleaseUtility).toHaveBeenCalledTimes(1);
       expect(mockDestroy).not.toHaveBeenCalled();
-      expect(() => invokeUtilityDialog(UTILITY_DIALOG_GET_PAYLOAD, window.webContents.id)).toThrow(
-        "No active dialog payload",
-      );
+      expect(applyMessages(window)).toEqual([presented(1), retired(1)]);
+      expect(() => dialogPayload(window)).toThrow("No active dialog payload");
     });
 
     it("joins concurrent requests, then re-applies only the new payload to the warm shell", async () => {
@@ -1114,10 +1176,8 @@ describe("window-graph", () => {
       expect(BrowserWindow).toHaveBeenCalledTimes(1);
       expect(mockAcquireUtility).toHaveBeenCalledTimes(1);
       readyUtilityDialog();
-      expect(window.webContents.send).toHaveBeenCalledExactlyOnceWith(UTILITY_DIALOG_APPLY, {
-        ...dialogOptions,
-      });
-      invokeUtilityDialog(UTILITY_DIALOG_SET_HEIGHT, window.webContents.id, 400);
+      expect(applyMessages(window)).toEqual([presented(1)]);
+      setUtilityDialogHeight(window, 400);
       expect(window.setContentSize).toHaveBeenLastCalledWith(360, 400, false);
 
       const preventDefault = closeUtilityDialog();
@@ -1126,6 +1186,8 @@ describe("window-graph", () => {
       await expect(joined).resolves.toEqual({ response: 0, checkboxChecked: false });
       expect(mockHide).toHaveBeenCalledTimes(1);
       expect(mockReleaseUtility).toHaveBeenCalledTimes(1);
+      // Native Close retires the presentation through APPLY too.
+      expect(applyMessages(window)).toEqual([presented(1), retired(1)]);
 
       const nextOptions = {
         ...dialogOptions,
@@ -1138,19 +1200,16 @@ describe("window-graph", () => {
       expect(mockIpcHandle).toHaveBeenCalledTimes(3);
       expect(mockAcquireUtility).toHaveBeenCalledTimes(2);
       expect(window.setContentSize).toHaveBeenLastCalledWith(360, 280, false);
-      expect(window.webContents.send).toHaveBeenCalledTimes(2);
-      expect(window.webContents.send).toHaveBeenLastCalledWith(UTILITY_DIALOG_APPLY, nextOptions);
-      expect(invokeUtilityDialog(UTILITY_DIALOG_GET_PAYLOAD, window.webContents.id)).toEqual(
-        nextOptions,
-      );
+      expect(applyMessages(window)).toEqual([presented(1), retired(1), presented(2, nextOptions)]);
+      expect(dialogPayload(window)).toEqual({ ...nextOptions, presentationId: 2 });
       expect(mockShow).toHaveBeenCalledTimes(2);
       expect(mockFocus).toHaveBeenCalledTimes(2);
 
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, window.webContents.id, 1);
+      respondUtilityDialog(window, 1);
       await expect(next).resolves.toEqual({ response: 1, checkboxChecked: false });
       expect(mockReleaseUtility).toHaveBeenCalledTimes(2);
       expect(mockDestroy).not.toHaveBeenCalled();
-      expect(window.webContents.send).toHaveBeenCalledTimes(2);
+      expect(applyMessages(window)).toHaveLength(4);
     });
 
     it("does not show a dismissed loading shell on late ready, but can present it later", async () => {
@@ -1164,19 +1223,17 @@ describe("window-graph", () => {
       expect(mockReleaseUtility).toHaveBeenCalledTimes(1);
       readyUtilityDialog();
       expect(mockShow).not.toHaveBeenCalled();
-      expect(window.webContents.send).not.toHaveBeenCalled();
+      expect(applyMessages(window)).toEqual([retired(1)]);
       expect(mockAcquireUtility).toHaveBeenCalledTimes(1);
 
-      const next = presentUtilityDialog({ ...dialogOptions, message: "Try again" });
+      const nextOptions = { ...dialogOptions, message: "Try again" };
+      const next = presentUtilityDialog(nextOptions);
       expect(BrowserWindow).toHaveBeenCalledTimes(1);
       expect(mockLoadURL).toHaveBeenCalledTimes(1);
       expect(mockShow).toHaveBeenCalledTimes(1);
-      expect(window.webContents.send).toHaveBeenCalledExactlyOnceWith(UTILITY_DIALOG_APPLY, {
-        ...dialogOptions,
-        message: "Try again",
-      });
+      expect(applyMessages(window)).toEqual([retired(1), presented(2, nextOptions)]);
       expect(mockAcquireUtility).toHaveBeenCalledTimes(2);
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, window.webContents.id, 1);
+      respondUtilityDialog(window, 1);
       await expect(next).resolves.toEqual({ response: 1, checkboxChecked: false });
     });
 
@@ -1188,17 +1245,15 @@ describe("window-graph", () => {
       closeUtilityDialog();
       await expect(first).resolves.toEqual({ response: 0, checkboxChecked: false });
 
-      const second = presentUtilityDialog({ ...dialogOptions, title: "Reopened before paint" });
+      const reopened = { ...dialogOptions, title: "Reopened before paint" };
+      const second = presentUtilityDialog(reopened);
       expect(BrowserWindow).toHaveBeenCalledTimes(1);
       expect(mockAcquireUtility).toHaveBeenCalledTimes(2);
       expect(mockShow).not.toHaveBeenCalled();
       readyUtilityDialog();
       expect(mockShow).toHaveBeenCalledTimes(1);
-      expect(window.webContents.send).toHaveBeenCalledExactlyOnceWith(UTILITY_DIALOG_APPLY, {
-        ...dialogOptions,
-        title: "Reopened before paint",
-      });
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, window.webContents.id, 1);
+      expect(applyMessages(window)).toEqual([retired(1), presented(2, reopened)]);
+      respondUtilityDialog(window, 1);
       await expect(second).resolves.toEqual({ response: 1, checkboxChecked: false });
     });
 
@@ -1208,30 +1263,27 @@ describe("window-graph", () => {
       const result = presentUtilityDialog(dialogOptions);
       const window = createdWindow(BrowserWindow);
       readyUtilityDialog();
-      const foreignSender = window.webContents.id + 1;
+      const foreign = {
+        sender: { id: window.webContents.id + 1 },
+        senderFrame: { parent: null, detached: false, isDestroyed: () => false },
+      };
 
-      expect(() => invokeUtilityDialog(UTILITY_DIALOG_GET_PAYLOAD, foreignSender)).toThrow(
+      expect(() => invokeUtilityDialog(UTILITY_DIALOG_GET_PAYLOAD, foreign)).toThrow(
         "No active dialog payload",
       );
-      expect(() => invokeUtilityDialog(UTILITY_DIALOG_SET_HEIGHT, foreignSender, 450)).toThrow(
+      expect(() => invokeUtilityDialog(UTILITY_DIALOG_SET_HEIGHT, foreign, 1, 450)).toThrow(
         "Invalid sender",
       );
-      expect(() => invokeUtilityDialog(UTILITY_DIALOG_RESPOND, foreignSender, 1)).toThrow(
+      expect(() => invokeUtilityDialog(UTILITY_DIALOG_RESPOND, foreign, 1, 1)).toThrow(
         "Invalid sender",
       );
       expect(window.setContentSize).toHaveBeenCalledTimes(1);
       expect(mockHide).not.toHaveBeenCalled();
 
       mockIsDestroyed.mockReturnValue(true);
-      expect(() => invokeUtilityDialog(UTILITY_DIALOG_GET_PAYLOAD, window.webContents.id)).toThrow(
-        "No active dialog payload",
-      );
-      expect(() =>
-        invokeUtilityDialog(UTILITY_DIALOG_SET_HEIGHT, window.webContents.id, 450),
-      ).toThrow("Invalid sender");
-      expect(() => invokeUtilityDialog(UTILITY_DIALOG_RESPOND, window.webContents.id, 1)).toThrow(
-        "Invalid sender",
-      );
+      expect(() => dialogPayload(window)).toThrow("No active dialog payload");
+      expect(() => setUtilityDialogHeight(window, 450, 1)).toThrow("Invalid sender");
+      expect(() => respondUtilityDialog(window, 1, 1)).toThrow("Invalid sender");
       mockIsDestroyed.mockReturnValue(false);
 
       for (const [height, expected] of [
@@ -1242,12 +1294,104 @@ describe("window-graph", () => {
         [Number.NaN, 280],
         ["450", 280],
       ] as const) {
-        invokeUtilityDialog(UTILITY_DIALOG_SET_HEIGHT, window.webContents.id, height);
+        setUtilityDialogHeight(window, height);
         expect(window.setContentSize).toHaveBeenLastCalledWith(360, expected, false);
       }
       expect(window.setContentSize).toHaveBeenCalledTimes(7);
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, window.webContents.id, 0);
+      respondUtilityDialog(window, 0);
       await expect(result).resolves.toEqual({ response: 0, checkboxChecked: false });
+    });
+
+    it("authenticates every invoke against the cached contents' current main frame", async () => {
+      const { presentUtilityDialog } = await import("../../src/main/process/window-graph.js");
+      const { BrowserWindow } = await import("electron");
+      const result = presentUtilityDialog(dialogOptions);
+      const window = createdWindow(BrowserWindow);
+      readyUtilityDialog();
+      const contents = window.webContents;
+      const mainFrame = vi.mocked(contents.mainFrame);
+      const liveFrame = () => ({ parent: null, detached: false, isDestroyed: () => false });
+      const expectRejected = (event: unknown): void => {
+        expect(() => invokeUtilityDialog(UTILITY_DIALOG_GET_PAYLOAD, event)).toThrow(
+          "No active dialog payload",
+        );
+        expect(() => invokeUtilityDialog(UTILITY_DIALOG_RESPOND, event, 1, 1)).toThrow(
+          "Invalid sender",
+        );
+        expect(() => invokeUtilityDialog(UTILITY_DIALOG_SET_HEIGHT, event, 1, 450)).toThrow(
+          "Invalid sender",
+        );
+      };
+
+      expectRejected({ sender: contents, senderFrame: { ...liveFrame(), parent: mainFrame } });
+      expectRejected({ sender: contents, senderFrame: null });
+      expectRejected({ sender: contents, senderFrame: liveFrame() });
+      expectRejected({ sender: { ...contents }, senderFrame: mainFrame });
+
+      Object.assign(mainFrame, { detached: true });
+      expectRejected(fromMainFrame(window));
+      Object.assign(mainFrame, { detached: false });
+      mainFrame.isDestroyed.mockReturnValue(true);
+      expectRejected(fromMainFrame(window));
+      mainFrame.isDestroyed.mockReturnValue(false);
+      vi.mocked(contents.isDestroyed).mockReturnValue(true);
+      expectRejected(fromMainFrame(window));
+      vi.mocked(contents.isDestroyed).mockReturnValue(false);
+
+      // After a reload the previous main frame object is no longer current.
+      const staleFrameEvent = fromMainFrame(window);
+      Object.assign(contents, { mainFrame: liveFrame() });
+      expectRejected(staleFrameEvent);
+
+      expect(window.setContentSize).toHaveBeenCalledTimes(1);
+      expect(mockHide).not.toHaveBeenCalled();
+      respondUtilityDialog(window, 1);
+      await expect(result).resolves.toEqual({ response: 1, checkboxChecked: false });
+    });
+
+    it("ignores late responses and heights from a dismissed presentation", async () => {
+      const { presentUtilityDialog } = await import("../../src/main/process/window-graph.js");
+      const { BrowserWindow } = await import("electron");
+      const first = presentUtilityDialog(dialogOptions);
+      const window = createdWindow(BrowserWindow);
+      readyUtilityDialog();
+      respondUtilityDialog(window, 1);
+      await expect(first).resolves.toEqual({ response: 1, checkboxChecked: false });
+
+      const nextOptions = { ...dialogOptions, title: "Download complete" };
+      const next = presentUtilityDialog(nextOptions);
+      let nextSettled = false;
+      void next.then(() => {
+        nextSettled = true;
+      });
+      const sizeCalls = vi.mocked(window.setContentSize).mock.calls.length;
+
+      // Delayed replies from presentation 1 must not dismiss or resize presentation 2.
+      expect(respondUtilityDialog(window, 0, 1)).toBeUndefined();
+      expect(setUtilityDialogHeight(window, 500, 1)).toBeUndefined();
+      expect(respondUtilityDialog(window, 0, "2")).toBeUndefined();
+      expect(respondUtilityDialog(window, 0, null)).toBeUndefined();
+      await Promise.resolve();
+      expect(nextSettled).toBe(false);
+      expect(vi.mocked(window.setContentSize).mock.calls).toHaveLength(sizeCalls);
+      expect(mockHide).toHaveBeenCalledTimes(1);
+      expect(mockReleaseUtility).toHaveBeenCalledTimes(1);
+      expect(dialogPayload(window)).toEqual({ ...nextOptions, presentationId: 2 });
+
+      setUtilityDialogHeight(window, 300);
+      expect(window.setContentSize).toHaveBeenLastCalledWith(360, 300, false);
+      respondUtilityDialog(window, 0);
+      await expect(next).resolves.toEqual({ response: 0, checkboxChecked: false });
+      // Replies after settlement stay inert.
+      expect(respondUtilityDialog(window, 1, 2)).toBeUndefined();
+      expect(mockHide).toHaveBeenCalledTimes(2);
+      expect(mockReleaseUtility).toHaveBeenCalledTimes(2);
+      expect(applyMessages(window)).toEqual([
+        presented(1),
+        retired(1),
+        presented(2, nextOptions),
+        retired(2),
+      ]);
     });
 
     it("normalizes button lists and IDs, and treats invalid replies as cancel", async () => {
@@ -1260,14 +1404,15 @@ describe("window-graph", () => {
         cancelId: -1,
       });
       const window = createdWindow(BrowserWindow);
-      expect(invokeUtilityDialog(UTILITY_DIALOG_GET_PAYLOAD, window.webContents.id)).toEqual({
+      expect(dialogPayload(window)).toEqual({
         ...dialogOptions,
+        presentationId: 1,
         buttons: ["OK"],
         defaultId: 0,
         cancelId: 0,
       });
       readyUtilityDialog();
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, window.webContents.id, 1);
+      respondUtilityDialog(window, 1);
       await expect(empty).resolves.toEqual({ response: 0, checkboxChecked: false });
 
       const oversized = presentUtilityDialog({
@@ -1276,23 +1421,25 @@ describe("window-graph", () => {
         defaultId: 1.5,
         cancelId: 2,
       });
-      expect(invokeUtilityDialog(UTILITY_DIALOG_GET_PAYLOAD, window.webContents.id)).toEqual({
+      expect(dialogPayload(window)).toEqual({
         ...dialogOptions,
+        presentationId: 2,
         buttons: ["Not now", "Later", "Install"],
         defaultId: 2,
         cancelId: 2,
       });
-      expect(window.webContents.send).toHaveBeenCalledTimes(2);
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, window.webContents.id, "1");
+      expect(applyMessages(window)).toHaveLength(3);
+      respondUtilityDialog(window, "1");
       await expect(oversized).resolves.toEqual({ response: 2, checkboxChecked: false });
 
       const nonInteger = presentUtilityDialog({ ...dialogOptions, defaultId: 0, cancelId: 1 });
-      expect(invokeUtilityDialog(UTILITY_DIALOG_GET_PAYLOAD, window.webContents.id)).toEqual({
+      expect(dialogPayload(window)).toEqual({
         ...dialogOptions,
+        presentationId: 3,
         defaultId: 0,
         cancelId: 1,
       });
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, window.webContents.id, 0.5);
+      respondUtilityDialog(window, 0.5);
       await expect(nonInteger).resolves.toEqual({ response: 1, checkboxChecked: false });
       expect(BrowserWindow).toHaveBeenCalledTimes(1);
       expect(mockLoadURL).toHaveBeenCalledTimes(1);
@@ -1361,7 +1508,7 @@ describe("window-graph", () => {
       const result = presentUtilityDialog(dialogOptions);
       const window = createdWindow(BrowserWindow);
       readyUtilityDialog();
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, window.webContents.id, 1);
+      respondUtilityDialog(window, 1);
       await expect(result).resolves.toEqual({ response: 1, checkboxChecked: false });
       const removalError = new Error("payload handler removal failed");
       mockIpcRemoveHandler.mockImplementationOnce(() => {
@@ -1409,13 +1556,27 @@ describe("window-graph", () => {
       });
 
       readyUtilityDialog();
-      expect(window.webContents.send).toHaveBeenCalledExactlyOnceWith(UTILITY_DIALOG_APPLY, {
-        ...dialogOptions,
-      });
+      expect(applyMessages(window)).toEqual([presented(1)]);
       expect(mockShow).toHaveBeenCalledTimes(1);
       expect(mockFocus).toHaveBeenCalledTimes(1);
       expect(closeUtilityDialog()).toHaveBeenCalledTimes(1);
       await expect(result).resolves.toEqual({ response: 0, checkboxChecked: false });
+      expect(mockReleaseUtility).toHaveBeenCalledTimes(1);
+    });
+
+    it("still hides the shell when retiring its presentation cannot be pushed", async () => {
+      const { presentUtilityDialog } = await import("../../src/main/process/window-graph.js");
+      const { BrowserWindow } = await import("electron");
+      const result = presentUtilityDialog(dialogOptions);
+      const window = createdWindow(BrowserWindow);
+      readyUtilityDialog();
+      vi.mocked(window.webContents.send).mockImplementationOnce(() => {
+        throw new Error("Render frame was disposed");
+      });
+
+      respondUtilityDialog(window, 1);
+      await expect(result).resolves.toEqual({ response: 1, checkboxChecked: false });
+      expect(mockHide).toHaveBeenCalledTimes(1);
       expect(mockReleaseUtility).toHaveBeenCalledTimes(1);
     });
 
@@ -1431,6 +1592,7 @@ describe("window-graph", () => {
       expect(mockShow).toHaveBeenCalledTimes(1);
       expect(closeUtilityDialog()).toHaveBeenCalledTimes(1);
       await expect(result).resolves.toEqual({ response: 0, checkboxChecked: false });
+      expect(window.webContents.send).not.toHaveBeenCalled();
     });
 
     it("destroys the hidden cache on cleanup, then registers fresh IPC for a new shell", async () => {
@@ -1440,7 +1602,7 @@ describe("window-graph", () => {
       const first = presentUtilityDialog(dialogOptions);
       const firstWindow = createdWindow(BrowserWindow);
       readyUtilityDialog();
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, firstWindow.webContents.id, 1);
+      respondUtilityDialog(firstWindow, 1);
       await expect(first).resolves.toEqual({ response: 1, checkboxChecked: false });
 
       closeUtilityDialogWindow();
@@ -1450,20 +1612,19 @@ describe("window-graph", () => {
       closeUtilityDialogWindow();
       expect(mockDestroy).toHaveBeenCalledTimes(1);
 
-      const second = presentUtilityDialog({ ...dialogOptions, title: "New shell" });
+      const nextOptions = { ...dialogOptions, title: "New shell" };
+      const second = presentUtilityDialog(nextOptions);
       const nextWindow = createdWindow(BrowserWindow, 1);
       expect(BrowserWindow).toHaveBeenCalledTimes(2);
       expect(mockLoadURL).toHaveBeenCalledTimes(2);
       expect(mockIpcHandle).toHaveBeenCalledTimes(6);
-      expect(() =>
-        invokeUtilityDialog(UTILITY_DIALOG_GET_PAYLOAD, firstWindow.webContents.id),
-      ).toThrow("No active dialog payload");
+      expect(() => dialogPayload(firstWindow)).toThrow("No active dialog payload");
       readyUtilityDialog(1);
-      expect(nextWindow.webContents.send).toHaveBeenCalledExactlyOnceWith(UTILITY_DIALOG_APPLY, {
-        ...dialogOptions,
-        title: "New shell",
-      });
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, nextWindow.webContents.id, 0);
+      expect(nextWindow.webContents.send).toHaveBeenCalledExactlyOnceWith(
+        UTILITY_DIALOG_APPLY,
+        presented(2, nextOptions),
+      );
+      respondUtilityDialog(nextWindow, 0);
       await expect(second).resolves.toEqual({ response: 0, checkboxChecked: false });
     });
 
@@ -1482,7 +1643,7 @@ describe("window-graph", () => {
       readyUtilityDialog(1);
       const window = createdWindow(BrowserWindow, 1);
       expect(mockShow).toHaveBeenCalledTimes(1);
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, window.webContents.id, 0);
+      respondUtilityDialog(window, 0);
       await expect(second).resolves.toEqual({ response: 0, checkboxChecked: false });
       expect(mockReleaseUtility).toHaveBeenCalledTimes(2);
     });
@@ -1506,8 +1667,200 @@ describe("window-graph", () => {
       expect(BrowserWindow).toHaveBeenCalledTimes(2);
       readyUtilityDialog();
       const window = createdWindow(BrowserWindow, 1);
-      invokeUtilityDialog(UTILITY_DIALOG_RESPOND, window.webContents.id, 1);
+      respondUtilityDialog(window, 1);
       await expect(retried).resolves.toEqual({ response: 1, checkboxChecked: false });
+    });
+
+    it("keeps a retired shell's stale handlers from acting for any window", async () => {
+      const { presentUtilityDialog, closeUtilityDialogWindow } =
+        await import("../../src/main/process/window-graph.js");
+      const { BrowserWindow } = await import("electron");
+      const first = presentUtilityDialog(dialogOptions);
+      const oldWindow = createdWindow(BrowserWindow);
+      readyUtilityDialog();
+      const staleHandlers = new Map(mockIpcHandle.mock.calls);
+      closeUtilityDialogWindow();
+      await expect(first).resolves.toEqual({ response: 0, checkboxChecked: false });
+
+      const next = presentUtilityDialog({ ...dialogOptions, title: "Replacement" });
+      const newWindow = createdWindow(BrowserWindow, 1);
+      for (const window of [oldWindow, newWindow]) {
+        const event = fromMainFrame(window);
+        expect(() => staleHandlers.get(UTILITY_DIALOG_GET_PAYLOAD)?.(event)).toThrow(
+          "No active dialog payload",
+        );
+        expect(() => staleHandlers.get(UTILITY_DIALOG_RESPOND)?.(event, 2, 0)).toThrow(
+          "Invalid sender",
+        );
+        expect(() => staleHandlers.get(UTILITY_DIALOG_SET_HEIGHT)?.(event, 2, 400)).toThrow(
+          "Invalid sender",
+        );
+      }
+      expect(newWindow.setContentSize).not.toHaveBeenCalled();
+
+      readyUtilityDialog(1);
+      respondUtilityDialog(newWindow, 1);
+      await expect(next).resolves.toEqual({ response: 1, checkboxChecked: false });
+    });
+
+    it("settles and tears down at quit even when releasing foreground fails", async () => {
+      const { presentUtilityDialog, closeUtilityDialogWindow } =
+        await import("../../src/main/process/window-graph.js");
+      const { BrowserWindow } = await import("electron");
+      const result = presentUtilityDialog({ ...dialogOptions, cancelId: 1 });
+      readyUtilityDialog();
+      const releaseFailure = new Error("Dock unavailable");
+      mockReleaseUtility.mockImplementationOnce(() => {
+        throw releaseFailure;
+      });
+
+      expect(() => closeUtilityDialogWindow()).toThrow(releaseFailure);
+      await expect(result).resolves.toEqual({ response: 1, checkboxChecked: false });
+      expect(mockDestroy).toHaveBeenCalledTimes(1);
+      expect(mockIpcRemoveHandler).toHaveBeenCalledTimes(3);
+      expect(() => closeUtilityDialogWindow()).not.toThrow();
+
+      const next = presentUtilityDialog(dialogOptions);
+      expect(BrowserWindow).toHaveBeenCalledTimes(2);
+      readyUtilityDialog(1);
+      respondUtilityDialog(createdWindow(BrowserWindow, 1), 0);
+      await expect(next).resolves.toEqual({ response: 0, checkboxChecked: false });
+    });
+
+    describe("startup failure recovery", () => {
+      it("settles with the cancel result and discards the shell when its load rejects", async () => {
+        const { presentUtilityDialog } = await import("../../src/main/process/window-graph.js");
+        const { BrowserWindow } = await import("electron");
+        const load = Promise.withResolvers<void>();
+        mockLoadURL.mockReturnValueOnce(load.promise);
+        const failed = presentUtilityDialog({ ...dialogOptions, cancelId: 1 });
+        const failedWindow = createdWindow(BrowserWindow);
+        expect(mockAcquireUtility).toHaveBeenCalledTimes(1);
+
+        load.reject(new Error("ERR_FILE_NOT_FOUND"));
+        await expect(failed).resolves.toEqual({ response: 1, checkboxChecked: false });
+        expect(mockReleaseUtility).toHaveBeenCalledTimes(1);
+        expect(mockDestroy).toHaveBeenCalledTimes(1);
+        expect(mockIpcRemoveHandler.mock.calls.map(([channel]) => channel)).toEqual([
+          UTILITY_DIALOG_GET_PAYLOAD,
+          UTILITY_DIALOG_RESPOND,
+          UTILITY_DIALOG_SET_HEIGHT,
+        ]);
+        expect(failedWindow.webContents.send).not.toHaveBeenCalled();
+
+        const retried = presentUtilityDialog(dialogOptions);
+        const window = createdWindow(BrowserWindow, 1);
+        expect(BrowserWindow).toHaveBeenCalledTimes(2);
+        expect(mockIpcHandle).toHaveBeenCalledTimes(6);
+        expect(mockAcquireUtility).toHaveBeenCalledTimes(2);
+
+        // Late callbacks from the failed shell cannot touch its replacement.
+        readyUtilityDialog(0);
+        closedUtilityDialog(0);
+        expect(closeUtilityDialog(0)).not.toHaveBeenCalled();
+        expect(() => dialogPayload(failedWindow)).toThrow("No active dialog payload");
+        expect(mockShow).not.toHaveBeenCalled();
+        expect(mockReleaseUtility).toHaveBeenCalledTimes(1);
+        expect(mockIpcRemoveHandler).toHaveBeenCalledTimes(3);
+        expect(mockDestroy).toHaveBeenCalledTimes(1);
+
+        readyUtilityDialog(1);
+        expect(mockShow).toHaveBeenCalledTimes(1);
+        expect(applyMessages(window)).toEqual([presented(2)]);
+        respondUtilityDialog(window, 1);
+        await expect(retried).resolves.toEqual({ response: 1, checkboxChecked: false });
+        expect(mockReleaseUtility).toHaveBeenCalledTimes(2);
+      });
+
+      it("discards a dismissed, still-loading shell whose load later rejects", async () => {
+        const { presentUtilityDialog } = await import("../../src/main/process/window-graph.js");
+        const { BrowserWindow } = await import("electron");
+        const load = Promise.withResolvers<void>();
+        mockLoadURL.mockReturnValueOnce(load.promise);
+        const first = presentUtilityDialog(dialogOptions);
+        closeUtilityDialog();
+        await expect(first).resolves.toEqual({ response: 0, checkboxChecked: false });
+        expect(mockReleaseUtility).toHaveBeenCalledTimes(1);
+
+        load.reject(new Error("ERR_CONNECTION_REFUSED"));
+        await vi.waitFor(() => {
+          expect(mockDestroy).toHaveBeenCalledTimes(1);
+        });
+        expect(mockIpcRemoveHandler).toHaveBeenCalledTimes(3);
+        expect(mockReleaseUtility).toHaveBeenCalledTimes(1);
+
+        const next = presentUtilityDialog(dialogOptions);
+        expect(BrowserWindow).toHaveBeenCalledTimes(2);
+        readyUtilityDialog(1);
+        respondUtilityDialog(createdWindow(BrowserWindow, 1), 0);
+        await expect(next).resolves.toEqual({ response: 0, checkboxChecked: false });
+      });
+
+      it("ignores a load rejection for a shell that was already torn down", async () => {
+        const { presentUtilityDialog, closeUtilityDialogWindow } =
+          await import("../../src/main/process/window-graph.js");
+        const { BrowserWindow } = await import("electron");
+        const load = Promise.withResolvers<void>();
+        mockLoadURL.mockReturnValueOnce(load.promise);
+        const first = presentUtilityDialog(dialogOptions);
+        closeUtilityDialogWindow();
+        await expect(first).resolves.toEqual({ response: 0, checkboxChecked: false });
+
+        const next = presentUtilityDialog(dialogOptions);
+        load.reject(new Error("ERR_ABORTED"));
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(BrowserWindow).toHaveBeenCalledTimes(2);
+        expect(mockDestroy).toHaveBeenCalledTimes(1);
+        expect(mockIpcRemoveHandler).toHaveBeenCalledTimes(3);
+        expect(mockReleaseUtility).toHaveBeenCalledTimes(1);
+        readyUtilityDialog(1);
+        respondUtilityDialog(createdWindow(BrowserWindow, 1), 1);
+        await expect(next).resolves.toEqual({ response: 1, checkboxChecked: false });
+      });
+
+      it("rolls back only its own handlers after partial registration, then allows a retry", async () => {
+        const { presentUtilityDialog } = await import("../../src/main/process/window-graph.js");
+        const { BrowserWindow } = await import("electron");
+        const conflict = new Error(
+          "Attempted to register a second handler for 'utility-dialog:respond'",
+        );
+        mockIpcHandle
+          .mockImplementationOnce(() => {})
+          .mockImplementationOnce(() => {
+            throw conflict;
+          });
+
+        await expect(presentUtilityDialog({ ...dialogOptions, cancelId: 1 })).resolves.toEqual({
+          response: 1,
+          checkboxChecked: false,
+        });
+        // Only the handler this shell registered is removed; the conflicting one is not ours.
+        expect(mockIpcRemoveHandler.mock.calls.map(([channel]) => channel)).toEqual([
+          UTILITY_DIALOG_GET_PAYLOAD,
+        ]);
+        expect(mockDestroy).toHaveBeenCalledTimes(1);
+        expect(mockLoadURL).not.toHaveBeenCalled();
+        expect(mockAcquireUtility).not.toHaveBeenCalled();
+        expect(mockReleaseUtility).not.toHaveBeenCalled();
+
+        const retried = presentUtilityDialog(dialogOptions);
+        const window = createdWindow(BrowserWindow, 1);
+        expect(mockIpcHandle.mock.calls.map(([channel]) => channel)).toEqual([
+          UTILITY_DIALOG_GET_PAYLOAD,
+          UTILITY_DIALOG_RESPOND,
+          UTILITY_DIALOG_GET_PAYLOAD,
+          UTILITY_DIALOG_RESPOND,
+          UTILITY_DIALOG_SET_HEIGHT,
+        ]);
+        readyUtilityDialog();
+        expect(applyMessages(window)).toEqual([presented(2)]);
+        respondUtilityDialog(window, 1);
+        await expect(retried).resolves.toEqual({ response: 1, checkboxChecked: false });
+        expect(mockAcquireUtility).toHaveBeenCalledOnce();
+        expect(mockReleaseUtility).toHaveBeenCalledOnce();
+      });
     });
   });
 });

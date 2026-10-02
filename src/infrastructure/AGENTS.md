@@ -11,7 +11,7 @@ Implements application ports with Electron/Node. May import domain types and app
 | `logging/electron-logger.ts` | `LoggerPort` | `electron-log` |
 | `notification/broadcast-notifier.ts` | `MainToRendererNotifierPort` | maps `AppPushEvent` → IPC `PUSH_CHANNELS` |
 | `notification/os-user-notifier.ts` | `UserNotifierPort` | Electron `Notification`; falls back to logger when unsupported |
-| `settings/file-settings-store.ts` | `SettingsStorePort` | atomic JSON; **coalesced** one active write + one pending batch; corrupt backup |
+| `settings/file-settings-store.ts` | `SettingsStorePort` | atomic JSON; **coalesced** one active write + one pending batch; corrupt backup; isolated commits (copied patches, per-recipient snapshots) |
 | `settings/dialog-save-failure.ts` | `SettingsSaveFailurePort` | `dialog.showErrorBox` |
 | `sleep/power-save-blocker.ts` | `SleepBlockerPort` | **sole** `powerSaveBlocker` owner |
 | `shortcut/electron-global-shortcut.ts` | `GlobalShortcutPort` | register / unregisterAll |
@@ -33,6 +33,10 @@ Implements application ports with Electron/Node. May import domain types and app
 - At most **one physical write** in flight and **one pending batch** of callers.
 - Different-field updates merge; each caller keeps its own `rejectedKeys`.
 - Cache + `onChange` only after successful rename; failure preserves cache and rejects batch callers.
+- `update()` copies the patch when it accepts it (later caller mutation cannot reach queued work) and rejects before `init()` without touching disk.
+- Every subscriber and caller receives its **own** snapshot (no-op results included); nothing can alias the cache or another recipient.
+- After the rename lands the batch is committed: subscribers run in registration order, each isolated (sync throws and async rejections logged as `[settings] Change subscriber threw:`), then callers resolve. Subscriber failures never reject callers or count toward the 3-failure feedback threshold.
+- Subscribers may enqueue updates while a batch commits; they join the pending batch and `flush()` drains them. Unsubscribe is idempotent and removes only its own registration.
 - `flush()` must await all queued work (used on quit).
 
 ## Updater

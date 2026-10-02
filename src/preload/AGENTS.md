@@ -41,10 +41,10 @@ Always return unsubscribe. Payload types from `IpcChannelMap` / push responses.
 
 | Method | Channel | Notes |
 |--------|---------|-------|
-| `getPayload()` | `utility-dialog:get-payload` | Invoke; main validates webContents id |
-| `respond(index)` | `utility-dialog:respond` | Invoke; settles dialog promise (main hides warm shell) |
-| `setHeight(px)` | `utility-dialog:set-height` | Invoke; main clamps height then `setContentSize` (renderer awaits before open fade) |
-| `onApply(cb)` | `utility-dialog:apply` | Push listener; warm-cache re-present without reload |
+| `getPayload()` | `utility-dialog:get-payload` | Invoke; active payload incl. `presentationId` (main checks cached webContents + current main frame) |
+| `respond(presentationId, index)` | `utility-dialog:respond` | Invoke; settles that presentation if still active (main hides warm shell); stale ids ignored |
+| `setHeight(presentationId, px)` | `utility-dialog:set-height` | Invoke; main clamps then `setContentSize` only for the active id (renderer awaits before open fade) |
+| `onApply(cb)` | `utility-dialog:apply` | Push listener; `{ kind: "present", payload }` or `{ kind: "retire", presentationId }` |
 | `os` | (sync) | `process.platform` for optional body class |
 
 Channel name literals live in `src/shared/utility-dialog.ts` — **not** in public `IPC_CHANNELS`.

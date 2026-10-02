@@ -9,7 +9,7 @@ Renderer Vitest suites run in jsdom and assert DOM behavior for vanilla TypeScri
 | `index.test.ts` | Popover render, status/timer, controls, pushes, effective-active OR matrix, session-action identity, hide dedupe, benchmark API mock |
 | `settings.test.ts` | Settings form, sections, debounced save, rejectedKeys, sleep mode, shortcut-failure subscription |
 | `about.test.ts` | About metadata fill, copyright/author, Escape close (no in-content OK), icon open, no autofocus on show, fancy aurora leaf fixture + warm-cache `.is-paused` toggle, getAbout failure visibility |
-| `utility-dialog.test.ts` | Payload apply, fancy aurora leaf fixture, warm-cache `.is-paused` toggle |
+| `utility-dialog.test.ts` | Payload apply, fancy aurora leaf fixture, warm-cache `.is-paused` toggle, presentation lifetimes (stale/duplicate/retired payloads, late height/animation, unload disposal, bootstrap decline), warm-reopen initial focus restore |
 | `delegation.test.ts` | Event delegation on `#app` |
 
 Settings warm-cache focus clear and main hide-on-close are covered primarily in `tests/main/window-graph.test.ts` (main process). Utility-dialog presentation (WindowGraph / hybrid-updater) stays covered in main tests; renderer pause/payload smoke lives in `utility-dialog.test.ts`.
@@ -18,7 +18,7 @@ Settings warm-cache focus clear and main hide-on-close are covered primarily in 
 
 - Build DOM explicitly (`#app`).
 - Install `window.api` mock before importing renderer modules (popover / settings / about).
-- Utility-dialog: install `window.utilityDialogApi` (`getPayload`, `respond`, `setHeight`, `onApply`, `os`) — not `window.api`.
+- Utility-dialog: install `window.utilityDialogApi` (`getPayload`, `respond(id, index)`, `setHeight(id, px)`, `onApply` delivering `{ kind: "present" | "retire" }`, `os`) — not `window.api`. Payload fixtures carry `presentationId`. Remove every window listener the entry added after each test (pagehide/keydown).
 - Include `window.api.benchmark.isEnabled()` when importing popover code.
 - Include `window.api.platform.os` when testing settings shortcut labels.
 - Import entry after mocks, then dispatch `DOMContentLoaded` when the entry listens for it.

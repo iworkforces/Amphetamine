@@ -51,9 +51,10 @@ Dependency rule: **domain** and **application** must not import `electron` / `el
 | Process graph / windows | `src/main/app-shell.ts`, `src/main/process/` | AppShell ready/quit (composition before IPC); WindowGraph sole `BrowserWindow` factory; hide-on-close warm cache |
 | Main→renderer push | `MainToRendererNotifierPort` + `broadcast-notifier` | Application publishes `AppPushEvent`; adapter maps to `PUSH_CHANNELS` |
 | OS user notifications | `UserNotifierPort` + `os-user-notifier` | Low-battery OS `Notification` (not a renderer push) |
-| Settings persistence | `src/infrastructure/settings/`, façade `src/main/settings.ts` | Atomic write; coalesced one-in-flight + one pending batch |
+| Settings persistence | `src/infrastructure/settings/`, façade `src/main/settings.ts` | Atomic write; coalesced one-in-flight + one pending batch; patches copied on accept; per-recipient snapshots; subscriber throws never fail a committed save |
 | Sleep blocker | `src/infrastructure/sleep/`, façade `src/main/sleep-prevention.ts` | Sole `powerSaveBlocker` owner |
 | Battery sensor | `src/main/platform/battery-sensor.ts` | `BatterySensorPort`; percent still `battery-percent.ts` |
+| Battery read authority | `src/main/battery-monitor.ts` | Policy epoch revokes in-flight reads; one read at a time + one coalesced follow-up |
 | Session runtime | `src/application/session/`, façade `src/main/session-timer.ts` | Handle injection only; no module-level session globals |
 | Settings → system side effects | `SettingsReactionService` (application), wired in composition | Single `onChange` subscriber; UpdateSettings is persist-only |
 | Login items | `src/main/auto-launch.ts` (`AutoLaunchPort` view) | Implemented in main (not infrastructure) |
@@ -61,7 +62,7 @@ Dependency rule: **domain** and **application** must not import `electron` / `el
 | Renderer popover | `src/renderer/index.ts` | Domain `isEffectivelyActive`; mode-stable session actions; chips start session only |
 | Settings UI | `src/renderer/settings/AGENTS.md` | System Settings groups; debounced saves; shortcut recorder; warm-cache focus clear |
 | About window | `src/renderer/about/`, WindowGraph `showAbout` | Built `about.html`; dismiss Close/Escape (no OK); github allowlist |
-| Utility dialog | `src/renderer/utility-dialog/`, WindowGraph `presentUtilityDialog` | Dedicated preload; single-flight; height settle before fade-in |
+| Utility dialog | `src/renderer/utility-dialog/`, WindowGraph `presentUtilityDialog` | Dedicated preload; single-flight; height settle before fade-in; main-owned `presentationId` + main-frame auth; APPLY present/retire |
 | Hybrid auto-updater | `src/infrastructure/updater/` (+ main IPC façade) | `showUserDialog` inject; `setFeedURL` from package repo; single-flight checks; needs `latest-mac.yml` / `latest.yml` on release |
 | Utility Dock / dialogs | `src/main/platform/utility-presentation.ts` | Refcounted macOS foreground; prefer `isDarwin` / `isWin32` |
 | Benchmark mode | `src/infrastructure/benchmark/`, `scripts/benchmark-performance.ts` | `idle` \| `active-session`; requires built `lib/` |
@@ -99,7 +100,7 @@ Sentrux DSM: 173 nodes, 349 edges, all below-diagonal (downward layering). LSP u
 - Session **preference** is `defaultSessionDuration`; live session state is engine handle + `SESSION_STATUS*` pushes only.
 - `PerfTimestamp` values come from `asPerf(n)`. Do not raw-cast timestamps.
 - `SessionStatusResponse`, `SessionStartResponse`, updater status, and benchmark guards are discriminated/runtime-checked contracts.
-- Settings init is async; writes use UUID temp file + rename with **coalesced batching** (one active write + one pending merge); quit flushes via `flushSettingsWriteChain()`.
+- Settings init is async; writes use UUID temp file + rename with **coalesced batching** (one active write + one pending merge); quit flushes via `flushSettingsWriteChain()`. `update()` copies each patch on accept and rejects before `init()`; every subscriber/caller gets its own snapshot; subscriber exceptions are logged (`[settings] Change subscriber threw:`) and never count as save failures.
 - Settings→renderer pushes (`settings-changed`) only when a renderer-visible key changes (`preventSleep` \| `batteryThreshold` \| `shortcut`).
 - Popover `#session-actions` rebuilds only on running/idle **mode** change (stable cancel-button identity); hide transitions are coalesced in WindowGraph.
 - UI strings in constants files; styles in CSS. Format: double quotes, semicolons, 2-space, print width 100.
@@ -144,6 +145,6 @@ bun run clean                  # remove lib/dist outputs
 - Utility surfaces share `--utility-window-bg` (`#0D1117` only in `utility-tokens.css`). Fancy aurora bloom on `.icon-aurora` only; `bindIconAuroraStagePause` before any About await. Settings stays `icon-aurora--static`.
 - Settings/About/utility-dialog: **hide-on-close** warm cache; `*WantsVisible`; refcounted Dock via `utility-presentation`. Windows: taskbar + `titleBarOverlay`. About dismisses via system Close / Escape (no in-content OK).
 - Updater: injected `showUserDialog` → `presentUtilityDialog` (not `dialog.showMessageBox`). Info-only hides the OK row. Releases must publish `latest-mac.yml` + `latest.yml`. Repo: `iworkforces/Amphetamine`.
-- Utility-dialog private channels stay out of the public 16-name `IPC_CHANNELS` budget. `hardenWebContents` denies `window.open`; About allowlists the package GitHub repo via `shell.openExternal`.
+- Utility-dialog private channels (4) stay out of the public 16-name `IPC_CHANNELS` budget. Each presentation carries a main-owned increasing `presentationId`; invokes are honoured only from the cached shell's current main frame for the active id; dismissal retires the id via APPLY. `hardenWebContents` denies `window.open`; About allowlists the package GitHub repo via `shell.openExternal`.
 - Login items: darwin `openAsHidden: true`; win32 `openAtLogin` only. Sleep default `prevent-display-sleep`.
 - Develop CI: lint/test. **Beta** on `develop` publishes `vX.Y.Z-beta.N` (`prerelease: true`). Production CD is `workflow_run` on `main` only.

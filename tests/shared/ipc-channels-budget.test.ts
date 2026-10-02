@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { IPC_CHANNELS, PUSH_CHANNELS, type IpcChannelMap } from "../../src/shared/types.js";
 import { SETTINGS_QUIT_DRAIN_ACK, SETTINGS_QUIT_DRAIN_REQUEST } from "../../src/shared/settings-quit.js";
+import * as utilityDialog from "../../src/shared/utility-dialog.js";
 
 describe("IPC channel budget contract", () => {
   it("has exactly 16 named channels", () => {
@@ -30,6 +31,22 @@ describe("IPC channel budget contract", () => {
     for (const channel of [SETTINGS_QUIT_DRAIN_ACK, SETTINGS_QUIT_DRAIN_REQUEST]) {
       expect(publicChannels.has(channel)).toBe(false);
       expect(PUSH_CHANNELS).not.toContain(channel);
+    }
+  });
+
+  it("keeps exactly four private utility-dialog channels outside the public budget", () => {
+    const dialogChannels = Object.entries(utilityDialog)
+      .filter(([name]) => name.startsWith("UTILITY_DIALOG_"))
+      .map(([, channel]) => channel as string);
+    expect(dialogChannels.sort()).toEqual([
+      "utility-dialog:apply",
+      "utility-dialog:get-payload",
+      "utility-dialog:respond",
+      "utility-dialog:set-height",
+    ]);
+    const publicChannels = new Set<string>(Object.values(IPC_CHANNELS));
+    for (const channel of dialogChannels) {
+      expect(publicChannels.has(channel)).toBe(false);
     }
   });
 });

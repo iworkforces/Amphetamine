@@ -1,4 +1,11 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type * as BatteryMonitorModule from "../../src/main/battery-monitor.js";
+import type { BatteryDeps, BatteryMonitorHandle } from "../../src/main/battery-monitor.js";
+import { createFileSettingsStore } from "../../src/infrastructure/settings/file-settings-store.js";
+import { DEFAULT_SETTINGS, type AppSettings } from "../../src/shared/types.js";
 
 // Helper: extracts the first argument of the first call of a hoisted mock with
 // type assertion. vi.hoisted(() => vi.fn(() => ...)) infers an empty-args
@@ -41,7 +48,7 @@ const mockBatterySensor = vi.hoisted(() => ({
 }));
 const mockCreateBatterySensor = vi.hoisted(() => vi.fn(() => mockBatterySensor));
 const mockCreateBatteryMonitor = vi.hoisted(() =>
-  vi.fn(() => ({
+  vi.fn((_deps: unknown): BatteryMonitorHandle => ({
     initBatteryMonitoring: mockBatteryInit,
     cleanupBatteryMonitoring: mockBatteryCleanup,
     onPreventSleepChange: mockBatteryOnPreventSleepChange,
@@ -72,6 +79,8 @@ const mockCreateSettingsWindow = vi.hoisted(() => vi.fn());
 vi.mock("electron", () => ({
   app: { isPackaged: false, focus: vi.fn() },
   BrowserWindow: { getAllWindows: mockGetAllWindows },
+  // Unsupported → the OS notifier logs `[notify] …` through electron-log (observable body).
+  Notification: { isSupported: () => false },
   powerMonitor: {
     on: vi.fn(),
     off: vi.fn(),
@@ -177,6 +186,11 @@ describe("composition wiring", () => {
   let composition: {
     init: () => Promise<void>;
     cleanup: () => void;
+    getIpcDeps: () => {
+      updateSettings: (
+        partial: Partial<AppSettings>,
+      ) => Promise<{ settings: AppSettings; rejectedKeys: string[] }>;
+    };
     getTrayDeps: () => {
       getEffectiveActive: () => boolean;
       onActiveStateChanged: (cb: () => void) => () => void;
@@ -838,6 +852,264 @@ describe("composition wiring", () => {
       });
 
       expect(mockSyncPreventSleep).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("production wiring over the real settings store", () => {
+    const storeDirs: string[] = [];
+
+    afterEach(() => {
+      cleanupComposition();
+      for (const dir of storeDirs.splice(0)) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    /**
+     * Isolated file store over a fresh temp directory (never real user settings),
+     * routed through the mocked settings façade that composition imports.
+     */
+    async function useRealSettingsStore(initial?: Partial<AppSettings>) {
+      const dir = mkdtempSync(join(tmpdir(), "amphetamine-wiring-"));
+      storeDirs.push(dir);
+      const settingsFile = join(dir, "settings.json");
+      if (initial !== undefined) {
+        writeFileSync(settingsFile, JSON.stringify(initial));
+      }
+      const storeLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+      const notifyPersistenceBroken = vi.fn();
+      const store = createFileSettingsStore({
+        getUserDataPath: () => dir,
+        onSaveFailure: { notifyPersistenceBroken },
+        logger: storeLogger,
+      });
+      await store.init();
+      mockGetSettings.mockImplementation(() => store.get());
+      mockUpdateSettings.mockImplementation((partial: Partial<AppSettings>) =>
+        store.update(partial),
+      );
+      mockOnSettingsChanged.mockImplementation((cb: (settings: AppSettings) => void) =>
+        store.onChange(cb),
+      );
+      // Stateful blocker so recompute reports real effective-active flips.
+      let blockerActive = false;
+      mockSyncPreventSleep.mockImplementation((active: boolean) => {
+        blockerActive = active;
+      });
+      mockIsPreventingSleep.mockImplementation(() => blockerActive);
+      return {
+        store,
+        storeLogger,
+        notifyPersistenceBroken,
+        readDisk: () => JSON.parse(readFileSync(settingsFile, "utf-8")) as unknown,
+      };
+    }
+
+    function requireComposition() {
+      if (composition === null) throw new Error("composition not initialized");
+      return composition;
+    }
+
+    it("delivers committed settings to reactions, tray refresh and renderer pushes past a failing integration", async () => {
+      const real = await useRealSettingsStore();
+      const mockSend = vi.fn();
+      mockGetAllWindows.mockReturnValue([
+        { isDestroyed: () => false, webContents: { send: mockSend } },
+      ]);
+      const integrationError = new Error("status integration crashed");
+      const integrationSeen: AppSettings[] = [];
+      // Registered ahead of composition: mutates its own copy, then throws.
+      real.store.onChange((settings) => {
+        integrationSeen.push({ ...settings });
+        settings.preventSleep = false;
+        settings.batteryThreshold = 99;
+        throw integrationError;
+      });
+      await initComposition();
+      const trayRefresh = vi.fn();
+      requireTrayDeps().onSettingsChanged?.(trayRefresh);
+      const activeListener = vi.fn();
+      requireTrayDeps().onActiveStateChanged(activeListener);
+      mockSyncPreventSleep.mockClear();
+      mockBatteryReconfigure.mockClear();
+
+      const result = await requireComposition()
+        .getIpcDeps()
+        .updateSettings({ preventSleep: true, batteryThreshold: 20 });
+
+      const committed = { ...DEFAULT_SETTINGS, preventSleep: true, batteryThreshold: 20 };
+      expect(result).toEqual({ settings: committed, rejectedKeys: [] });
+      expect(integrationSeen).toEqual([committed]);
+      expect(mockSyncPreventSleep).toHaveBeenCalledWith(true, "prevent-display-sleep");
+      expect(mockBatteryReconfigure).toHaveBeenCalledOnce();
+      expect(mockSend).toHaveBeenCalledExactlyOnceWith("settings:changed", committed);
+      expect(trayRefresh).toHaveBeenCalledOnce();
+      expect(activeListener).toHaveBeenCalledOnce();
+      expect(requireTrayDeps().getEffectiveActive()).toBe(true);
+      expect(real.storeLogger.error).toHaveBeenCalledExactlyOnceWith(
+        "[settings] Change subscriber threw:",
+        integrationError,
+      );
+      expect(real.notifyPersistenceBroken).not.toHaveBeenCalled();
+      expect(real.store.get()).toEqual(committed);
+      expect(real.readDisk()).toEqual(committed);
+
+      // A non-renderer-visible change still reacts and refreshes the tray, without a push.
+      await requireComposition().getIpcDeps().updateSettings({ launchAtLogin: true });
+      expect(mockSyncAutoLaunch).toHaveBeenLastCalledWith(true);
+      expect(trayRefresh).toHaveBeenCalledTimes(2);
+      expect(mockSend).toHaveBeenCalledOnce();
+      expect(real.storeLogger.error).toHaveBeenCalledTimes(2);
+      expect(real.notifyPersistenceBroken).not.toHaveBeenCalled();
+      await real.store.flush();
+    });
+
+    describe("battery read authority", () => {
+      /** Deferred sensor reads, resolved by each test in issue order. */
+      let reads: PromiseWithResolvers<number | null>[];
+      let onBatteryPower: boolean;
+      let powerHandlers: { onBattery: () => void; onAc: () => void; onResume: () => void } | null;
+      let samples: (number | null)[];
+
+      const settle = async (): Promise<void> => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      };
+
+      async function settleRead(index: number, percent: number | null): Promise<void> {
+        const read = reads[index];
+        if (read === undefined) throw new Error(`Read ${index} was never issued`);
+        read.resolve(percent);
+        await settle();
+      }
+
+      function power() {
+        if (powerHandlers === null) throw new Error("power source listeners not registered");
+        return powerHandlers;
+      }
+
+      function sessionTimerDeps() {
+        return firstCallArg<{ onSessionActiveChange: (active: boolean) => void }>(
+          mockCreateSessionTimer,
+        );
+      }
+
+      beforeEach(async () => {
+        reads = [];
+        onBatteryPower = true;
+        powerHandlers = null;
+        samples = [];
+        mockBatterySensor.getPercent.mockImplementation(() => {
+          const read = Promise.withResolvers<number | null>();
+          reads.push(read);
+          return read.promise;
+        });
+        mockBatterySensor.isOnBatteryPower.mockImplementation(() => onBatteryPower);
+        mockBatterySensor.onPowerSourceChange.mockImplementation(
+          (handlers: { onBattery: () => void; onAc: () => void; onResume: () => void }) => {
+            powerHandlers = handlers;
+            return () => {
+              powerHandlers = null;
+            };
+          },
+        );
+        const actual = await vi.importActual<typeof BatteryMonitorModule>(
+          "../../src/main/battery-monitor.js",
+        );
+        // Real detector; the production onPercentSample is forwarded and recorded.
+        mockCreateBatteryMonitor.mockImplementation((deps) => {
+          const productionDeps = deps as BatteryDeps;
+          return actual.createBatteryMonitor({
+            ...productionDeps,
+            onPercentSample: (percent) => {
+              samples.push(percent);
+              productionDeps.onPercentSample?.(percent);
+            },
+          });
+        });
+      });
+
+      it("ignores a slow reading after the committed threshold is disabled and re-enabled", async () => {
+        const real = await useRealSettingsStore({ preventSleep: true, batteryThreshold: 20 });
+        await initComposition();
+        const ipc = requireComposition().getIpcDeps();
+
+        power().onBattery();
+        await ipc.updateSettings({ batteryThreshold: 0 });
+        await ipc.updateSettings({ batteryThreshold: 20 });
+        await settleRead(0, 5);
+
+        expect(samples).toEqual([]);
+        expect(mockSessionCancel).not.toHaveBeenCalled();
+        expect(real.store.get().preventSleep).toBe(true);
+        // The re-enable earned one fresh check under the committed threshold.
+        expect(reads).toHaveLength(2);
+        await settleRead(1, 45);
+        expect(samples).toEqual([45]);
+        expect(mockSessionCancel).not.toHaveBeenCalled();
+        expect(real.readDisk()).toEqual({
+          ...DEFAULT_SETTINGS,
+          preventSleep: true,
+          batteryThreshold: 20,
+        });
+      });
+
+      it("ignores a slow reading after sleep prevention turns off and on again", async () => {
+        const real = await useRealSettingsStore({ preventSleep: true, batteryThreshold: 20 });
+        await initComposition();
+        const ipc = requireComposition().getIpcDeps();
+
+        power().onBattery();
+        await ipc.updateSettings({ preventSleep: false });
+        expect(requireTrayDeps().getEffectiveActive()).toBe(false);
+        await ipc.updateSettings({ preventSleep: true });
+        expect(requireTrayDeps().getEffectiveActive()).toBe(true);
+        await settleRead(0, 5);
+
+        expect(samples).toEqual([]);
+        expect(mockSessionCancel).not.toHaveBeenCalled();
+        expect(real.store.get().preventSleep).toBe(true);
+        expect(reads).toHaveLength(1);
+        expect(mockLogInfo).not.toHaveBeenCalledWith(expect.stringContaining("[notify]"));
+      });
+
+      it("ignores a slow reading once the machine moves onto AC power", async () => {
+        const real = await useRealSettingsStore({ preventSleep: true, batteryThreshold: 20 });
+        await initComposition();
+
+        power().onBattery();
+        onBatteryPower = false;
+        power().onAc();
+        await settleRead(0, 5);
+
+        expect(samples).toEqual([]);
+        expect(mockSessionCancel).not.toHaveBeenCalled();
+        expect(real.store.get().preventSleep).toBe(true);
+        expect(mockLogInfo).not.toHaveBeenCalledWith(expect.stringContaining("[notify]"));
+      });
+
+      it("lets a fresh eligible low reading clear intent and cancel the session", async () => {
+        const real = await useRealSettingsStore({ preventSleep: true, batteryThreshold: 20 });
+        await initComposition();
+        const timerDeps = sessionTimerDeps();
+        timerDeps.onSessionActiveChange(true);
+        mockSessionCancel.mockImplementation(() => {
+          timerDeps.onSessionActiveChange(false);
+        });
+
+        power().onBattery();
+        await settleRead(0, 12);
+        await real.store.flush();
+
+        expect(samples).toEqual([12]);
+        expect(mockSessionCancel).toHaveBeenCalledOnce();
+        expect(real.store.get().preventSleep).toBe(false);
+        expect(real.readDisk()).toEqual({ ...DEFAULT_SETTINGS, batteryThreshold: 20 });
+        expect(mockSyncPreventSleep).toHaveBeenLastCalledWith(false, "prevent-display-sleep");
+        expect(requireTrayDeps().getEffectiveActive()).toBe(false);
+        expect(mockLogInfo).toHaveBeenCalledWith(
+          expect.stringContaining("Battery at 12% (threshold 20%)"),
+        );
+      });
     });
   });
 

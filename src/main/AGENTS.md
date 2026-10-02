@@ -21,7 +21,7 @@ Main process owns app lifecycle, BrowserWindows, tray, typed IPC registration, a
 | `session-timer.ts` | Façade over `application/session` engine; **handle injection only** |
 | `global-shortcut.ts` | Façade over RegisterAppShortcut + GlobalShortcutPort |
 | `auto-launch.ts` | Login items + `AutoLaunchPort` view (port lives here, not infrastructure) |
-| `battery-monitor.ts` | Threshold **detector** only; injected `BatterySensorPort` (`createBatterySensor`); optional `onPercentSample`; benchmark counters |
+| `battery-monitor.ts` | Threshold **detector** only; injected `BatterySensorPort` (`createBatterySensor`); optional `onPercentSample`; benchmark counters; read authority (policy epoch + coalesced follow-up) |
 | `auto-updater.ts` | IPC registration + re-exports of hybrid policy (`infrastructure/updater`) |
 | `auto-updater-utils.ts` | Façade over pure release-URL helpers + package repo lookup |
 | `settings-window.ts` | Thin re-export of WindowGraph settings APIs |
@@ -58,6 +58,7 @@ Do not register a second `before-quit` handler on settings or other modules.
 - Effective sleep: `preventSleep` **OR** session active — via `createRecomputeSleepPrevention` + domain `isEffectivelyActive`.
 - Low-battery: detector calls `HandleLowBatteryAutoStop` (clear intent + cancel session + optional OS notify via `UserNotifierPort`).
 - Battery monitor is constructed with `createBatterySensor()`; it may report `onPercentSample` so low-battery messages can include the last known charge percent.
+- Battery read authority: sampling/auto-stop require battery power + enabled threshold + active prevention + live monitor **before and after** `getPercent()`. Power-source, resume, `reconfigure()` (committed threshold), `onPreventSleepChange` and cleanup bump a policy epoch that revokes in-flight reads (even if values later return). One read in flight; eligible triggers during it coalesce into one fresh follow-up; failed/unavailable reads never retry on their own.
 - Session IPC before `init` **fails closed** (throws); no module-level session globals.
 - Application → renderer pushes use `AppPushEvent` via `MainToRendererNotifierPort` (not raw `IPC_CHANNELS`).
 - OS user feedback uses `UserNotifierPort` (`createOsUserNotifier`) — not a push channel.
@@ -75,7 +76,7 @@ Do not register a second `before-quit` handler on settings or other modules.
 
 - Use `typedHandle()` for invoke channels (validates sender).
 - Public raw `ipcMain.on()` requires `validateSender()`; the private Settings quit acknowledgement instead checks the exact cached `webContents`, its current main frame, and the correlated request ID.
-- Packaged public senders: exact-match NFC-normalized `lib/renderer/{index,settings,about}.html`; dev: `DEV_ORIGINS`. Utility-dialog private IPC uses webContents-id binding (not URL allowlist).
+- Packaged public senders: exact-match NFC-normalized `lib/renderer/{index,settings,about}.html`; dev: `DEV_ORIGINS`. Utility-dialog private IPC authenticates the exact cached `webContents` **and** its current main frame (not URL allowlist); child, missing, detached, destroyed or foreign frames are rejected.
 - Renderer pushes: `broadcastToWindows<K>()`; skip destroyed windows.
 - `hardenWebContents` blocks off-allowlist navigation and **denies all** `window.open` by default (popover, settings, about, utility-dialog).
 - About external links: WindowGraph overrides `setWindowOpenHandler` to allowlist the package repository URL (and paths under it on `github.com`) via `shell.openExternal` (still returns `deny` so no popup BrowserWindow).
@@ -104,7 +105,8 @@ Do not register a second `before-quit` handler on settings or other modules.
 - Window chrome: `popoverWindowChrome` / `settingsWindowChrome` / `aboutWindowChrome` / `utilityDialogWindowChrome` (applied inside WindowGraph). Utility dialog chrome is **opaque** (`backgroundColor: #0D1117`, no vibrancy/mica) with system Close (hiddenInset / titleBarOverlay).
 - Settings, About, and utility dialog acquire/release **refcounted** utility foreground (`acquireUtilityForeground` / `releaseUtilityForeground`); Dock icon via `setUtilityDockIcon`.
 - Settings/About/utility-dialog use **hide-on-close warm cache**: first open creates+loads the BrowserWindow; user close hides (renderer stays warm); quit/`close*Window` force-destroys (`win.destroy()`, not hide).
-- Utility dialog is **single-flight** (concurrent `presentUtilityDialog` joins the in-flight promise). Re-present pushes payload via `utility-dialog:apply` (no reload). Present path resets content size to default then re-measures; renderer calls `set-height` **before** the open fade (avoids first-open aurora filter fringe at the window edge).
+- Utility dialog is **single-flight** (concurrent `presentUtilityDialog` joins the in-flight promise; first options win). Re-present pushes `{ kind: "present", payload }` via `utility-dialog:apply` (no reload); button / native Close dismissal pushes `{ kind: "retire", presentationId }`.
+- Utility dialog lifetimes: a **shell** (window + the private handlers it registered) outlives **presentations** (main-owned increasing `presentationId`). `respond` / `set-height` for a non-active id are ignored. Shell callbacks (ready, load rejection, closed) act only while that shell is current. Load rejection or partial handler registration settles the request with its cancel result, removes only that shell's handlers, releases only that presentation's foreground ref, and discards the shell so the next present rebuilds. Present path resets content size to default then re-measures; renderer calls `set-height` **before** the open fade (avoids first-open aurora filter fringe at the window edge).
 - `*WantsVisible` intent flag (Settings/About/utility-dialog): late `ready-to-show` after user dismiss must not re-show; reopening sets intent true again.
 - Settings/About present path clears renderer focus after show (deferred `webContents.executeJavaScript` blur) so Settings does not restore Launch at Login / last control and About does not land on the GitHub icon.
 - `isSettingsWindowOpen()` means **visible** (not merely cached-and-hidden).
