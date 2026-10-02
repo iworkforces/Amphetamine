@@ -1,12 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import type { UtilityDialogPayload } from "../../src/shared/utility-dialog.js";
+import type {
+  UtilityDialogApplyMessage,
+  UtilityDialogPayload,
+} from "../../src/shared/utility-dialog.js";
 
 const mockGetPayload = vi.fn<() => Promise<UtilityDialogPayload>>();
-const mockRespond = vi.fn<(response: number) => Promise<void>>();
-const mockSetHeight = vi.fn<(height: number) => Promise<void>>();
-const mockOnApply = vi.fn<(callback: (payload: UtilityDialogPayload) => void) => () => void>();
+const mockRespond = vi.fn<(presentationId: number, response: number) => Promise<void>>();
+const mockSetHeight = vi.fn<(presentationId: number, height: number) => Promise<void>>();
+const mockOnApply = vi.fn<(callback: (message: UtilityDialogApplyMessage) => void) => () => void>();
 
 const samplePayload: UtilityDialogPayload = {
+  presentationId: 1,
   title: "Amphetamine",
   message: "You're up to date",
   detail: "Amphetamine 1.11.0 is the latest version.",
@@ -20,12 +24,86 @@ const choicePayload: UtilityDialogPayload = {
   defaultId: 1,
 };
 const nativeWindow = window;
-const keydownListeners: EventListenerOrEventListenerObject[] = [];
+/** Every listener the renderer adds through the stand-in window (removed after each test). */
+const windowListeners: [string, EventListenerOrEventListenerObject][] = [];
 
 async function openDialog(): Promise<void> {
   vi.resetModules();
   await import("../../src/renderer/utility-dialog/index.js");
   await vi.advanceTimersByTimeAsync(400);
+}
+
+/** Deliver an APPLY push through the renderer's subscription. */
+function apply(message: UtilityDialogApplyMessage): void {
+  const listener = mockOnApply.mock.calls[0]?.[0];
+  if (listener === undefined) throw new Error("renderer did not subscribe to APPLY");
+  listener(message);
+}
+
+function present(payload: UtilityDialogPayload): void {
+  apply({ kind: "present", payload });
+}
+
+function retire(presentationId: number): void {
+  apply({ kind: "retire", presentationId });
+}
+
+function requireRoot(): HTMLElement {
+  const root = document.getElementById("app");
+  if (root === null) throw new Error("missing #app");
+  return root;
+}
+
+function actionButtons(): HTMLButtonElement[] {
+  return Array.from(document.querySelectorAll<HTMLButtonElement>("#dialog-actions button"));
+}
+
+function pressKey(key: string): KeyboardEvent {
+  const event = new KeyboardEvent("keydown", { key, cancelable: true, bubbles: true });
+  window.dispatchEvent(event);
+  return event;
+}
+
+function enableMotion(): void {
+  const originalMatchMedia = window.matchMedia;
+  Object.defineProperty(window, "matchMedia", {
+    value: (query: string) => ({ ...originalMatchMedia(query), matches: false }),
+    configurable: true,
+  });
+}
+
+/** Manual animation-frame queue with cancellation (ids are stable per frame). */
+function captureAnimationFrames(): {
+  pending: Map<number, FrameRequestCallback>;
+  run: (id: number) => void;
+  runAll: () => void;
+  cancel: ReturnType<typeof vi.fn<(id: number) => void>>;
+} {
+  const pending = new Map<number, FrameRequestCallback>();
+  let nextId = 1;
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+    const id = nextId++;
+    pending.set(id, callback);
+    return id;
+  });
+  const cancel = vi.fn<(id: number) => void>((id) => {
+    pending.delete(id);
+  });
+  vi.stubGlobal("cancelAnimationFrame", cancel);
+  const run = (id: number): void => {
+    const callback = pending.get(id);
+    if (callback === undefined) throw new Error(`frame ${id} is not pending`);
+    pending.delete(id);
+    callback(id * 16);
+  };
+  return {
+    pending,
+    run,
+    runAll: () => {
+      for (const id of [...pending.keys()]) run(id);
+    },
+    cancel,
+  };
 }
 
 function setupDom(): void {
@@ -75,9 +153,13 @@ describe("renderer utility-dialog", () => {
     vi.useFakeTimers();
     setupDom();
     setDocumentVisibility("visible");
+    mockGetPayload.mockReset();
     mockGetPayload.mockResolvedValue(samplePayload);
+    mockRespond.mockReset();
     mockRespond.mockResolvedValue(undefined);
+    mockSetHeight.mockReset();
     mockSetHeight.mockResolvedValue(undefined);
+    mockOnApply.mockReset();
     mockOnApply.mockImplementation(() => () => {
       /* unsubscribe */
     });
@@ -109,7 +191,7 @@ describe("renderer utility-dialog", () => {
           options?: boolean | AddEventListenerOptions,
         ) => {
           nativeWindow.addEventListener(type, listener, options);
-          if (type === "keydown") keydownListeners.push(listener);
+          windowListeners.push([type, listener]);
         },
         removeEventListener: nativeWindow.removeEventListener.bind(nativeWindow),
       },
@@ -119,8 +201,9 @@ describe("renderer utility-dialog", () => {
   });
 
   afterEach(() => {
-    for (const listener of keydownListeners) nativeWindow.removeEventListener("keydown", listener);
-    keydownListeners.length = 0;
+    for (const [type, listener] of windowListeners)
+      nativeWindow.removeEventListener(type, listener);
+    windowListeners.length = 0;
     Object.defineProperty(globalThis, "window", {
       value: nativeWindow,
       writable: true,
@@ -152,7 +235,7 @@ describe("renderer utility-dialog", () => {
       "Amphetamine 1.11.0 is the latest version.",
     );
     expect(document.title).toBe("Amphetamine");
-    expect(mockSetHeight).toHaveBeenCalledWith(280);
+    expect(mockSetHeight).toHaveBeenCalledWith(1, 280);
     // Open animation runs only after height settles.
     expect(document.getElementById("app")?.classList.contains("ready")).toBe(true);
   });
@@ -201,7 +284,7 @@ describe("renderer utility-dialog", () => {
     expect(document.activeElement).toBe(buttons?.[1]);
 
     buttons?.[index]?.click();
-    expect(mockRespond).toHaveBeenCalledExactlyOnceWith(index);
+    expect(mockRespond).toHaveBeenCalledExactlyOnceWith(1, index);
   });
 
   it.each(["Escape", "Enter"])("dismisses an info-only dialog with %s", async (key) => {
@@ -214,7 +297,7 @@ describe("renderer utility-dialog", () => {
     const event = new KeyboardEvent("keydown", { key, cancelable: true, bubbles: true });
     root?.dispatchEvent(event);
     expect(event.defaultPrevented).toBe(true);
-    expect(mockRespond).toHaveBeenCalledExactlyOnceWith(0);
+    expect(mockRespond).toHaveBeenCalledExactlyOnceWith(1, 0);
   });
 
   it.each(["Escape", "Enter"])("uses the configured %s choice outside buttons", async (key) => {
@@ -229,7 +312,7 @@ describe("renderer utility-dialog", () => {
     const event = new KeyboardEvent("keydown", { key, cancelable: true, bubbles: true });
     document.body.dispatchEvent(event);
     expect(event.defaultPrevented).toBe(true);
-    expect(mockRespond).toHaveBeenCalledExactlyOnceWith(key === "Escape" ? 2 : 1);
+    expect(mockRespond).toHaveBeenCalledExactlyOnceWith(1, key === "Escape" ? 2 : 1);
   });
 
   it("leaves Enter on a focused action to native button activation", async () => {
@@ -252,7 +335,7 @@ describe("renderer utility-dialog", () => {
     buttons[1]?.click();
     buttons[0]?.click();
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
-    expect(mockRespond).toHaveBeenCalledExactlyOnceWith(1);
+    expect(mockRespond).toHaveBeenCalledExactlyOnceWith(1, 1);
   });
 
   it("re-applies an info-only payload after dismissal and resets the response", async () => {
@@ -260,7 +343,8 @@ describe("renderer utility-dialog", () => {
     await openDialog();
     document.querySelector<HTMLButtonElement>(".dialog-btn-primary")?.click();
 
-    mockOnApply.mock.calls[0]?.[0]({ ...samplePayload, title: "Status", message: "All set" });
+    retire(1);
+    present({ ...samplePayload, presentationId: 2, title: "Status", message: "All set" });
     await vi.advanceTimersByTimeAsync(400);
     const actions = document.getElementById("dialog-actions");
     expect(document.title).toBe("Status");
@@ -272,12 +356,15 @@ describe("renderer utility-dialog", () => {
     document
       .getElementById("app")
       ?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-    expect(mockRespond.mock.calls).toEqual([[1], [0]]);
+    expect(mockRespond.mock.calls).toEqual([
+      [1, 1],
+      [2, 0],
+    ]);
   });
 
   it("restores actions and default focus when re-applied after an info-only payload", async () => {
     await openDialog();
-    mockOnApply.mock.calls[0]?.[0](choicePayload);
+    present({ ...choicePayload, presentationId: 2 });
     await vi.advanceTimersByTimeAsync(400);
 
     const actions = document.getElementById("dialog-actions");
@@ -301,7 +388,7 @@ describe("renderer utility-dialog", () => {
     );
     await openDialog();
 
-    expect(mockSetHeight).toHaveBeenCalledWith(282);
+    expect(mockSetHeight).toHaveBeenCalledWith(1, 282);
     expect(root?.classList.contains("pre-animate")).toBe(true);
     expect(root?.classList.contains("ready")).toBe(false);
     expect(root?.style.minHeight).toBe("200px");
@@ -318,7 +405,7 @@ describe("renderer utility-dialog", () => {
     mockSetHeight.mockRejectedValue(new Error("resize unavailable"));
     await openDialog();
 
-    expect(mockSetHeight).toHaveBeenCalledWith(280);
+    expect(mockSetHeight).toHaveBeenCalledWith(1, 280);
     expect(document.getElementById("app")?.classList.contains("ready")).toBe(true);
     expect(mockRespond).not.toHaveBeenCalled();
   });
@@ -328,11 +415,20 @@ describe("renderer utility-dialog", () => {
     await openDialog();
     expect(document.getElementById("dialog-message")?.textContent).toBe("");
 
-    mockOnApply.mock.calls[0]?.[0](choicePayload);
+    present(choicePayload);
     await vi.advanceTimersByTimeAsync(400);
     expect(document.getElementById("dialog-message")?.textContent).toBe(choicePayload.message);
     expect(document.querySelectorAll("#dialog-actions button")).toHaveLength(2);
     expect(document.getElementById("app")?.classList.contains("ready")).toBe(true);
+  });
+
+  it("ignores keys while no presentation is live", async () => {
+    mockGetPayload.mockRejectedValue(new Error("no presentation yet"));
+    await openDialog();
+
+    expect(pressKey("Escape").defaultPrevented).toBe(false);
+    expect(pressKey("Enter").defaultPrevented).toBe(false);
+    expect(mockRespond).not.toHaveBeenCalled();
   });
 
   it("marks a Windows dialog for platform-specific chrome", async () => {
@@ -355,7 +451,7 @@ describe("renderer utility-dialog", () => {
     const event = new KeyboardEvent("keydown", { key: "Enter", cancelable: true, bubbles: true });
     root?.dispatchEvent(event);
     expect(event.defaultPrevented).toBe(true);
-    expect(mockRespond).toHaveBeenCalledExactlyOnceWith(0);
+    expect(mockRespond).toHaveBeenCalledExactlyOnceWith(1, 0);
   });
 
   it.each([-1, 1.5, 8])(
@@ -369,7 +465,7 @@ describe("renderer utility-dialog", () => {
       expect(document.activeElement).toBe(actions[1]);
 
       actions[1]?.click();
-      expect(mockRespond).toHaveBeenCalledExactlyOnceWith(1);
+      expect(mockRespond).toHaveBeenCalledExactlyOnceWith(1, 1);
     },
   );
 
@@ -382,7 +478,7 @@ describe("renderer utility-dialog", () => {
       const event = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
       window.dispatchEvent(event);
       expect(event.defaultPrevented).toBe(true);
-      expect(mockRespond).toHaveBeenCalledExactlyOnceWith(0);
+      expect(mockRespond).toHaveBeenCalledExactlyOnceWith(1, 0);
     },
   );
 
@@ -416,13 +512,16 @@ describe("renderer utility-dialog", () => {
     document.querySelector<HTMLButtonElement>(".dialog-btn-primary")?.click();
     await vi.advanceTimersByTimeAsync(0);
     expect(console.error).toHaveBeenCalledWith("[utility-dialog] respond failed:", error);
-    expect(mockRespond).toHaveBeenCalledExactlyOnceWith(1);
+    expect(mockRespond).toHaveBeenCalledExactlyOnceWith(1, 1);
 
-    mockOnApply.mock.calls[0]?.[0]({ ...choicePayload, message: "Try again" });
+    present({ ...choicePayload, presentationId: 2, message: "Try again" });
     expect(document.getElementById("dialog-message")?.textContent).toBe("Try again");
     expect(document.activeElement).toBe(document.querySelector(".dialog-btn-primary"));
     document.querySelector<HTMLButtonElement>("#dialog-actions button")?.click();
-    expect(mockRespond.mock.calls).toEqual([[1], [0]]);
+    expect(mockRespond.mock.calls).toEqual([
+      [1, 1],
+      [2, 0],
+    ]);
   });
 
   it("opens without motion preferences when matchMedia is unavailable", async () => {
@@ -451,11 +550,7 @@ describe("renderer utility-dialog", () => {
   });
 
   it("reveals motion-enabled content after sizing and two animation frames", async () => {
-    const originalMatchMedia = window.matchMedia;
-    Object.defineProperty(window, "matchMedia", {
-      value: (query: string) => ({ ...originalMatchMedia(query), matches: false }),
-      configurable: true,
-    });
+    enableMotion();
     const frames: FrameRequestCallback[] = [];
     vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) =>
       frames.push(callback),
@@ -468,7 +563,7 @@ describe("renderer utility-dialog", () => {
     expect(root?.classList.contains("pre-animate")).toBe(true);
     frames.shift()?.(0);
     await vi.advanceTimersByTimeAsync(0);
-    expect(mockSetHeight).toHaveBeenCalledWith(280);
+    expect(mockSetHeight).toHaveBeenCalledWith(1, 280);
     expect(root?.classList.contains("ready")).toBe(false);
 
     frames.shift()?.(16);
@@ -479,11 +574,7 @@ describe("renderer utility-dialog", () => {
   });
 
   it("reveals a motion-enabled dialog if animation frames stop arriving", async () => {
-    const originalMatchMedia = window.matchMedia;
-    Object.defineProperty(window, "matchMedia", {
-      value: (query: string) => ({ ...originalMatchMedia(query), matches: false }),
-      configurable: true,
-    });
+    enableMotion();
     const frames: FrameRequestCallback[] = [];
     vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) =>
       frames.push(callback),
@@ -502,23 +593,20 @@ describe("renderer utility-dialog", () => {
   });
 
   it("sizes and reveals without requestAnimationFrame support", async () => {
-    const originalMatchMedia = window.matchMedia;
-    Object.defineProperty(window, "matchMedia", {
-      value: (query: string) => ({ ...originalMatchMedia(query), matches: false }),
-      configurable: true,
-    });
+    enableMotion();
     vi.stubGlobal("requestAnimationFrame", undefined);
     vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(276);
     await openDialog();
 
-    expect(mockSetHeight).toHaveBeenCalledWith(276);
+    expect(mockSetHeight).toHaveBeenCalledWith(1, 276);
     expect(document.getElementById("app")?.classList.contains("ready")).toBe(true);
     expect(document.activeElement).toBe(document.getElementById("app"));
   });
 
-  it("reveals the shell and declines the dialog if action markup is missing", async () => {
+  it("reveals the shell and declines the live presentation if action markup is missing", async () => {
     document.getElementById("dialog-actions")?.remove();
     vi.spyOn(console, "error").mockImplementation(() => {});
+    mockGetPayload.mockResolvedValue({ ...choicePayload, presentationId: 7, cancelId: 1 });
     await openDialog();
 
     const root = document.getElementById("app");
@@ -528,8 +616,21 @@ describe("renderer utility-dialog", () => {
     );
     expect(root?.classList.contains("ready")).toBe(true);
     expect(root?.classList.contains("pre-animate")).toBe(false);
-    expect(mockRespond).toHaveBeenCalledExactlyOnceWith(0);
-    expect(mockGetPayload).not.toHaveBeenCalled();
+    expect(mockOnApply).not.toHaveBeenCalled();
+    expect(mockRespond).toHaveBeenCalledExactlyOnceWith(7, 1);
+  });
+
+  it("declines nothing after a bootstrap failure when no presentation is live", async () => {
+    document.getElementById("dialog-message")?.remove();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    mockGetPayload.mockRejectedValue(new Error("[utility-dialog] No active dialog payload"));
+    await openDialog();
+
+    expect(console.error).toHaveBeenCalledWith(
+      "[utility-dialog] bootstrap failed:",
+      expect.objectContaining({ message: "[utility-dialog] Missing element #dialog-message" }),
+    );
+    expect(mockRespond).not.toHaveBeenCalled();
   });
 
   it("declines an unrenderable dialog when the root is missing", async () => {
@@ -543,7 +644,261 @@ describe("renderer utility-dialog", () => {
       expect.objectContaining({ message: "[utility-dialog] Missing element #app" }),
     );
     expect(document.getElementById("app")).toBeNull();
-    expect(mockRespond).toHaveBeenCalledExactlyOnceWith(0);
-    expect(mockGetPayload).not.toHaveBeenCalled();
+    expect(mockRespond).toHaveBeenCalledExactlyOnceWith(1, 0);
+  });
+
+  it("survives a bootstrap failure when the preload bridge is missing", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    Reflect.deleteProperty(window, "utilityDialogApi");
+    await openDialog();
+
+    expect(console.error).toHaveBeenCalledWith(
+      "[utility-dialog] bootstrap failed:",
+      expect.any(TypeError),
+    );
+    expect(requireRoot().classList.contains("ready")).toBe(true);
+    expect(mockRespond).not.toHaveBeenCalled();
+  });
+
+  describe("presentation lifetimes", () => {
+    it("ignores a stale initial payload read that settles after a newer presentation", async () => {
+      vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(280);
+      const initialRead = Promise.withResolvers<UtilityDialogPayload>();
+      mockGetPayload.mockReturnValue(initialRead.promise);
+      await openDialog();
+
+      present({ ...choicePayload, presentationId: 2, message: "Newer request" });
+      await vi.advanceTimersByTimeAsync(400);
+      const buttons = actionButtons();
+      initialRead.resolve({ ...samplePayload, message: "Older request" });
+      await vi.advanceTimersByTimeAsync(400);
+
+      expect(document.getElementById("dialog-message")?.textContent).toBe("Newer request");
+      expect(actionButtons()).toEqual(buttons);
+      expect(mockSetHeight.mock.calls.map(([id]) => id)).toEqual([2]);
+      buttons[1]?.click();
+      expect(mockRespond).toHaveBeenCalledExactlyOnceWith(2, 1);
+    });
+
+    it("ignores an initial payload read for a presentation main already retired", async () => {
+      const initialRead = Promise.withResolvers<UtilityDialogPayload>();
+      mockGetPayload.mockReturnValue(initialRead.promise);
+      await openDialog();
+
+      retire(1);
+      initialRead.resolve(choicePayload);
+      await vi.advanceTimersByTimeAsync(400);
+
+      expect(document.getElementById("dialog-message")?.textContent).toBe("");
+      expect(actionButtons()).toHaveLength(0);
+      expect(pressKey("Escape").defaultPrevented).toBe(false);
+      expect(mockRespond).not.toHaveBeenCalled();
+      expect(mockSetHeight).not.toHaveBeenCalled();
+    });
+
+    it("does not rebuild, refocus, re-measure, or re-arm on duplicate deliveries", async () => {
+      vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(280);
+      mockGetPayload.mockResolvedValue(choicePayload);
+      await openDialog();
+      const buttons = actionButtons();
+      buttons[0]?.focus();
+
+      present(choicePayload);
+      expect(actionButtons()).toEqual(buttons);
+      expect(document.activeElement).toBe(buttons[0]);
+      buttons[1]?.click();
+      present({ ...choicePayload, message: "Duplicate with new text" });
+      expect(document.getElementById("dialog-message")?.textContent).toBe(choicePayload.message);
+      pressKey("Escape");
+      buttons[0]?.click();
+
+      expect(mockRespond).toHaveBeenCalledExactlyOnceWith(1, 1);
+      expect(mockSetHeight).toHaveBeenCalledOnce();
+    });
+
+    it("keeps a retired presentation's controls and keys from responding", async () => {
+      mockGetPayload.mockResolvedValue(choicePayload);
+      await openDialog();
+      const staleButtons = actionButtons();
+
+      retire(1);
+      staleButtons[1]?.click();
+      expect(pressKey("Escape").defaultPrevented).toBe(false);
+      expect(pressKey("Enter").defaultPrevented).toBe(false);
+      expect(mockRespond).not.toHaveBeenCalled();
+      // Older retirements and presents cannot resurrect it.
+      retire(0);
+      present(choicePayload);
+      staleButtons[0]?.click();
+      expect(mockRespond).not.toHaveBeenCalled();
+
+      present({ ...choicePayload, presentationId: 2 });
+      staleButtons[1]?.click();
+      expect(mockRespond).not.toHaveBeenCalled();
+      actionButtons()[0]?.click();
+      expect(mockRespond).toHaveBeenCalledExactlyOnceWith(2, 0);
+    });
+
+    it("lets a later retirement supersede a presentation the renderer never saw", async () => {
+      mockGetPayload.mockResolvedValue(choicePayload);
+      await openDialog();
+
+      retire(3);
+      present({ ...choicePayload, presentationId: 2, message: "Already dismissed" });
+      expect(document.getElementById("dialog-message")?.textContent).toBe(choicePayload.message);
+      expect(pressKey("Escape").defaultPrevented).toBe(false);
+      expect(mockRespond).not.toHaveBeenCalled();
+    });
+
+    it("never lets a late height settlement reveal the next presentation", async () => {
+      vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(280);
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const heights: PromiseWithResolvers<void>[] = [];
+      mockSetHeight.mockImplementation(() => {
+        const height = Promise.withResolvers<void>();
+        heights.push(height);
+        return height.promise;
+      });
+      mockGetPayload.mockResolvedValue(choicePayload);
+      await openDialog();
+      const root = requireRoot();
+
+      retire(1);
+      present({ ...choicePayload, presentationId: 2, message: "Next request" });
+      present({ ...choicePayload, presentationId: 2 });
+      await vi.advanceTimersByTimeAsync(20);
+      expect(mockSetHeight.mock.calls).toEqual([
+        [1, 280],
+        [2, 280],
+      ]);
+
+      heights[0]?.resolve();
+      await vi.advanceTimersByTimeAsync(400);
+      expect(root.classList.contains("ready")).toBe(false);
+      expect(root.classList.contains("pre-animate")).toBe(true);
+
+      retire(2);
+      present({ ...choicePayload, presentationId: 3 });
+      heights[1]?.reject(new Error("window resized away"));
+      await vi.advanceTimersByTimeAsync(400);
+      expect(root.classList.contains("ready")).toBe(false);
+      expect(console.error).toHaveBeenCalledWith(
+        "[utility-dialog] setHeight failed:",
+        expect.any(Error),
+      );
+
+      heights[2]?.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(root.classList.contains("ready")).toBe(true);
+    });
+
+    it("skips measuring a presentation retired before its frame runs", async () => {
+      const frames = captureAnimationFrames();
+      vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(280);
+      mockGetPayload.mockResolvedValue(choicePayload);
+      await openDialog();
+
+      retire(1);
+      frames.runAll();
+      await vi.advanceTimersByTimeAsync(400);
+      expect(mockSetHeight).not.toHaveBeenCalled();
+      expect(requireRoot().classList.contains("ready")).toBe(false);
+    });
+
+    it("never lets a dismissed presentation's open animation reveal the next one", async () => {
+      enableMotion();
+      const frames = captureAnimationFrames();
+      vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(280);
+      mockGetPayload.mockResolvedValue(choicePayload);
+      await openDialog();
+      const root = requireRoot();
+
+      frames.runAll();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockSetHeight).toHaveBeenCalledExactlyOnceWith(1, 280);
+      const firstAnimationFrames = [...frames.pending.keys()];
+      expect(firstAnimationFrames).toHaveLength(1);
+
+      retire(1);
+      present({ ...choicePayload, presentationId: 2 });
+      const secondMeasureFrames = [...frames.pending.keys()].filter(
+        (id) => !firstAnimationFrames.includes(id),
+      );
+      for (const id of firstAnimationFrames) frames.run(id);
+      for (const id of [...frames.pending.keys()]) {
+        if (!secondMeasureFrames.includes(id)) frames.run(id);
+      }
+      await vi.advanceTimersByTimeAsync(400);
+      expect(root.classList.contains("ready")).toBe(false);
+      expect(root.classList.contains("pre-animate")).toBe(true);
+
+      frames.runAll();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockSetHeight.mock.calls).toEqual([
+        [1, 280],
+        [2, 280],
+      ]);
+      frames.runAll();
+      frames.runAll();
+      expect(root.classList.contains("ready")).toBe(true);
+    });
+
+    it("disposes subscriptions, aurora pause, keys, and scheduled work only on actual unload", async () => {
+      enableMotion();
+      const frames = captureAnimationFrames();
+      const unsubscribe = vi.fn();
+      mockOnApply.mockImplementation(() => unsubscribe);
+      vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(280);
+      mockGetPayload.mockResolvedValue(choicePayload);
+      await openDialog();
+      const root = requireRoot();
+      const stage = document.querySelector(".icon-aurora-stage");
+      frames.runAll();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(frames.pending.size).toBe(1);
+
+      // Warm hide (window.hide → visibilitychange) keeps everything wired.
+      setDocumentVisibility("hidden");
+      document.dispatchEvent(new Event("visibilitychange"));
+      expect(stage?.classList.contains("is-paused")).toBe(true);
+      setDocumentVisibility("visible");
+      document.dispatchEvent(new Event("visibilitychange"));
+      expect(stage?.classList.contains("is-paused")).toBe(false);
+      window.dispatchEvent(new nativeWindow.PageTransitionEvent("pagehide", { persisted: true }));
+      expect(unsubscribe).not.toHaveBeenCalled();
+
+      const pendingFrames = [...frames.pending.keys()];
+      window.dispatchEvent(new nativeWindow.PageTransitionEvent("pagehide", { persisted: false }));
+      window.dispatchEvent(new nativeWindow.PageTransitionEvent("pagehide", { persisted: false }));
+      expect(unsubscribe).toHaveBeenCalledOnce();
+      expect(frames.cancel.mock.calls.map(([id]) => id)).toEqual(pendingFrames);
+
+      setDocumentVisibility("hidden");
+      document.dispatchEvent(new Event("visibilitychange"));
+      expect(stage?.classList.contains("is-paused")).toBe(false);
+      expect(pressKey("Escape").defaultPrevented).toBe(false);
+      actionButtons()[1]?.click();
+      await vi.advanceTimersByTimeAsync(400);
+      expect(root.classList.contains("ready")).toBe(false);
+      expect(mockRespond).not.toHaveBeenCalled();
+    });
+
+    it("drops a payload read and height reply that settle after unload", async () => {
+      vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(280);
+      const initialRead = Promise.withResolvers<UtilityDialogPayload>();
+      mockGetPayload.mockReturnValueOnce(initialRead.promise);
+      const height = Promise.withResolvers<void>();
+      mockSetHeight.mockReturnValueOnce(height.promise);
+      await openDialog();
+
+      present(choicePayload);
+      window.dispatchEvent(new nativeWindow.PageTransitionEvent("pagehide", { persisted: false }));
+      initialRead.resolve({ ...choicePayload, presentationId: 2, message: "After unload" });
+      height.resolve();
+      await vi.advanceTimersByTimeAsync(400);
+
+      expect(document.getElementById("dialog-message")?.textContent).toBe(choicePayload.message);
+      expect(requireRoot().classList.contains("ready")).toBe(false);
+    });
   });
 });

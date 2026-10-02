@@ -2,23 +2,44 @@
  * Aurora utility dialog renderer — Check for Updates and similar alerts.
  * Privileged access via window.utilityDialogApi (dedicated preload).
  * Supports warm-cache re-present via onApply (no full page reload).
+ *
+ * The page outlives individual presentations. Main stamps each one with an
+ * increasing `presentationId`; only the newest live presentation may build
+ * controls, respond, resize, or reveal. Stale payload reads, duplicate APPLY
+ * deliveries, and late height / animation completions are ignored. Listeners and
+ * scheduled work are disposed on actual unload (pagehide), never on warm hide.
  */
 import "./styles.css";
-import type { UtilityDialogPayload } from "../../shared/utility-dialog.js";
+import type {
+  UtilityDialogApplyMessage,
+  UtilityDialogPayload,
+} from "../../shared/utility-dialog.js";
 import { bindIconAuroraStagePause } from "../icon-aurora-pause.js";
 
 const heroIcon = new URL("../../assets/settings-hero-icon.png", import.meta.url).toString();
+
+/** Fallback reveal if animation frames stop arriving (hidden/occluded window). */
+const OPEN_ANIMATION_FALLBACK_MS = 400;
 
 declare global {
   interface Window {
     utilityDialogApi: {
       getPayload: () => Promise<UtilityDialogPayload>;
-      respond: (response: number) => Promise<void>;
-      setHeight: (height: number) => Promise<void>;
-      onApply: (callback: (payload: UtilityDialogPayload) => void) => () => void;
+      respond: (presentationId: number, response: number) => Promise<void>;
+      setHeight: (presentationId: number, height: number) => Promise<void>;
+      onApply: (callback: (message: UtilityDialogApplyMessage) => void) => () => void;
       os: string;
     };
   }
+}
+
+/** State of the presentation currently on screen; replaced (never reused) per presentation. */
+interface LivePresentation {
+  readonly id: number;
+  readonly defaultId: number;
+  readonly cancelId: number;
+  readonly showActionButtons: boolean;
+  responded: boolean;
 }
 
 function requireEl<T extends HTMLElement>(id: string): T {
@@ -40,28 +61,6 @@ function prefersReducedMotion(): boolean {
   }
 }
 
-/** Opacity-only open (no scale) so height shrink-wrap does not fight transform. */
-function startOpenAnimation(root: HTMLElement): void {
-  root.classList.remove("pre-animate", "ready");
-  if (prefersReducedMotion()) {
-    root.classList.add("ready");
-    return;
-  }
-  root.classList.add("pre-animate");
-  const finish = (): void => {
-    root.classList.remove("pre-animate");
-    root.classList.add("ready");
-  };
-  if (typeof requestAnimationFrame === "function") {
-    requestAnimationFrame(() => {
-      requestAnimationFrame(finish);
-    });
-  } else {
-    finish();
-  }
-  window.setTimeout(finish, 400);
-}
-
 function clampIndex(index: number, length: number, fallback: number): number {
   if (length <= 0) return 0;
   if (!Number.isInteger(index) || index < 0 || index >= length) {
@@ -70,45 +69,49 @@ function clampIndex(index: number, length: number, fallback: number): number {
   return index;
 }
 
-/**
- * Measure intrinsic content height and shrink-wrap.
- * Single rAF; does not wait on icon (stage size is reserved in CSS).
- * Invokes `onSettled` after setHeight resolves (or immediately on skip/failure)
- * so open animation never races the first resize (warm-edge filter fringe).
- */
-function reportContentHeight(root: HTMLElement, onSettled?: () => void): void {
-  const measure = (): void => {
-    const prevMinHeight = root.style.minHeight;
-    const prevHeight = root.style.height;
-    root.style.minHeight = "0";
-    root.style.height = "auto";
-    const height = Math.ceil(root.scrollHeight);
-    root.style.minHeight = prevMinHeight;
-    root.style.height = prevHeight;
-    if (height <= 0) {
-      onSettled?.();
-      return;
-    }
-    void window.utilityDialogApi
-      .setHeight(height)
-      .then(() => {
-        onSettled?.();
-      })
-      .catch((err: unknown) => {
-        console.error("[utility-dialog] setHeight failed:", err);
-        // Still reveal content if sizing fails.
-        onSettled?.();
+/** Timeouts and animation frames owned by this page, cancelled together on unload. */
+function createScheduler(): {
+  timeout: (callback: () => void, ms: number) => void;
+  frame: (callback: () => void) => void;
+  cancelAll: () => void;
+} {
+  const timeouts = new Set<number>();
+  const frames = new Set<number>();
+  return {
+    timeout(callback, ms) {
+      const id = window.setTimeout(() => {
+        timeouts.delete(id);
+        callback();
+      }, ms);
+      timeouts.add(id);
+    },
+    frame(callback) {
+      if (typeof requestAnimationFrame !== "function") {
+        callback();
+        return;
+      }
+      // Boxed id: safe even if a host runs the callback before returning the id.
+      const frame = { id: 0 };
+      frame.id = requestAnimationFrame(() => {
+        frames.delete(frame.id);
+        callback();
       });
+      frames.add(frame.id);
+    },
+    cancelAll() {
+      for (const id of timeouts) window.clearTimeout(id);
+      timeouts.clear();
+      if (typeof cancelAnimationFrame === "function") {
+        for (const id of frames) cancelAnimationFrame(id);
+      }
+      frames.clear();
+    },
   };
-  if (typeof requestAnimationFrame === "function") {
-    requestAnimationFrame(measure);
-  } else {
-    measure();
-  }
 }
 
 function bootstrap(): void {
-  if (window.utilityDialogApi.os === "win32") {
+  const api = window.utilityDialogApi;
+  if (api.os === "win32") {
     document.body.classList.add("platform-win32");
   }
 
@@ -118,54 +121,119 @@ function bootstrap(): void {
   const detailEl = requireEl<HTMLParagraphElement>("dialog-detail");
   const actionsEl = requireEl<HTMLDivElement>("dialog-actions");
   // Wire pause before async payload so warm-cache hide still freezes leaves.
-  bindIconAuroraStagePause(root);
+  const unbindAuroraPause = bindIconAuroraStagePause(root);
 
   icon.src = heroIcon;
   // Icon is decorative for layout; height measure does not wait on decode.
 
-  let defaultId = 0;
-  let cancelId = 0;
-  let showActionButtons = false;
-  let responded = false;
+  const scheduler = createScheduler();
+  let disposed = false;
+  /** Highest presentation id seen (presented or retired); nothing older is applied. */
+  let latestPresentationId = 0;
+  let live: LivePresentation | null = null;
 
-  const respond = (index: number): void => {
-    if (responded) return;
-    responded = true;
-    void window.utilityDialogApi.respond(index).catch((err: unknown) => {
+  const isLive = (presentation: LivePresentation): boolean => !disposed && live === presentation;
+
+  const respond = (presentation: LivePresentation, index: number): void => {
+    if (!isLive(presentation) || presentation.responded) return;
+    presentation.responded = true;
+    void api.respond(presentation.id, index).catch((err: unknown) => {
       console.error("[utility-dialog] respond failed:", err);
     });
   };
 
+  /** Opacity-only open (no scale) so height shrink-wrap does not fight transform. */
+  const startOpenAnimation = (presentation: LivePresentation): void => {
+    root.classList.remove("pre-animate", "ready");
+    if (prefersReducedMotion()) {
+      root.classList.add("ready");
+      return;
+    }
+    root.classList.add("pre-animate");
+    const finish = (): void => {
+      // A later presentation owns the reveal once this one is retired or replaced.
+      if (!isLive(presentation)) return;
+      root.classList.remove("pre-animate");
+      root.classList.add("ready");
+    };
+    scheduler.frame(() => {
+      scheduler.frame(finish);
+    });
+    scheduler.timeout(finish, OPEN_ANIMATION_FALLBACK_MS);
+  };
+
+  /**
+   * Measure intrinsic content height and shrink-wrap.
+   * Single rAF; does not wait on icon (stage size is reserved in CSS).
+   * Invokes `onSettled` after setHeight resolves (or immediately on skip/failure)
+   * so open animation never races the first resize (warm-edge filter fringe).
+   * Completions for a presentation that is no longer live are ignored.
+   */
+  const reportContentHeight = (presentation: LivePresentation, onSettled: () => void): void => {
+    scheduler.frame(() => {
+      if (!isLive(presentation)) return;
+      const prevMinHeight = root.style.minHeight;
+      const prevHeight = root.style.height;
+      root.style.minHeight = "0";
+      root.style.height = "auto";
+      const height = Math.ceil(root.scrollHeight);
+      root.style.minHeight = prevMinHeight;
+      root.style.height = prevHeight;
+      if (height <= 0) {
+        onSettled();
+        return;
+      }
+      void api.setHeight(presentation.id, height).then(
+        () => {
+          if (isLive(presentation)) onSettled();
+        },
+        (err: unknown) => {
+          console.error("[utility-dialog] setHeight failed:", err);
+          // Still reveal content if sizing fails.
+          if (isLive(presentation)) onSettled();
+        },
+      );
+    });
+  };
+
   const applyPayload = (payload: UtilityDialogPayload): void => {
-    responded = false;
+    // Older (stale) or equal (duplicate / already retired) ids change nothing:
+    // no rebuild, no refocus, and no re-armed response.
+    if (disposed || payload.presentationId <= latestPresentationId) return;
+    latestPresentationId = payload.presentationId;
+
     document.title = payload.title;
     messageEl.textContent = payload.message;
     detailEl.textContent = payload.detail;
 
     const buttons = payload.buttons.length > 0 ? payload.buttons : ["OK"];
-    defaultId = clampIndex(payload.defaultId, buttons.length, buttons.length - 1);
-    cancelId = clampIndex(payload.cancelId, buttons.length, 0);
-    showActionButtons = buttons.length > 1;
+    const presentation: LivePresentation = {
+      id: payload.presentationId,
+      defaultId: clampIndex(payload.defaultId, buttons.length, buttons.length - 1),
+      cancelId: clampIndex(payload.cancelId, buttons.length, 0),
+      showActionButtons: buttons.length > 1,
+      responded: false,
+    };
+    live = presentation;
 
     // Wipe previous action row (warm-cache re-present).
     actionsEl.replaceChildren();
     root.classList.remove("no-actions");
     actionsEl.hidden = false;
 
-    if (showActionButtons) {
+    if (presentation.showActionButtons) {
       buttons.forEach((label, index) => {
         const btn = document.createElement("button");
         btn.type = "button";
         btn.textContent = label;
         btn.className =
-          index === defaultId ? "dialog-btn-primary" : "dialog-btn-secondary";
+          index === presentation.defaultId ? "dialog-btn-primary" : "dialog-btn-secondary";
         btn.addEventListener("click", () => {
-          respond(index);
+          respond(presentation, index);
         });
         actionsEl.appendChild(btn);
       });
-      const focusTarget =
-        actionsEl.children[defaultId] ?? actionsEl.children[0];
+      const focusTarget = actionsEl.children[presentation.defaultId] ?? actionsEl.children[0];
       if (focusTarget instanceof HTMLButtonElement) {
         focusTarget.focus();
       }
@@ -184,21 +252,42 @@ function bootstrap(): void {
     // final window bounds.
     root.classList.remove("ready");
     root.classList.add("pre-animate");
-    reportContentHeight(root, () => {
-      startOpenAnimation(root);
+    reportContentHeight(presentation, () => {
+      startOpenAnimation(presentation);
     });
   };
 
-  window.addEventListener("keydown", (e: KeyboardEvent) => {
+  /** Main dismissed this presentation: stop it from responding, resizing, or revealing. */
+  const retire = (presentationId: number): void => {
+    latestPresentationId = Math.max(latestPresentationId, presentationId);
+    if (live !== null && live.id <= presentationId) {
+      live = null;
+    }
+  };
+
+  const onApply = (message: UtilityDialogApplyMessage): void => {
+    switch (message.kind) {
+      case "present":
+        applyPayload(message.payload);
+        break;
+      case "retire":
+        retire(message.presentationId);
+        break;
+    }
+  };
+
+  const onKeyDown = (e: KeyboardEvent): void => {
+    const presentation = live;
+    if (presentation === null) return;
     if (e.key === "Escape") {
       e.preventDefault();
-      respond(cancelId);
+      respond(presentation, presentation.cancelId);
       return;
     }
     if (e.key === "Enter") {
-      if (!showActionButtons) {
+      if (!presentation.showActionButtons) {
         e.preventDefault();
-        respond(cancelId);
+        respond(presentation, presentation.cancelId);
         return;
       }
       const active = document.activeElement;
@@ -206,20 +295,52 @@ function bootstrap(): void {
         return;
       }
       e.preventDefault();
-      respond(defaultId);
+      respond(presentation, presentation.defaultId);
     }
-  });
+  };
 
-  // Warm-cache re-present: main pushes a fresh payload without reloading.
-  window.utilityDialogApi.onApply(applyPayload);
+  let unsubscribeApply: () => void = () => {};
+
+  const dispose = (): void => {
+    disposed = true;
+    live = null;
+    unsubscribeApply();
+    unbindAuroraPause();
+    window.removeEventListener("keydown", onKeyDown);
+    window.removeEventListener("pagehide", onPageHide);
+    scheduler.cancelAll();
+  };
+
+  // Warm hide keeps everything; only a real unload (not a bfcache entry) disposes.
+  const onPageHide = (event: PageTransitionEvent): void => {
+    if (event.persisted) return;
+    dispose();
+  };
+
+  window.addEventListener("pagehide", onPageHide);
+  window.addEventListener("keydown", onKeyDown);
+  // Warm-cache re-present / retirement: main pushes without reloading.
+  unsubscribeApply = api.onApply(onApply);
 
   // First paint: pull payload if main already stored one (race with APPLY).
-  void window.utilityDialogApi
-    .getPayload()
-    .then(applyPayload)
-    .catch(() => {
-      // Idle warm shell may have no payload yet — wait for onApply.
-    });
+  void api.getPayload().then(applyPayload, () => {
+    // Idle warm shell may have no payload yet — wait for onApply.
+  });
+}
+
+/** An unrenderable page declines only the presentation that is live right now. */
+function declineLivePresentation(): void {
+  try {
+    const api = window.utilityDialogApi;
+    void api
+      .getPayload()
+      .then((payload) => api.respond(payload.presentationId, payload.cancelId))
+      .catch(() => {
+        // No live presentation, or main already settled it.
+      });
+  } catch {
+    // Preload may be unavailable if bootstrap failed very early.
+  }
 }
 
 try {
@@ -231,7 +352,5 @@ try {
     root.classList.remove("pre-animate");
     root.classList.add("ready");
   }
-  void window.utilityDialogApi.respond(0).catch(() => {
-    // Preload may be unavailable if bootstrap failed very early.
-  });
+  declineLivePresentation();
 }

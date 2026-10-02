@@ -38,6 +38,7 @@ import {
   UTILITY_DIALOG_GET_PAYLOAD,
   UTILITY_DIALOG_RESPOND,
   UTILITY_DIALOG_SET_HEIGHT,
+  type UtilityDialogApplyMessage,
   type UtilityDialogOptions,
   type UtilityDialogPayload,
   type UtilityDialogResult,
@@ -638,25 +639,49 @@ export function closeAboutWindow(): void {
 // First present creates + loads the BrowserWindow (slow). User dismiss hides and keeps
 // the renderer warm so the next present is apply-payload + show/focus only (fast).
 // Quit / destroyAllWindows force-destroys via closeUtilityDialogWindow.
+//
+// Two lifetimes: a *shell* (BrowserWindow + the private handlers it registered) outlives
+// many *presentations* (one request each, stamped with a main-owned, increasing id).
+// Invokes count only from the cached shell's current main frame and only for the active
+// presentation id. Shell callbacks (ready, load failure, closed) act only while their
+// shell is current, so a discarded shell never touches state owned by its replacement.
 
-let utilityDialogWindow: BrowserWindow | null = null;
-let utilityDialogHeldForeground = false;
+/** One cached dialog BrowserWindow and the private IPC handlers it registered. */
+interface UtilityDialogShell {
+  readonly win: BrowserWindow;
+  readonly contents: Electron.WebContents;
+  /** First paint happened; re-present can skip waiting for ready-to-show. */
+  ready: boolean;
+  /** Private channels this shell registered (in order); only these are removed on teardown. */
+  readonly ownedChannels: string[];
+  /** Torn down (failure, external close, quit); its late callbacks are ignored. */
+  retired: boolean;
+}
+
+/** One presentation (request). Concurrent callers share `promise` (first options win). */
+interface UtilityDialogPresentation {
+  readonly payload: UtilityDialogPayload;
+  readonly promise: Promise<UtilityDialogResult>;
+  readonly resolve: (result: UtilityDialogResult) => void;
+  /** This presentation holds one utility-foreground reference. */
+  holdsForeground: boolean;
+}
+
+let utilityDialogShell: UtilityDialogShell | null = null;
+/**
+ * Active (unsettled) presentation. Doubles as the user's intent to have the dialog
+ * visible: a late ready-to-show after dismissal finds none and cannot re-show.
+ */
+let utilityDialogPresentation: UtilityDialogPresentation | null = null;
+/** Last issued presentation id (main-owned, strictly increasing). */
+let lastUtilityDialogPresentationId = 0;
 /** When true, close is allowed to destroy (quit / composition cleanup). */
 let utilityDialogAllowDestroy = false;
-/**
- * User intent to have the dialog visible. Cleared on hide/finish.
- * Guards late ready-to-show so a dismiss before first paint cannot re-show.
- */
-let utilityDialogWantsVisible = false;
-/** True after first did-finish-load / ready-to-show so re-present can skip load. */
-let utilityDialogShellReady = false;
-/** In-flight presentation; concurrent callers await the same result. */
-let utilityDialogInFlight: Promise<UtilityDialogResult> | null = null;
-let utilityDialogPayload: UtilityDialogPayload | null = null;
-let utilityDialogResolve: ((result: UtilityDialogResult) => void) | null = null;
-let utilityDialogHandlersRegistered = false;
 
-function normalizeUtilityDialogOptions(options: UtilityDialogOptions): UtilityDialogPayload {
+function normalizeUtilityDialogOptions(
+  options: UtilityDialogOptions,
+  presentationId: number,
+): UtilityDialogPayload {
   const buttons = options.buttons.length > 0 ? options.buttons.slice(0, 3) : (["OK"] as string[]);
   const lastIndex = buttons.length - 1;
   const defaultId =
@@ -674,6 +699,7 @@ function normalizeUtilityDialogOptions(options: UtilityDialogOptions): UtilityDi
       ? options.cancelId
       : 0;
   return {
+    presentationId,
     title: options.title,
     message: options.message,
     detail: options.detail,
@@ -683,12 +709,37 @@ function normalizeUtilityDialogOptions(options: UtilityDialogOptions): UtilityDi
   };
 }
 
-function isUtilityDialogSender(event: IpcMainInvokeEvent): boolean {
-  const win = utilityDialogWindow;
-  if (win === null || win.isDestroyed()) {
+/**
+ * True only for an invoke from `shell`'s live WebContents *and* its current main frame,
+ * while that shell is the cached one. Foreign contents, child frames, and missing,
+ * detached, or destroyed frames are rejected.
+ */
+function isUtilityDialogSender(shell: UtilityDialogShell, event: IpcMainInvokeEvent): boolean {
+  if (shell.retired || utilityDialogShell !== shell) {
     return false;
   }
-  return event.sender.id === win.webContents.id;
+  const { win, contents } = shell;
+  if (win.isDestroyed() || contents.isDestroyed() || event.sender !== contents) {
+    return false;
+  }
+  const frame = event.senderFrame;
+  return (
+    frame !== null &&
+    frame === contents.mainFrame &&
+    frame.parent === null &&
+    !frame.detached &&
+    !frame.isDestroyed()
+  );
+}
+
+/** The active presentation when `presentationId` names it; otherwise the reply is stale. */
+function activeUtilityDialogPresentation(
+  presentationId: unknown,
+): UtilityDialogPresentation | null {
+  const presentation = utilityDialogPresentation;
+  return presentation !== null && presentation.payload.presentationId === presentationId
+    ? presentation
+    : null;
 }
 
 function clampUtilityDialogHeight(height: number): number {
@@ -701,45 +752,68 @@ function clampUtilityDialogHeight(height: number): number {
   );
 }
 
-function releaseUtilityDialogForeground(): void {
-  if (utilityDialogHeldForeground) {
-    releaseUtilityForeground();
-    utilityDialogHeldForeground = false;
+function acquirePresentationForeground(presentation: UtilityDialogPresentation): void {
+  ensureUtilityDockIcon();
+  if (!presentation.holdsForeground) {
+    acquireUtilityForeground();
+    presentation.holdsForeground = true;
   }
 }
 
-function destroyUtilityDialogShell(): void {
-  const win = utilityDialogWindow;
-  const handlersRegistered = utilityDialogHandlersRegistered;
-  utilityDialogWindow = null;
-  utilityDialogShellReady = false;
-  utilityDialogPayload = null;
-  utilityDialogWantsVisible = false;
-  utilityDialogHandlersRegistered = false;
-
-  let firstError: unknown;
-  try {
-    releaseUtilityDialogForeground();
-  } catch (error) {
-    firstError ??= error;
-    utilityDialogHeldForeground = false;
+function releasePresentationForeground(presentation: UtilityDialogPresentation): void {
+  if (presentation.holdsForeground) {
+    presentation.holdsForeground = false;
+    releaseUtilityForeground();
   }
-  if (handlersRegistered) {
-    for (const channel of [
-      UTILITY_DIALOG_GET_PAYLOAD,
-      UTILITY_DIALOG_RESPOND,
-      UTILITY_DIALOG_SET_HEIGHT,
-    ]) {
-      try {
-        ipcMain.removeHandler(channel);
-      } catch (error) {
-        firstError ??= error;
-      }
+}
+
+/**
+ * Settle `presentation` once: clear it, release only its foreground reference, and
+ * resolve its callers (invalid indices map to the cancel button). No-op if already settled.
+ */
+function settleUtilityDialogPresentation(
+  presentation: UtilityDialogPresentation,
+  response: number,
+  retire?: () => void,
+): void {
+  if (utilityDialogPresentation !== presentation) {
+    return;
+  }
+  utilityDialogPresentation = null;
+  const { payload } = presentation;
+  try {
+    releasePresentationForeground(presentation);
+    retire?.();
+  } finally {
+    const safeResponse =
+      Number.isInteger(response) && response >= 0 && response < payload.buttons.length
+        ? response
+        : payload.cancelId;
+    presentation.resolve({ response: safeResponse, checkboxChecked: false });
+  }
+}
+
+/**
+ * Retire a shell: remove only the private handlers it registered, then destroy its
+ * window. Every step is attempted; the first failure is rethrown afterwards.
+ */
+function teardownUtilityDialogShell(shell: UtilityDialogShell): void {
+  shell.retired = true;
+  shell.ready = false;
+  if (utilityDialogShell === shell) {
+    utilityDialogShell = null;
+  }
+  let firstError: unknown;
+  for (const channel of shell.ownedChannels.splice(0)) {
+    try {
+      ipcMain.removeHandler(channel);
+    } catch (error) {
+      firstError ??= error;
     }
   }
   try {
-    if (win !== null && !win.isDestroyed()) {
-      win.destroy();
+    if (!shell.win.isDestroyed()) {
+      shell.win.destroy();
     }
   } catch (error) {
     firstError ??= error;
@@ -747,38 +821,56 @@ function destroyUtilityDialogShell(): void {
   if (firstError !== undefined) throw firstError;
 }
 
-function acquireUtilityDialogForeground(): void {
-  ensureUtilityDockIcon();
-  if (!utilityDialogHeldForeground) {
-    acquireUtilityForeground();
-    utilityDialogHeldForeground = true;
+/**
+ * The shell failed (main-frame load rejected): cancel the presentation it carried and
+ * discard it so a later presentation builds a fresh one. Never throws (async callback).
+ */
+function failUtilityDialogShell(shell: UtilityDialogShell): void {
+  if (shell.retired || utilityDialogShell !== shell) {
+    return;
+  }
+  const presentation = utilityDialogPresentation;
+  try {
+    teardownUtilityDialogShell(shell);
+  } catch {
+    // Best effort: the shell is already out of the registry and marked retired.
+  }
+  if (presentation !== null) {
+    try {
+      settleUtilityDialogPresentation(presentation, presentation.payload.cancelId);
+    } catch {
+      // The presentation is settled even if releasing its foreground failed.
+    }
   }
 }
 
 /**
- * Push payload into the warm renderer and reset content height for re-measure.
- * No-ops if the shell is gone or not yet ready.
+ * Push the active payload into a ready shell, reset its height for re-measure, and
+ * bring it forward. No-ops unless `presentation` is still the active one.
  */
-function applyUtilityDialogPayload(win: BrowserWindow): void {
-  if (win.isDestroyed() || utilityDialogPayload === null) {
+function showUtilityDialogPresentation(
+  shell: UtilityDialogShell,
+  presentation: UtilityDialogPresentation,
+): void {
+  const { win, contents } = shell;
+  if (
+    shell.retired ||
+    !shell.ready ||
+    win.isDestroyed() ||
+    utilityDialogPresentation !== presentation
+  ) {
     return;
   }
+  acquirePresentationForeground(presentation);
   try {
     win.setContentSize(UTILITY_DIALOG_WIDTH, UTILITY_DIALOG_HEIGHT, false);
   } catch {
     // Size can fail if the window is mid-destroy.
   }
-  if (!win.webContents.isDestroyed()) {
-    win.webContents.send(UTILITY_DIALOG_APPLY, utilityDialogPayload);
+  if (!contents.isDestroyed()) {
+    const message: UtilityDialogApplyMessage = { kind: "present", payload: presentation.payload };
+    contents.send(UTILITY_DIALOG_APPLY, message);
   }
-}
-
-function showUtilityDialogWindow(win: BrowserWindow): void {
-  if (win.isDestroyed() || !utilityDialogWantsVisible) {
-    return;
-  }
-  acquireUtilityDialogForeground();
-  applyUtilityDialogPayload(win);
   if (!win.isVisible()) {
     win.show();
   }
@@ -791,76 +883,93 @@ function showUtilityDialogWindow(win: BrowserWindow): void {
 }
 
 /**
- * Settle an in-flight presentation and hide (warm) or destroy (quit).
- * Safe to call twice: second call no-ops resolve.
+ * Button or native Close dismissal: settle the presentation, retire it in the warm
+ * renderer through APPLY (so its late keyboard, height, and animation work stays
+ * inert), and hide the shell for reuse.
  */
-function finishUtilityDialog(response: number): void {
-  const payload = utilityDialogPayload;
-  const resolve = utilityDialogResolve;
-  const win = utilityDialogWindow;
-  const destroying = utilityDialogAllowDestroy;
-
-  utilityDialogResolve = null;
-  utilityDialogInFlight = null;
-  utilityDialogWantsVisible = false;
-  // Keep last payload only until hide completes; clear so getPayload fails when idle.
-  utilityDialogPayload = null;
-
-  try {
-    if (destroying) {
-      destroyUtilityDialogShell();
-    } else {
-      releaseUtilityDialogForeground();
-      if (win !== null && !win.isDestroyed() && win.isVisible()) {
-        win.hide();
+function dismissUtilityDialog(
+  shell: UtilityDialogShell,
+  presentation: UtilityDialogPresentation,
+  response: number,
+): void {
+  settleUtilityDialogPresentation(presentation, response, () => {
+    const { win, contents } = shell;
+    try {
+      if (!contents.isDestroyed()) {
+        const message: UtilityDialogApplyMessage = {
+          kind: "retire",
+          presentationId: presentation.payload.presentationId,
+        };
+        contents.send(UTILITY_DIALOG_APPLY, message);
       }
+    } catch {
+      // Main stays authoritative: replies for a settled presentation are ignored anyway.
     }
-  } finally {
-    if (resolve !== null) {
-      const safeResponse =
-        payload !== null &&
-        Number.isInteger(response) &&
-        response >= 0 &&
-        response < payload.buttons.length
-          ? response
-          : (payload?.cancelId ?? 0);
-      resolve({ response: safeResponse, checkboxChecked: false });
+    if (!win.isDestroyed() && win.isVisible()) {
+      win.hide();
     }
+  });
+}
+
+/**
+ * Register the private handlers for `shell`. Throws on the first failure, leaving
+ * `shell.ownedChannels` listing exactly what this shell registered for rollback.
+ */
+function registerUtilityDialogHandlers(shell: UtilityDialogShell): void {
+  const handlers: readonly (readonly [
+    string,
+    (event: IpcMainInvokeEvent, ...args: unknown[]) => unknown,
+  ])[] = [
+    [
+      UTILITY_DIALOG_GET_PAYLOAD,
+      (event) => {
+        const presentation = utilityDialogPresentation;
+        if (!isUtilityDialogSender(shell, event) || presentation === null) {
+          throw new Error("[utility-dialog] No active dialog payload");
+        }
+        return presentation.payload;
+      },
+    ],
+    [
+      UTILITY_DIALOG_RESPOND,
+      (event, presentationId, response) => {
+        if (!isUtilityDialogSender(shell, event)) {
+          throw new Error("[utility-dialog] Invalid sender");
+        }
+        // A reply for a dismissed presentation must never dismiss its successor.
+        const presentation = activeUtilityDialogPresentation(presentationId);
+        if (presentation === null) {
+          return;
+        }
+        dismissUtilityDialog(
+          shell,
+          presentation,
+          typeof response === "number" ? response : Number.NaN,
+        );
+      },
+    ],
+    [
+      UTILITY_DIALOG_SET_HEIGHT,
+      (event, presentationId, height) => {
+        if (!isUtilityDialogSender(shell, event)) {
+          throw new Error("[utility-dialog] Invalid sender");
+        }
+        // A height measured for a dismissed presentation must never resize its successor.
+        if (activeUtilityDialogPresentation(presentationId) === null || shell.win.isDestroyed()) {
+          return;
+        }
+        const next = clampUtilityDialogHeight(typeof height === "number" ? height : Number.NaN);
+        shell.win.setContentSize(UTILITY_DIALOG_WIDTH, next, false);
+      },
+    ],
+  ];
+  for (const [channel, handler] of handlers) {
+    ipcMain.handle(channel, handler);
+    shell.ownedChannels.push(channel);
   }
 }
 
-function registerUtilityDialogHandlers(): void {
-  if (utilityDialogHandlersRegistered) {
-    return;
-  }
-  ipcMain.handle(UTILITY_DIALOG_GET_PAYLOAD, (event) => {
-    if (!isUtilityDialogSender(event) || utilityDialogPayload === null) {
-      throw new Error("[utility-dialog] No active dialog payload");
-    }
-    return utilityDialogPayload;
-  });
-  ipcMain.handle(UTILITY_DIALOG_RESPOND, (event, response: unknown) => {
-    if (!isUtilityDialogSender(event)) {
-      throw new Error("[utility-dialog] Invalid sender");
-    }
-    const index = typeof response === "number" ? response : Number.NaN;
-    finishUtilityDialog(index);
-  });
-  ipcMain.handle(UTILITY_DIALOG_SET_HEIGHT, (event, height: unknown) => {
-    if (!isUtilityDialogSender(event)) {
-      throw new Error("[utility-dialog] Invalid sender");
-    }
-    const win = utilityDialogWindow;
-    if (win === null || win.isDestroyed()) {
-      return;
-    }
-    const next = clampUtilityDialogHeight(typeof height === "number" ? height : Number.NaN);
-    win.setContentSize(UTILITY_DIALOG_WIDTH, next, false);
-  });
-  utilityDialogHandlersRegistered = true;
-}
-
-function createUtilityDialogShell(): BrowserWindow {
+function createUtilityDialogShell(): UtilityDialogShell {
   const win = new BrowserWindow({
     width: UTILITY_DIALOG_WIDTH,
     height: UTILITY_DIALOG_HEIGHT,
@@ -877,118 +986,130 @@ function createUtilityDialogShell(): BrowserWindow {
       preload: getUtilityDialogPreloadPath(),
     }),
   });
+  const shell: UtilityDialogShell = {
+    win,
+    contents: win.webContents,
+    ready: false,
+    ownedChannels: [],
+    retired: false,
+  };
 
-  hardenWebContents(win);
-  utilityDialogWindow = win;
-  utilityDialogShellReady = false;
-  registerUtilityDialogHandlers();
+  try {
+    hardenWebContents(win);
+    registerUtilityDialogHandlers(shell);
+  } catch (error) {
+    // Partial registration: roll back only this shell's handlers and discard its window.
+    try {
+      teardownUtilityDialogShell(shell);
+    } catch {
+      // The registration failure is the one worth reporting.
+    }
+    throw error;
+  }
+  utilityDialogShell = shell;
 
   win.once("ready-to-show", () => {
-    if (win.isDestroyed() || utilityDialogWindow !== win) {
+    if (shell.retired || utilityDialogShell !== shell || win.isDestroyed()) {
       return;
     }
-    utilityDialogShellReady = true;
-    // May no-op if the user dismissed before first paint.
-    showUtilityDialogWindow(win);
+    shell.ready = true;
+    // No active presentation means the user dismissed before first paint.
+    const presentation = utilityDialogPresentation;
+    if (presentation !== null) {
+      showUtilityDialogPresentation(shell, presentation);
+    }
   });
 
   // User close (traffic light / caption) → hide + settle cancel (warm cache).
   win.on("close", (event) => {
-    if (utilityDialogAllowDestroy) {
+    if (utilityDialogAllowDestroy || shell.retired) {
       return;
     }
     event.preventDefault();
-    if (utilityDialogInFlight !== null) {
-      const cancelId = utilityDialogPayload?.cancelId ?? 0;
-      finishUtilityDialog(cancelId);
+    const presentation = utilityDialogPresentation;
+    if (presentation !== null) {
+      dismissUtilityDialog(shell, presentation, presentation.payload.cancelId);
     } else if (!win.isDestroyed() && win.isVisible()) {
       win.hide();
-      releaseUtilityDialogForeground();
-      utilityDialogWantsVisible = false;
     }
   });
 
   win.on("closed", () => {
-    if (utilityDialogWindow === win) {
-      utilityDialogWindow = null;
+    // Shells we tore down ourselves own nothing any more (their replacement might).
+    if (shell.retired) {
+      return;
     }
-    utilityDialogShellReady = false;
-    utilityDialogWantsVisible = false;
-    releaseUtilityDialogForeground();
-    // If destroy raced past finish, settle any waiter.
-    if (utilityDialogResolve !== null) {
-      const resolve = utilityDialogResolve;
-      const cancelId = utilityDialogPayload?.cancelId ?? 0;
-      utilityDialogResolve = null;
-      utilityDialogInFlight = null;
-      utilityDialogPayload = null;
-      resolve({ response: cancelId, checkboxChecked: false });
-    }
-    if (utilityDialogHandlersRegistered) {
-      ipcMain.removeHandler(UTILITY_DIALOG_GET_PAYLOAD);
-      ipcMain.removeHandler(UTILITY_DIALOG_RESPOND);
-      ipcMain.removeHandler(UTILITY_DIALOG_SET_HEIGHT);
-      utilityDialogHandlersRegistered = false;
+    // Closed externally: discard this shell and cancel the presentation it carried.
+    const presentation = utilityDialogPresentation;
+    try {
+      teardownUtilityDialogShell(shell);
+    } finally {
+      if (presentation !== null) {
+        settleUtilityDialogPresentation(presentation, presentation.payload.cancelId);
+      }
     }
   });
 
-  if (isDev) {
-    void win.loadURL(`${getDevServerUrl()}/utility-dialog.html`);
-  } else {
-    void win.loadFile(path.join(__dirname, "..", "renderer", "utility-dialog.html"));
-  }
+  const load = isDev
+    ? win.loadURL(`${getDevServerUrl()}/utility-dialog.html`)
+    : win.loadFile(path.join(__dirname, "..", "renderer", "utility-dialog.html"));
+  void load.catch(() => {
+    failUtilityDialogShell(shell);
+  });
 
-  return win;
+  return shell;
+}
+
+/** The cached shell if still alive; one destroyed behind our back is discarded first. */
+function reusableUtilityDialogShell(): UtilityDialogShell | null {
+  const shell = utilityDialogShell;
+  if (shell === null) {
+    return null;
+  }
+  if (!shell.win.isDestroyed() && !shell.contents.isDestroyed()) {
+    return shell;
+  }
+  teardownUtilityDialogShell(shell);
+  return null;
 }
 
 /**
  * Present a single-flight aurora utility dialog (Check for Updates, etc.).
  * First open creates + loads the shell; later opens re-apply payload + show (warm cache).
- * Concurrent calls share the in-flight promise.
+ * Concurrent calls share the in-flight promise; the first caller's options win.
  */
 export function presentUtilityDialog(options: UtilityDialogOptions): Promise<UtilityDialogResult> {
-  if (utilityDialogInFlight !== null) {
-    return utilityDialogInFlight;
+  const active = utilityDialogPresentation;
+  if (active !== null) {
+    return active.promise;
   }
 
-  const payload = normalizeUtilityDialogOptions(options);
-  utilityDialogPayload = payload;
-  utilityDialogWantsVisible = true;
+  lastUtilityDialogPresentationId += 1;
+  const payload = normalizeUtilityDialogOptions(options, lastUtilityDialogPresentationId);
+  const { promise, resolve } = Promise.withResolvers<UtilityDialogResult>();
+  const presentation: UtilityDialogPresentation = {
+    payload,
+    promise,
+    resolve,
+    holdsForeground: false,
+  };
+  utilityDialogPresentation = presentation;
 
-  const inFlight = new Promise<UtilityDialogResult>((resolve) => {
-    utilityDialogResolve = resolve;
-
+  try {
+    const shell = reusableUtilityDialogShell() ?? createUtilityDialogShell();
+    // Acquire before first paint so tray-only apps surface the Dock while the shell loads.
+    acquirePresentationForeground(presentation);
+    // A loading shell presents from ready-to-show instead.
+    showUtilityDialogPresentation(shell, presentation);
+  } catch {
     try {
-      const existing = utilityDialogWindow;
-      if (existing !== null && !existing.isDestroyed() && utilityDialogShellReady) {
-        showUtilityDialogWindow(existing);
-        return;
-      }
-
-      if (existing !== null && !existing.isDestroyed()) {
-        // Shell still loading; ready-to-show will call showUtilityDialogWindow.
-        acquireUtilityDialogForeground();
-        return;
-      }
-
-      createUtilityDialogShell();
-      // Acquire early so tray-only apps surface Dock while the shell loads.
-      acquireUtilityDialogForeground();
+      settleUtilityDialogPresentation(presentation, payload.cancelId);
     } catch {
-      utilityDialogResolve = null;
-      utilityDialogInFlight = null;
-      utilityDialogPayload = null;
-      utilityDialogWantsVisible = false;
-      releaseUtilityDialogForeground();
-      resolve({ response: payload.cancelId, checkboxChecked: false });
+      // Settled with the cancel result even if releasing its foreground failed.
     }
-  });
-
-  if (utilityDialogResolve !== null) {
-    utilityDialogInFlight = inFlight;
   }
 
-  return inFlight;
+  return promise;
 }
 
 /**
@@ -997,18 +1118,28 @@ export function presentUtilityDialog(options: UtilityDialogOptions): Promise<Uti
  */
 export function closeUtilityDialogWindow(): void {
   utilityDialogAllowDestroy = true;
-  utilityDialogWantsVisible = false;
-
+  let firstError: unknown;
   try {
-    if (utilityDialogInFlight !== null) {
-      const cancelId = utilityDialogPayload?.cancelId ?? 0;
-      finishUtilityDialog(cancelId);
-    } else {
-      destroyUtilityDialogShell();
+    const presentation = utilityDialogPresentation;
+    if (presentation !== null) {
+      try {
+        settleUtilityDialogPresentation(presentation, presentation.payload.cancelId);
+      } catch (error) {
+        firstError ??= error;
+      }
+    }
+    const shell = utilityDialogShell;
+    if (shell !== null) {
+      try {
+        teardownUtilityDialogShell(shell);
+      } catch (error) {
+        firstError ??= error;
+      }
     }
   } finally {
     utilityDialogAllowDestroy = false;
   }
+  if (firstError !== undefined) throw firstError;
 }
 
 /**
