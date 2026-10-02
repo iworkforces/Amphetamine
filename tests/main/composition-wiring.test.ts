@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type * as BatteryMonitorModule from "../../src/main/battery-monitor.js";
+import type { BatteryDeps, BatteryMonitorHandle } from "../../src/main/battery-monitor.js";
 import { createFileSettingsStore } from "../../src/infrastructure/settings/file-settings-store.js";
 import { DEFAULT_SETTINGS, type AppSettings } from "../../src/shared/types.js";
 
@@ -46,7 +48,7 @@ const mockBatterySensor = vi.hoisted(() => ({
 }));
 const mockCreateBatterySensor = vi.hoisted(() => vi.fn(() => mockBatterySensor));
 const mockCreateBatteryMonitor = vi.hoisted(() =>
-  vi.fn(() => ({
+  vi.fn((_deps: unknown): BatteryMonitorHandle => ({
     initBatteryMonitoring: mockBatteryInit,
     cleanupBatteryMonitoring: mockBatteryCleanup,
     onPreventSleepChange: mockBatteryOnPreventSleepChange,
@@ -77,6 +79,8 @@ const mockCreateSettingsWindow = vi.hoisted(() => vi.fn());
 vi.mock("electron", () => ({
   app: { isPackaged: false, focus: vi.fn() },
   BrowserWindow: { getAllWindows: mockGetAllWindows },
+  // Unsupported → the OS notifier logs `[notify] …` through electron-log (observable body).
+  Notification: { isSupported: () => false },
   powerMonitor: {
     on: vi.fn(),
     off: vi.fn(),
@@ -958,6 +962,154 @@ describe("composition wiring", () => {
       expect(real.storeLogger.error).toHaveBeenCalledTimes(2);
       expect(real.notifyPersistenceBroken).not.toHaveBeenCalled();
       await real.store.flush();
+    });
+
+    describe("battery read authority", () => {
+      /** Deferred sensor reads, resolved by each test in issue order. */
+      let reads: PromiseWithResolvers<number | null>[];
+      let onBatteryPower: boolean;
+      let powerHandlers: { onBattery: () => void; onAc: () => void; onResume: () => void } | null;
+      let samples: (number | null)[];
+
+      const settle = async (): Promise<void> => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      };
+
+      async function settleRead(index: number, percent: number | null): Promise<void> {
+        const read = reads[index];
+        if (read === undefined) throw new Error(`Read ${index} was never issued`);
+        read.resolve(percent);
+        await settle();
+      }
+
+      function power() {
+        if (powerHandlers === null) throw new Error("power source listeners not registered");
+        return powerHandlers;
+      }
+
+      function sessionTimerDeps() {
+        return firstCallArg<{ onSessionActiveChange: (active: boolean) => void }>(
+          mockCreateSessionTimer,
+        );
+      }
+
+      beforeEach(async () => {
+        reads = [];
+        onBatteryPower = true;
+        powerHandlers = null;
+        samples = [];
+        mockBatterySensor.getPercent.mockImplementation(() => {
+          const read = Promise.withResolvers<number | null>();
+          reads.push(read);
+          return read.promise;
+        });
+        mockBatterySensor.isOnBatteryPower.mockImplementation(() => onBatteryPower);
+        mockBatterySensor.onPowerSourceChange.mockImplementation(
+          (handlers: { onBattery: () => void; onAc: () => void; onResume: () => void }) => {
+            powerHandlers = handlers;
+            return () => {
+              powerHandlers = null;
+            };
+          },
+        );
+        const actual = await vi.importActual<typeof BatteryMonitorModule>(
+          "../../src/main/battery-monitor.js",
+        );
+        // Real detector; the production onPercentSample is forwarded and recorded.
+        mockCreateBatteryMonitor.mockImplementation((deps) => {
+          const productionDeps = deps as BatteryDeps;
+          return actual.createBatteryMonitor({
+            ...productionDeps,
+            onPercentSample: (percent) => {
+              samples.push(percent);
+              productionDeps.onPercentSample?.(percent);
+            },
+          });
+        });
+      });
+
+      it("ignores a slow reading after the committed threshold is disabled and re-enabled", async () => {
+        const real = await useRealSettingsStore({ preventSleep: true, batteryThreshold: 20 });
+        await initComposition();
+        const ipc = requireComposition().getIpcDeps();
+
+        power().onBattery();
+        await ipc.updateSettings({ batteryThreshold: 0 });
+        await ipc.updateSettings({ batteryThreshold: 20 });
+        await settleRead(0, 5);
+
+        expect(samples).toEqual([]);
+        expect(mockSessionCancel).not.toHaveBeenCalled();
+        expect(real.store.get().preventSleep).toBe(true);
+        // The re-enable earned one fresh check under the committed threshold.
+        expect(reads).toHaveLength(2);
+        await settleRead(1, 45);
+        expect(samples).toEqual([45]);
+        expect(mockSessionCancel).not.toHaveBeenCalled();
+        expect(real.readDisk()).toEqual({
+          ...DEFAULT_SETTINGS,
+          preventSleep: true,
+          batteryThreshold: 20,
+        });
+      });
+
+      it("ignores a slow reading after sleep prevention turns off and on again", async () => {
+        const real = await useRealSettingsStore({ preventSleep: true, batteryThreshold: 20 });
+        await initComposition();
+        const ipc = requireComposition().getIpcDeps();
+
+        power().onBattery();
+        await ipc.updateSettings({ preventSleep: false });
+        expect(requireTrayDeps().getEffectiveActive()).toBe(false);
+        await ipc.updateSettings({ preventSleep: true });
+        expect(requireTrayDeps().getEffectiveActive()).toBe(true);
+        await settleRead(0, 5);
+
+        expect(samples).toEqual([]);
+        expect(mockSessionCancel).not.toHaveBeenCalled();
+        expect(real.store.get().preventSleep).toBe(true);
+        expect(reads).toHaveLength(1);
+        expect(mockLogInfo).not.toHaveBeenCalledWith(expect.stringContaining("[notify]"));
+      });
+
+      it("ignores a slow reading once the machine moves onto AC power", async () => {
+        const real = await useRealSettingsStore({ preventSleep: true, batteryThreshold: 20 });
+        await initComposition();
+
+        power().onBattery();
+        onBatteryPower = false;
+        power().onAc();
+        await settleRead(0, 5);
+
+        expect(samples).toEqual([]);
+        expect(mockSessionCancel).not.toHaveBeenCalled();
+        expect(real.store.get().preventSleep).toBe(true);
+        expect(mockLogInfo).not.toHaveBeenCalledWith(expect.stringContaining("[notify]"));
+      });
+
+      it("lets a fresh eligible low reading clear intent and cancel the session", async () => {
+        const real = await useRealSettingsStore({ preventSleep: true, batteryThreshold: 20 });
+        await initComposition();
+        const timerDeps = sessionTimerDeps();
+        timerDeps.onSessionActiveChange(true);
+        mockSessionCancel.mockImplementation(() => {
+          timerDeps.onSessionActiveChange(false);
+        });
+
+        power().onBattery();
+        await settleRead(0, 12);
+        await real.store.flush();
+
+        expect(samples).toEqual([12]);
+        expect(mockSessionCancel).toHaveBeenCalledOnce();
+        expect(real.store.get().preventSleep).toBe(false);
+        expect(real.readDisk()).toEqual({ ...DEFAULT_SETTINGS, batteryThreshold: 20 });
+        expect(mockSyncPreventSleep).toHaveBeenLastCalledWith(false, "prevent-display-sleep");
+        expect(requireTrayDeps().getEffectiveActive()).toBe(false);
+        expect(mockLogInfo).toHaveBeenCalledWith(
+          expect.stringContaining("Battery at 12% (threshold 20%)"),
+        );
+      });
     });
   });
 

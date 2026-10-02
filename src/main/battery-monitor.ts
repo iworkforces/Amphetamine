@@ -106,51 +106,85 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
   const { getThreshold, onAutoStop, isPreventingSleep } = deps;
   const onPercentSample = deps.onPercentSample;
 
-  let isCheckingBattery = false;
   let disposed = false;
   let unsubscribePowerSource: (() => void) | null = null;
   let batteryCheckInterval: ReturnType<typeof setInterval> | null = null;
 
-  const checkBatteryAndStop = async (): Promise<void> => {
-    const threshold = getThreshold();
-    if (!isThresholdEnabled(threshold)) {
-      recordBattery("guardedSkipped");
-      return;
-    }
-    if (!isPreventingSleep()) {
-      recordBattery("guardedSkipped");
-      return;
-    }
+  /**
+   * Read authority. Bumped on every observed policy transition (power source,
+   * resume, committed threshold, effective-active, cleanup); a read may only
+   * publish a sample or stop prevention for the epoch it started in. A value
+   * comparison alone misses a setting that changes away and back mid-read.
+   */
+  let policyEpoch = 0;
+  /** At most one `getPercent()` in flight. */
+  let readInFlight = false;
+  /** One coalesced fresh check owed for eligible triggers seen during the current read. */
+  let followUpRequested = false;
 
+  const invalidatePendingReads = (): void => {
+    policyEpoch += 1;
+  };
+
+  /** Threshold to enforce under current policy, or null when sampling has no authority. */
+  const currentAuthority = (): number | null => {
+    if (disposed) return null;
+    const threshold = getThreshold();
+    if (!isThresholdEnabled(threshold)) return null;
+    if (!sensor.isOnBatteryPower()) return null;
+    if (!isPreventingSleep()) return null;
+    return threshold;
+  };
+
+  const readBatteryAndStop = async (): Promise<void> => {
+    const epoch = policyEpoch;
+    let percent: number | null;
     try {
-      const percent = await sensor.getPercent();
-      recordBattery("completedRead");
-      if (disposed) return;
-      onPercentSample?.(percent);
-      if (percent !== null && percent <= threshold) {
-        log.info(
-          `[battery] Auto-stop triggered: battery at ${percent}% (threshold: ${threshold}%)`,
-        );
-        onAutoStop();
-      }
+      percent = await sensor.getPercent();
     } catch (err) {
       // Still a completed attempt past the gate (I/O failed after entry).
       recordBattery("completedRead");
       if (!disposed) log.warn("[battery] Failed to check battery level:", err);
+      return;
+    }
+    recordBattery("completedRead");
+
+    // Re-check authority after the read: a stale epoch or a policy that no longer
+    // allows sampling discards the reading entirely.
+    if (epoch !== policyEpoch) return;
+    const threshold = currentAuthority();
+    if (threshold === null) return;
+
+    onPercentSample?.(percent);
+    if (percent !== null && percent <= threshold) {
+      log.info(`[battery] Auto-stop triggered: battery at ${percent}% (threshold: ${threshold}%)`);
+      onAutoStop();
     }
   };
 
   const runGuardedBatteryCheck = (errorMessage: string): void => {
     recordBattery("callbackAttempted");
-    if (disposed || isCheckingBattery) {
+    if (readInFlight) {
+      recordBattery("guardedSkipped");
+      // Coalesce eligible triggers into one fresh check once the current read settles.
+      if (currentAuthority() !== null) followUpRequested = true;
+      return;
+    }
+    if (currentAuthority() === null) {
       recordBattery("guardedSkipped");
       return;
     }
-    isCheckingBattery = true;
-    void checkBatteryAndStop()
+    readInFlight = true;
+    void readBatteryAndStop()
       .catch((err) => log.error(errorMessage, err))
       .finally(() => {
-        isCheckingBattery = false;
+        readInFlight = false;
+        // Only triggers observed during the read earn a follow-up; an unavailable or
+        // rejected reading alone never schedules another one.
+        if (followUpRequested) {
+          followUpRequested = false;
+          runGuardedBatteryCheck("[battery] Follow-up battery check error:");
+        }
       });
   };
 
@@ -185,14 +219,17 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
     if (disposed || unsubscribePowerSource !== null) return;
     unsubscribePowerSource = sensor.onPowerSourceChange({
       onBattery: () => {
+        invalidatePendingReads();
         runGuardedBatteryCheck("[battery] Battery check error:");
         startPeriodicBatteryChecks();
       },
       onAc: () => {
+        invalidatePendingReads();
         log.info("[battery] On AC power, battery monitoring reset");
         stopPeriodicBatteryChecks();
       },
       onResume: () => {
+        invalidatePendingReads();
         if (sensor.isOnBatteryPower()) {
           runGuardedBatteryCheck("[battery] Battery check error:");
         }
@@ -208,6 +245,8 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
   const cleanupBatteryMonitoring = (): void => {
     if (disposed) return;
     disposed = true;
+    invalidatePendingReads();
+    followUpRequested = false;
     stopPeriodicBatteryChecks();
     unsubscribePowerSource?.();
     unsubscribePowerSource = null;
@@ -216,9 +255,11 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
   /**
    * Bridge from composition: sleep-prevention state changed. Start the polling
    * loop when prevention turns on (and we're on battery); stop it when off.
+   * Either flip revokes readings started under the previous state.
    */
   const onPreventSleepChange = (active: boolean): void => {
     if (disposed) return;
+    invalidatePendingReads();
     if (active) {
       startPeriodicBatteryChecks();
     } else {
@@ -229,10 +270,11 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
   /**
    * Threshold (or other policy) changed — restart the polling loop from current
    * gates so enabling auto-disable while already preventing sleep on battery
-   * actually starts monitoring.
+   * actually starts monitoring. Readings started under the old threshold are revoked.
    */
   const reconfigure = (): void => {
     if (disposed) return;
+    invalidatePendingReads();
     stopPeriodicBatteryChecks();
     startPeriodicBatteryChecks();
     if (isThresholdEnabled(getThreshold()) && isPreventingSleep()) {
