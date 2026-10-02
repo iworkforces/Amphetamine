@@ -27,9 +27,9 @@ Semantic counters on `timerCounters.battery` (zeros outside benchmark mode):
 | Key | Meaning |
 |-----|---------|
 | `scheduled` | Periodic poll interval started |
-| `callbackAttempted` | Guard entry ran |
-| `guardedSkipped` | Early exit (threshold/AC/inactive/re-entry) |
-| `completedRead` | Charge-percent read attempted past gates |
+| `callbackAttempted` | Guard entry ran (a coalesced follow-up check is one more entry) |
+| `guardedSkipped` | Early exit (threshold/AC/inactive/disposed/re-entry while a read is in flight) |
+| `completedRead` | Charge-percent read attempted past gates (counted even when the result is revoked as stale) |
 
 Owned by `main/battery-monitor.ts` (`getBatteryBenchmarkCounters` / `resetBatteryBenchmarkCounters`).
 

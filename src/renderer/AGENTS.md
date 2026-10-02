@@ -69,6 +69,9 @@ Electron renderer web context. Vanilla TypeScript only. Four built entries (Rsbu
 - `#app` uses `overflow: hidden` (clips corona to the dialog surface). No focus outline on `#app` when info-only surfaces call `root.focus()`.
 - **Info-only** (single button, e.g. OK): hide the action row; dismiss via system Close / Esc / Enter → `cancelId`. Multi-button: secondary left / primary right; Esc → `cancelId`; Enter → `defaultId` when no button focused.
 - Private IPC (not in public `IPC_CHANNELS` budget): `get-payload` / `respond` / `set-height` / push `apply`.
+- Presentation lifetimes: only the newest live `presentationId` may build controls, respond, resize, or reveal. Older/equal ids (stale initial read, duplicate APPLY, retired) are ignored — no rebuild, refocus, re-measure, or re-armed response. Late `setHeight` / animation-frame / fallback-timer completions check liveness first.
+- Initial focus survives warm reopen: Chromium resets focus to the first tab stop / document when the shell is shown or activated (a `focusout` with no related target, or window `focus` alone). Until the user presses a key, points, or deliberately moves focus (assistive technology), the live presentation restores its default button (or `#app` for info-only) one task later.
+- Dispose (APPLY subscription, aurora pause binding, keydown/pointerdown/focus/focusout guards, pending frames/timers) on `pagehide` that is not persisted — never on warm hide. Bootstrap failure declines only the presentation live at that moment (`getPayload` → `respond(id, cancelId)`).
 - Always assign message/detail/button labels with `textContent` (never `innerHTML`).
 - Wire `bindIconAuroraStagePause(root)` at bootstrap start (before async payload).
 

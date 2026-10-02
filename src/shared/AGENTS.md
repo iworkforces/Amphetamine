@@ -7,7 +7,7 @@ Zero-runtime-dependency contracts shared by main, preload, renderer, scripts, an
 | File | Role |
 |------|------|
 | `types.ts` | `IPC_CHANNELS`, `PUSH_CHANNELS`, `IpcChannelMap`, session/updater/about wire DTOs; re-exports domain `AppSettings` / `DEFAULT_SETTINGS` / `PerfTimestamp` / `SleepBlockMode` / `asPerf` |
-| `utility-dialog.ts` | Private utility-dialog channel names + `UtilityDialogOptions` / payload / result types (not part of public `IPC_CHANNELS` budget) |
+| `utility-dialog.ts` | Private utility-dialog channel names + `UtilityDialogOptions` / payload (with main-owned `presentationId`) / `UtilityDialogApplyMessage` (present \| retire) / result types (not part of public `IPC_CHANNELS` budget) |
 | `settings-quit.ts` | Private correlated Settings drain request/ack contract (not part of public channel or push budgets) |
 | `settings-validators.ts` | Re-export of domain settings validation |
 | `benchmark-types.ts` | Benchmark env name, renderer counter types/defaults, runtime guard |
