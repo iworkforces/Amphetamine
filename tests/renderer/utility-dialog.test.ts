@@ -883,6 +883,119 @@ describe("renderer utility-dialog", () => {
       expect(mockRespond).not.toHaveBeenCalled();
     });
 
+    describe("initial focus after a warm reopen", () => {
+      /** Chromium on window show: clear focus (no related target), then the first tab stop. */
+      function resetFocusLikeWindowShow(firstTabStop?: HTMLElement): void {
+        (document.activeElement as HTMLElement | null)?.blur();
+        firstTabStop?.focus();
+      }
+
+      it("restores the default button after the show resets focus to the first tab stop", async () => {
+        mockGetPayload.mockResolvedValue(choicePayload);
+        await openDialog();
+        const [later, install] = actionButtons();
+        expect(document.activeElement).toBe(install);
+
+        resetFocusLikeWindowShow(later);
+        expect(document.activeElement).toBe(later);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(document.activeElement).toBe(install);
+
+        pressKey("Enter");
+        expect(mockRespond).not.toHaveBeenCalled();
+        install?.click();
+        expect(mockRespond).toHaveBeenCalledExactlyOnceWith(1, 1);
+      });
+
+      it("restores the default button when activation lands focus without a focusout", async () => {
+        mockGetPayload.mockResolvedValue(choicePayload);
+        await openDialog();
+        const [later, install] = actionButtons();
+        if (later === undefined || install === undefined) throw new Error("missing actions");
+        // Payload applied while the page was unfocused; activation then silently
+        // focused the first tab stop and fired only window focus + focusin.
+        vi.spyOn(document, "activeElement", "get").mockReturnValue(later);
+        const focusInstall = vi.spyOn(install, "focus");
+
+        window.dispatchEvent(new Event("focus"));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(focusInstall).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
+      });
+
+      it("leaves an already focused target alone when the window is re-activated", async () => {
+        mockGetPayload.mockResolvedValue(choicePayload);
+        await openDialog();
+        const install = actionButtons()[1];
+        if (install === undefined) throw new Error("missing default action");
+        const focusInstall = vi.spyOn(install, "focus");
+
+        window.dispatchEvent(new Event("blur"));
+        window.dispatchEvent(new Event("focus"));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(focusInstall).not.toHaveBeenCalled();
+        expect(document.activeElement).toBe(install);
+      });
+
+      it("keeps a deliberate focus move such as assistive-technology navigation", async () => {
+        mockGetPayload.mockResolvedValue(choicePayload);
+        await openDialog();
+        const [later] = actionButtons();
+
+        later?.focus();
+        resetFocusLikeWindowShow();
+        window.dispatchEvent(new Event("focus"));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(document.activeElement).toBe(document.body);
+      });
+
+      it("restores the dialog surface for an info-only alert left on the document", async () => {
+        await openDialog();
+        const root = requireRoot();
+
+        resetFocusLikeWindowShow();
+        expect(document.activeElement).toBe(document.body);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(document.activeElement).toBe(root);
+      });
+
+      it.each(["key", "pointer"])("leaves focus to the user after %s input", async (input) => {
+        mockGetPayload.mockResolvedValue(choicePayload);
+        await openDialog();
+        const [later] = actionButtons();
+
+        if (input === "key") {
+          expect(pressKey("Tab").defaultPrevented).toBe(false);
+        } else {
+          window.dispatchEvent(new Event("pointerdown"));
+        }
+        resetFocusLikeWindowShow(later);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(document.activeElement).toBe(later);
+      });
+
+      it("never moves focus for a retired presentation or after unload", async () => {
+        mockGetPayload.mockResolvedValue(choicePayload);
+        await openDialog();
+
+        resetFocusLikeWindowShow();
+        retire(1);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(document.activeElement).toBe(document.body);
+
+        present({ ...choicePayload, presentationId: 2 });
+        const install = actionButtons()[1];
+        expect(document.activeElement).toBe(install);
+        resetFocusLikeWindowShow();
+        window.dispatchEvent(
+          new nativeWindow.PageTransitionEvent("pagehide", { persisted: false }),
+        );
+        install?.focus();
+        resetFocusLikeWindowShow();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(document.activeElement).toBe(document.body);
+      });
+    });
+
     it("drops a payload read and height reply that settle after unload", async () => {
       vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(280);
       const initialRead = Promise.withResolvers<UtilityDialogPayload>();

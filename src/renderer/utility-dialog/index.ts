@@ -8,6 +8,11 @@
  * controls, respond, resize, or reveal. Stale payload reads, duplicate APPLY
  * deliveries, and late height / animation completions are ignored. Listeners and
  * scheduled work are disposed on actual unload (pagehide), never on warm hide.
+ *
+ * Initial focus: when a warm window is shown or activated again, Chromium resets
+ * focus to the first tab stop (or the document). Until the user types, clicks, or
+ * moves focus (e.g. assistive technology), the live presentation restores focus to
+ * its own default target after such a reset.
  */
 import "./styles.css";
 import type {
@@ -40,6 +45,10 @@ interface LivePresentation {
   readonly cancelId: number;
   readonly showActionButtons: boolean;
   responded: boolean;
+  /** Default button, or the dialog surface for info-only alerts. */
+  focusTarget: HTMLElement;
+  /** Set on the first key/pointer input or deliberate focus move; focus is the user's then. */
+  focusSettled: boolean;
 }
 
 function requireEl<T extends HTMLElement>(id: string): T {
@@ -134,6 +143,17 @@ function bootstrap(): void {
 
   const isLive = (presentation: LivePresentation): boolean => !disposed && live === presentation;
 
+  /** True while this page moves focus itself, so the focus guard ignores the change. */
+  let movingFocus = false;
+  const focusPresentationTarget = (presentation: LivePresentation): void => {
+    movingFocus = true;
+    try {
+      presentation.focusTarget.focus({ preventScroll: true });
+    } finally {
+      movingFocus = false;
+    }
+  };
+
   const respond = (presentation: LivePresentation, index: number): void => {
     if (!isLive(presentation) || presentation.responded) return;
     presentation.responded = true;
@@ -213,6 +233,8 @@ function bootstrap(): void {
       cancelId: clampIndex(payload.cancelId, buttons.length, 0),
       showActionButtons: buttons.length > 1,
       responded: false,
+      focusTarget: root,
+      focusSettled: false,
     };
     live = presentation;
 
@@ -233,9 +255,9 @@ function bootstrap(): void {
         });
         actionsEl.appendChild(btn);
       });
-      const focusTarget = actionsEl.children[presentation.defaultId] ?? actionsEl.children[0];
-      if (focusTarget instanceof HTMLButtonElement) {
-        focusTarget.focus();
+      const defaultButton = actionsEl.children[presentation.defaultId] ?? actionsEl.children[0];
+      if (defaultButton instanceof HTMLButtonElement) {
+        presentation.focusTarget = defaultButton;
       }
     } else {
       actionsEl.hidden = true;
@@ -244,8 +266,8 @@ function bootstrap(): void {
       if (!root.hasAttribute("tabindex")) {
         root.tabIndex = -1;
       }
-      root.focus({ preventScroll: true });
     }
+    focusPresentationTarget(presentation);
 
     // Hold invisible, shrink-wrap, then fade in. Racing fade/bloom with setHeight
     // on first open let aurora filter/blend fringe paint a warm edge outside the
@@ -276,9 +298,45 @@ function bootstrap(): void {
     }
   };
 
+  /**
+   * Window show / activation resets focus to the first tab stop or the document.
+   * Before the user settles focus, put it back on the live presentation's target
+   * once that reset has run (a deactivating window keeps its active element, so the
+   * restore is then a no-op).
+   */
+  const scheduleFocusRestore = (): void => {
+    const presentation = live;
+    if (presentation === null || presentation.focusSettled) return;
+    scheduler.timeout(() => {
+      if (
+        isLive(presentation) &&
+        !presentation.focusSettled &&
+        document.activeElement !== presentation.focusTarget
+      ) {
+        focusPresentationTarget(presentation);
+      }
+    }, 0);
+  };
+
+  const onFocusOut = (e: FocusEvent): void => {
+    if (movingFocus || live === null) return;
+    if (e.relatedTarget === null) {
+      // Focus cleared without a destination: the window show reset.
+      scheduleFocusRestore();
+      return;
+    }
+    // A deliberate move to another element (assistive technology, script) is kept.
+    live.focusSettled = true;
+  };
+
+  const onPointerDown = (): void => {
+    if (live !== null) live.focusSettled = true;
+  };
+
   const onKeyDown = (e: KeyboardEvent): void => {
     const presentation = live;
     if (presentation === null) return;
+    presentation.focusSettled = true;
     if (e.key === "Escape") {
       e.preventDefault();
       respond(presentation, presentation.cancelId);
@@ -307,6 +365,9 @@ function bootstrap(): void {
     unsubscribeApply();
     unbindAuroraPause();
     window.removeEventListener("keydown", onKeyDown);
+    window.removeEventListener("pointerdown", onPointerDown, true);
+    window.removeEventListener("focus", scheduleFocusRestore);
+    document.removeEventListener("focusout", onFocusOut, true);
     window.removeEventListener("pagehide", onPageHide);
     scheduler.cancelAll();
   };
@@ -319,6 +380,10 @@ function bootstrap(): void {
 
   window.addEventListener("pagehide", onPageHide);
   window.addEventListener("keydown", onKeyDown);
+  window.addEventListener("pointerdown", onPointerDown, true);
+  // Activation can land focus on the first tab stop without any focusout.
+  window.addEventListener("focus", scheduleFocusRestore);
+  document.addEventListener("focusout", onFocusOut, true);
   // Warm-cache re-present / retirement: main pushes without reloading.
   unsubscribeApply = api.onApply(onApply);
 
