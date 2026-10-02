@@ -1,7 +1,6 @@
 import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { EventEmitter } from "node:events";
 import { DEFAULT_SETTINGS } from "../../domain/settings/app-settings.js";
 import type { AppSettings } from "../../domain/settings/app-settings.js";
 import {
@@ -11,10 +10,6 @@ import {
 import type { SettingsStorePort } from "../../application/ports/settings-store.port.js";
 import type { SettingsSaveFailurePort } from "../../application/ports/settings-save-failure.port.js";
 import type { LoggerPort } from "../../application/ports/logger.port.js";
-
-type SettingsEvents = {
-  change: [AppSettings];
-};
 
 export interface FileSettingsStoreDeps {
   getUserDataPath: () => string;
@@ -31,12 +26,27 @@ const MAX_CONSECUTIVE_SAVE_FAILURES = 3;
 
 type UpdateResult = { settings: AppSettings; rejectedKeys: string[] };
 
+type ChangeListener = (settings: AppSettings) => void;
+
+/** One `onChange` registration. Object identity keeps each unsubscribe scoped to its own call. */
+type Subscription = { listener: ChangeListener };
+
 type PendingCaller = {
+  /** Store-owned copy taken when `update()` accepted the patch. */
   partial: Partial<AppSettings>;
   rejectedKeys: string[];
   resolve: (result: UpdateResult) => void;
   reject: (err: unknown) => void;
 };
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "then" in value &&
+    typeof value.then === "function"
+  );
+}
 
 /**
  * JSON file settings store: atomic write, coalesced write batching, corrupt backup, onChange.
@@ -45,10 +55,17 @@ type PendingCaller = {
  * Coalescing model: at most one physical write in flight and one merged pending
  * batch of callers. Different-field updates merge; each caller keeps its own
  * rejectedKeys; successful batch emits one change with the final snapshot.
+ *
+ * Commit isolation: `update()` copies each patch on acceptance, and every
+ * subscriber and caller receives its own snapshot, so no recipient can alias the
+ * cache, queued work, or another recipient. Once the rename lands the batch is
+ * committed: subscriber exceptions are logged and never reject callers or count
+ * toward the save-failure threshold.
  */
 export function createFileSettingsStore(deps: FileSettingsStoreDeps): FileSettingsStore {
   const { getUserDataPath, onSaveFailure, logger } = deps;
-  const settingsEmitter = new EventEmitter<SettingsEvents>();
+  /** Registration order. Replaced (never mutated) so a commit delivers to the list it started with. */
+  let subscriptions: readonly Subscription[] = [];
 
   let initialized = false;
   let settingsCache: AppSettings = { ...DEFAULT_SETTINGS };
@@ -78,13 +95,16 @@ export function createFileSettingsStore(deps: FileSettingsStoreDeps): FileSettin
     await rename(tmpPath, settingsPath);
   };
 
+  /** Detached copy of the cache; every recipient gets its own. */
+  const snapshot = (): AppSettings => ({ ...settingsCache });
+
   const get = (): AppSettings => {
     if (!initialized) {
       throw new Error(
         "[settings] getSettings() called before initSettings(). Ensure initSettings() is awaited first.",
       );
     }
-    return { ...settingsCache };
+    return snapshot();
   };
 
   const markBusy = (): void => {
@@ -158,39 +178,63 @@ export function createFileSettingsStore(deps: FileSettingsStoreDeps): FileSettin
     return working;
   };
 
+  const differsFromCache = (next: AppSettings): boolean =>
+    (Object.keys(next) as (keyof AppSettings)[]).some((key) => next[key] !== settingsCache[key]);
+
+  const reportSubscriberError = (err: unknown): void => {
+    logger.error("[settings] Change subscriber threw:", err);
+  };
+
+  /** Deliver the committed cache to each registered subscriber, isolating failures. */
+  const publishCommitted = (): void => {
+    for (const { listener } of subscriptions) {
+      try {
+        const result: unknown = listener(snapshot());
+        if (isPromiseLike(result)) {
+          result.then(undefined, reportSubscriberError);
+        }
+      } catch (err) {
+        reportSubscriberError(err);
+      }
+    }
+  };
+
+  const resolveCallers = (callers: readonly PendingCaller[]): void => {
+    for (const caller of callers) {
+      caller.resolve({ settings: snapshot(), rejectedKeys: caller.rejectedKeys });
+    }
+  };
+
   const runPhysicalBatch = async (callers: PendingCaller[]): Promise<void> => {
     activeCallers = callers;
     try {
       const merged = mergeCallersOnto(settingsCache, callers);
-      const changed = (Object.keys(merged) as (keyof AppSettings)[]).some(
-        (key) => merged[key] !== settingsCache[key],
-      );
-      if (!changed) {
-        const snapshot = get();
+      if (!differsFromCache(merged)) {
+        resolveCallers(callers);
+        return;
+      }
+
+      try {
+        await save(merged);
+      } catch (err) {
+        // Physical write/rename failure: cache and subscribers stay untouched.
         for (const caller of callers) {
-          caller.resolve({ settings: snapshot, rejectedKeys: caller.rejectedKeys });
+          caller.reject(err);
+        }
+        consecutiveSaveFailures++;
+        logger.error("[settings] Failed to save settings:", err);
+        if (consecutiveSaveFailures >= MAX_CONSECUTIVE_SAVE_FAILURES) {
+          onSaveFailure.notifyPersistenceBroken();
         }
         return;
       }
 
-      await save(merged);
+      // Rename landed: the batch is committed and nothing below can fail it.
       consecutiveSaveFailures = 0;
-      // Cache + emit only after successful rename (atomic write).
-      settingsCache = { ...merged };
-      const snapshot = get();
-      settingsEmitter.emit("change", snapshot);
-      for (const caller of callers) {
-        caller.resolve({ settings: snapshot, rejectedKeys: caller.rejectedKeys });
-      }
-    } catch (err) {
-      consecutiveSaveFailures++;
-      logger.error("[settings] Failed to save settings:", err);
-      if (consecutiveSaveFailures >= MAX_CONSECUTIVE_SAVE_FAILURES) {
-        onSaveFailure.notifyPersistenceBroken();
-      }
-      for (const caller of callers) {
-        caller.reject(err);
-      }
+      // `merged` is a fresh object from validation and is never handed out.
+      settingsCache = merged;
+      publishCommitted();
+      resolveCallers(callers);
     } finally {
       activeCallers = null;
     }
@@ -225,23 +269,32 @@ export function createFileSettingsStore(deps: FileSettingsStoreDeps): FileSettin
   const update = async (
     partial: Partial<AppSettings>,
   ): Promise<{ settings: AppSettings; rejectedKeys: string[] }> => {
+    if (!initialized) {
+      // Writing before the disk file is loaded would replace it with defaults.
+      throw new Error(
+        "[settings] updateSettings() called before initSettings(). Ensure initSettings() is awaited first.",
+      );
+    }
+    // Own the patch from acceptance on; later caller mutation cannot reach queued work.
+    const accepted: Partial<AppSettings> = { ...partial };
     // rejectedKeys for this caller from validation against current cache (+ in-flight/pending).
     const baseForValidation = mergeCallersOnto(settingsCache, [
       ...(activeCallers ?? []),
       ...pendingCallers,
     ]);
-    const { rejectedKeys } = mergeValidatedPartial(baseForValidation, partial);
+    const { rejectedKeys } = mergeValidatedPartial(baseForValidation, accepted);
 
     return new Promise<UpdateResult>((resolve, reject) => {
-      pendingCallers.push({ partial, rejectedKeys, resolve, reject });
+      pendingCallers.push({ partial: accepted, rejectedKeys, resolve, reject });
       scheduleDrain();
     });
   };
 
-  const onChange = (cb: (settings: AppSettings) => void): (() => void) => {
-    settingsEmitter.on("change", cb);
+  const onChange = (cb: ChangeListener): (() => void) => {
+    const subscription: Subscription = { listener: cb };
+    subscriptions = [...subscriptions, subscription];
     return () => {
-      settingsEmitter.off("change", cb);
+      subscriptions = subscriptions.filter((entry) => entry !== subscription);
     };
   };
 

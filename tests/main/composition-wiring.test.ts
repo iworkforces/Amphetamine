@@ -1,4 +1,9 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createFileSettingsStore } from "../../src/infrastructure/settings/file-settings-store.js";
+import { DEFAULT_SETTINGS, type AppSettings } from "../../src/shared/types.js";
 
 // Helper: extracts the first argument of the first call of a hoisted mock with
 // type assertion. vi.hoisted(() => vi.fn(() => ...)) infers an empty-args
@@ -177,6 +182,11 @@ describe("composition wiring", () => {
   let composition: {
     init: () => Promise<void>;
     cleanup: () => void;
+    getIpcDeps: () => {
+      updateSettings: (
+        partial: Partial<AppSettings>,
+      ) => Promise<{ settings: AppSettings; rejectedKeys: string[] }>;
+    };
     getTrayDeps: () => {
       getEffectiveActive: () => boolean;
       onActiveStateChanged: (cb: () => void) => () => void;
@@ -838,6 +848,116 @@ describe("composition wiring", () => {
       });
 
       expect(mockSyncPreventSleep).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("production wiring over the real settings store", () => {
+    const storeDirs: string[] = [];
+
+    afterEach(() => {
+      cleanupComposition();
+      for (const dir of storeDirs.splice(0)) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    /**
+     * Isolated file store over a fresh temp directory (never real user settings),
+     * routed through the mocked settings façade that composition imports.
+     */
+    async function useRealSettingsStore(initial?: Partial<AppSettings>) {
+      const dir = mkdtempSync(join(tmpdir(), "amphetamine-wiring-"));
+      storeDirs.push(dir);
+      const settingsFile = join(dir, "settings.json");
+      if (initial !== undefined) {
+        writeFileSync(settingsFile, JSON.stringify(initial));
+      }
+      const storeLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+      const notifyPersistenceBroken = vi.fn();
+      const store = createFileSettingsStore({
+        getUserDataPath: () => dir,
+        onSaveFailure: { notifyPersistenceBroken },
+        logger: storeLogger,
+      });
+      await store.init();
+      mockGetSettings.mockImplementation(() => store.get());
+      mockUpdateSettings.mockImplementation((partial: Partial<AppSettings>) =>
+        store.update(partial),
+      );
+      mockOnSettingsChanged.mockImplementation((cb: (settings: AppSettings) => void) =>
+        store.onChange(cb),
+      );
+      // Stateful blocker so recompute reports real effective-active flips.
+      let blockerActive = false;
+      mockSyncPreventSleep.mockImplementation((active: boolean) => {
+        blockerActive = active;
+      });
+      mockIsPreventingSleep.mockImplementation(() => blockerActive);
+      return {
+        store,
+        storeLogger,
+        notifyPersistenceBroken,
+        readDisk: () => JSON.parse(readFileSync(settingsFile, "utf-8")) as unknown,
+      };
+    }
+
+    function requireComposition() {
+      if (composition === null) throw new Error("composition not initialized");
+      return composition;
+    }
+
+    it("delivers committed settings to reactions, tray refresh and renderer pushes past a failing integration", async () => {
+      const real = await useRealSettingsStore();
+      const mockSend = vi.fn();
+      mockGetAllWindows.mockReturnValue([
+        { isDestroyed: () => false, webContents: { send: mockSend } },
+      ]);
+      const integrationError = new Error("status integration crashed");
+      const integrationSeen: AppSettings[] = [];
+      // Registered ahead of composition: mutates its own copy, then throws.
+      real.store.onChange((settings) => {
+        integrationSeen.push({ ...settings });
+        settings.preventSleep = false;
+        settings.batteryThreshold = 99;
+        throw integrationError;
+      });
+      await initComposition();
+      const trayRefresh = vi.fn();
+      requireTrayDeps().onSettingsChanged?.(trayRefresh);
+      const activeListener = vi.fn();
+      requireTrayDeps().onActiveStateChanged(activeListener);
+      mockSyncPreventSleep.mockClear();
+      mockBatteryReconfigure.mockClear();
+
+      const result = await requireComposition()
+        .getIpcDeps()
+        .updateSettings({ preventSleep: true, batteryThreshold: 20 });
+
+      const committed = { ...DEFAULT_SETTINGS, preventSleep: true, batteryThreshold: 20 };
+      expect(result).toEqual({ settings: committed, rejectedKeys: [] });
+      expect(integrationSeen).toEqual([committed]);
+      expect(mockSyncPreventSleep).toHaveBeenCalledWith(true, "prevent-display-sleep");
+      expect(mockBatteryReconfigure).toHaveBeenCalledOnce();
+      expect(mockSend).toHaveBeenCalledExactlyOnceWith("settings:changed", committed);
+      expect(trayRefresh).toHaveBeenCalledOnce();
+      expect(activeListener).toHaveBeenCalledOnce();
+      expect(requireTrayDeps().getEffectiveActive()).toBe(true);
+      expect(real.storeLogger.error).toHaveBeenCalledExactlyOnceWith(
+        "[settings] Change subscriber threw:",
+        integrationError,
+      );
+      expect(real.notifyPersistenceBroken).not.toHaveBeenCalled();
+      expect(real.store.get()).toEqual(committed);
+      expect(real.readDisk()).toEqual(committed);
+
+      // A non-renderer-visible change still reacts and refreshes the tray, without a push.
+      await requireComposition().getIpcDeps().updateSettings({ launchAtLogin: true });
+      expect(mockSyncAutoLaunch).toHaveBeenLastCalledWith(true);
+      expect(trayRefresh).toHaveBeenCalledTimes(2);
+      expect(mockSend).toHaveBeenCalledOnce();
+      expect(real.storeLogger.error).toHaveBeenCalledTimes(2);
+      expect(real.notifyPersistenceBroken).not.toHaveBeenCalled();
+      await real.store.flush();
     });
   });
 
