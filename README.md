@@ -34,7 +34,7 @@ _Configure launch-at-login, sleep prevention, sleep block mode, session duration
 |----------|----------|
 | macOS | 11+ (Apple Silicon arm64 or Intel x64) |
 | Windows | 10/11 (**x64 and arm64** native packaging) |
-| Tooling | Bun ≥ 1.4.2 (recommended) or Node.js `>=26 <27` |
+| Tooling | Bun ≥ 1.4.3 (recommended) or Node.js `>=26 <27` |
 
 Linux is out of scope.
 
@@ -237,7 +237,7 @@ Dependency rule: **domain** and **application** must not import `electron` or pr
 | Language | TypeScript `^6.0.3` (strict sticky flags; ESM source → CJS main/preload) |
 | Architecture | Clean Architecture Lite (`domain` → `application` → `infrastructure` / presentation) |
 | Build | Rslib (main + preload), Rsbuild (renderer); parallel production via `scripts/build-production.ts` |
-| Package manager | Bun 1.4.2 (`engines`: Bun ≥ 1.3.14, Node `>=26 <27`) |
+| Package manager | Bun 1.4.3 (`engines`: Bun ≥ 1.3.14, Node `>=26 <27`) |
 | Test | Vitest `^4.1.10` workspace — **56** files, **640** tests |
 | Lint / format | ESLint 10 flat + Prettier 3 |
 | UI | Vanilla TypeScript (no UI framework) |
