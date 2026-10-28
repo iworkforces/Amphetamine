@@ -376,6 +376,7 @@ describe("settings", () => {
           "launchAtLogin",
           "preventSleep",
           "defaultSessionDuration",
+          "quickSessionDurations",
           "batteryThreshold",
           "shortcut",
           "sleepBlockMode",
@@ -640,6 +641,76 @@ describe("settings", () => {
   });
 
   describe("commit isolation (isolated store driver)", () => {
+    it("loads legacy presets and isolates defaults and getters", async () => {
+      const driver = await createStoreDriver({ sessionDuration: 45 });
+      const first = driver.store.get();
+      expect(first.quickSessionDurations).toEqual([15, 30, 60, 120]);
+      if (Array.isArray(first.quickSessionDurations)) first.quickSessionDurations.push(5);
+      expect(driver.store.get().quickSessionDurations).toEqual([15, 30, 60, 120]);
+      expect(DEFAULT_SETTINGS.quickSessionDurations).toEqual([15, 30, 60, 120]);
+    });
+
+    it("owns queued preset patches and isolates subscribers and callers", async () => {
+      const driver = await createStoreDriver();
+      const observed: (readonly number[])[] = [];
+      driver.store.onChange((settings) => {
+        if (Array.isArray(settings.quickSessionDurations)) settings.quickSessionDurations.push(99);
+      });
+      driver.store.onChange((settings) => observed.push(settings.quickSessionDurations));
+      const hold = holdNextWrite();
+      const active = driver.store.update({ preventSleep: true });
+      await hold.started;
+      const durations = [5, 90];
+      const first = driver.store.update({ quickSessionDurations: durations });
+      const second = driver.store.update({ launchAtLogin: true });
+      durations.push(200);
+      hold.release();
+      const [, firstResult, secondResult] = await Promise.all([active, first, second]);
+      if (Array.isArray(firstResult.settings.quickSessionDurations)) {
+        firstResult.settings.quickSessionDurations.push(300);
+      }
+      expect(secondResult.settings.quickSessionDurations).toEqual([5, 90]);
+      expect(observed).toEqual([[15, 30, 60, 120], [5, 90]]);
+      expect(driver.store.get().quickSessionDurations).toEqual([5, 90]);
+      expect((await driver.reopen()).get().quickSessionDurations).toEqual([5, 90]);
+    });
+
+    it("skips equal presets and writes reordered presets", async () => {
+      const driver = await createStoreDriver({ quickSessionDurations: [5, 90] });
+      const listener = vi.fn();
+      driver.store.onChange(listener);
+      const noChange = await driver.store.update({ quickSessionDurations: [5, 90] });
+      if (Array.isArray(noChange.settings.quickSessionDurations)) noChange.settings.quickSessionDurations.push(8);
+      expect(driver.store.get().quickSessionDurations).toEqual([5, 90]);
+      expect(await settingsWriteCount(driver.dir)).toBe(0);
+      expect(listener).not.toHaveBeenCalled();
+      await driver.store.update({ quickSessionDurations: [90, 5] });
+      expect(await settingsWriteCount(driver.dir)).toBe(1);
+      expect(listener).toHaveBeenCalledOnce();
+      expect((await driver.reopen()).get().quickSessionDurations).toEqual([90, 5]);
+    });
+
+    it("rejects a bad preset list without losing valid sibling changes", async () => {
+      const driver = await createStoreDriver({ quickSessionDurations: [5, 90] });
+      const result = await driver.store.update({
+        quickSessionDurations: [30, 30],
+        batteryThreshold: 20,
+      });
+      expect(result.rejectedKeys).toEqual(["quickSessionDurations"]);
+      expect(result.settings.quickSessionDurations).toEqual([5, 90]);
+      expect((await driver.reopen()).get().batteryThreshold).toBe(20);
+    });
+
+    it("keeps committed presets when a write fails and accepts a later retry", async () => {
+      const driver = await createStoreDriver({ quickSessionDurations: [5, 90] });
+      fsMockState.failNextRename = true;
+      await expect(driver.store.update({ quickSessionDurations: [90, 5] })).rejects.toBe(
+        fsMockState.renameError,
+      );
+      expect(driver.store.get().quickSessionDurations).toEqual([5, 90]);
+      await driver.store.update({ quickSessionDurations: [90, 5] });
+      expect((await driver.reopen()).get().quickSessionDurations).toEqual([90, 5]);
+    });
     it("rejects updates before init without writing or counting a save failure", async () => {
       const dir = mkdtempSync(join(tmpdir(), "amphetamine-settings-driver-"));
       driverDirs.push(dir);
@@ -796,6 +867,9 @@ describe("settings", () => {
       const [, firstResult, secondResult] = await Promise.all([active, first, second]);
       firstResult.settings.launchAtLogin = false;
       firstResult.settings.shortcut = "Mutated";
+      if (Array.isArray(firstResult.settings.quickSessionDurations)) {
+        firstResult.settings.quickSessionDurations.push(8);
+      }
 
       const expected = { ...DEFAULT_SETTINGS, launchAtLogin: true, preventSleep: true };
       expect(secondResult).toEqual({ settings: expected, rejectedKeys: ["batteryThreshold"] });

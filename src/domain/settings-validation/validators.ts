@@ -1,6 +1,7 @@
-import { DEFAULT_SETTINGS } from "../settings/app-settings.js";
+import { cloneAppSettings, DEFAULT_SETTINGS } from "../settings/app-settings.js";
 import type { AppSettings } from "../settings/app-settings.js";
 import type { SleepBlockMode } from "../settings/sleep-block-mode.js";
+import { MAX_SESSION_DURATION_MINUTES } from "../session/duration.js";
 
 export const isBoolean = (v: unknown): v is boolean => typeof v === "boolean";
 
@@ -14,6 +15,19 @@ export const isNonEmptyString = (v: unknown): v is string => typeof v === "strin
 
 export const isSleepBlockMode = (v: unknown): v is SleepBlockMode =>
   v === "prevent-display-sleep" || v === "prevent-app-suspension";
+
+export const isQuickSessionDurations = (value: unknown): value is readonly number[] =>
+  Array.isArray(value) &&
+  value.length >= 1 &&
+  value.length <= 6 &&
+  new Set(value).size === value.length &&
+  Array.from(value, (duration: unknown) => duration).every(
+    (duration: unknown) =>
+      typeof duration === "number" &&
+      Number.isInteger(duration) &&
+      duration >= 1 &&
+      duration <= MAX_SESSION_DURATION_MINUTES,
+  );
 
 const ACCELERATOR_MODIFIERS = [
   "Cmd",
@@ -155,6 +169,7 @@ export const VALIDATORS: { [K in keyof AppSettings]: SettingsValidator<K> } = {
     if (v === null) return null;
     return isPositiveNumber(v) ? v : f;
   },
+  quickSessionDurations: (v, f) => (isQuickSessionDurations(v) ? [...v] : [...f]),
   batteryThreshold: (v, f) => (isClamped0to100(v) ? v : f),
   shortcut: (v, f) => {
     if (!isValidShortcutSetting(v)) return f;
@@ -216,7 +231,7 @@ export function mergeValidatedPartial(
   base: AppSettings,
   partial: Partial<AppSettings>,
 ): { merged: AppSettings; rejectedKeys: string[] } {
-  const merged: AppSettings = { ...base };
+  const merged: AppSettings = cloneAppSettings(base);
   const rejectedKeys: string[] = [];
   for (const key of Object.keys(partial) as (keyof AppSettings)[]) {
     if (!(key in VALIDATORS)) {
@@ -231,6 +246,8 @@ export function mergeValidatedPartial(
       if (!isValidShortcutSetting(incoming)) {
         rejectedKeys.push(key);
       }
+    } else if (key === "quickSessionDurations") {
+      if (!isQuickSessionDurations(incoming)) rejectedKeys.push(key);
     } else if (validated !== incoming) {
       rejectedKeys.push(key);
     }

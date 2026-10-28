@@ -1,7 +1,7 @@
 import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { DEFAULT_SETTINGS } from "../../domain/settings/app-settings.js";
+import { cloneAppSettings, DEFAULT_SETTINGS, settingsFieldEqual } from "../../domain/settings/app-settings.js";
 import type { AppSettings } from "../../domain/settings/app-settings.js";
 import {
   mergeValidatedPartial,
@@ -68,7 +68,7 @@ export function createFileSettingsStore(deps: FileSettingsStoreDeps): FileSettin
   let subscriptions: readonly Subscription[] = [];
 
   let initialized = false;
-  let settingsCache: AppSettings = { ...DEFAULT_SETTINGS };
+  let settingsCache: AppSettings = cloneAppSettings(DEFAULT_SETTINGS);
   /** Resolves when the active write (and chained pending drain) is idle. */
   let writeIdle: Promise<void> = Promise.resolve();
   let writeIdleResolve: (() => void) | null = null;
@@ -87,16 +87,16 @@ export function createFileSettingsStore(deps: FileSettingsStoreDeps): FileSettin
   };
 
   const save = async (settings: AppSettings): Promise<void> => {
+    const raw = JSON.stringify(settings, null, 2);
     await ensureUserDataDir();
     const settingsPath = getSettingsPath();
     const tmpPath = settingsPath + `.tmp-${randomUUID()}`;
-    const raw = JSON.stringify(settings, null, 2);
     await writeFile(tmpPath, raw, { encoding: "utf-8", mode: 0o600 });
     await rename(tmpPath, settingsPath);
   };
 
   /** Detached copy of the cache; every recipient gets its own. */
-  const snapshot = (): AppSettings => ({ ...settingsCache });
+  const snapshot = (): AppSettings => cloneAppSettings(settingsCache);
 
   const get = (): AppSettings => {
     if (!initialized) {
@@ -130,12 +130,12 @@ export function createFileSettingsStore(deps: FileSettingsStoreDeps): FileSettin
     } catch (err) {
       const code = (err as { code?: string }).code;
       if (code === "ENOENT") {
-        settingsCache = { ...DEFAULT_SETTINGS };
+        settingsCache = cloneAppSettings(DEFAULT_SETTINGS);
         initialized = true;
         return;
       }
       logger.error("[settings] Failed to read settings file:", err);
-      settingsCache = { ...DEFAULT_SETTINGS };
+      settingsCache = cloneAppSettings(DEFAULT_SETTINGS);
       initialized = true;
       return;
     }
@@ -156,7 +156,7 @@ export function createFileSettingsStore(deps: FileSettingsStoreDeps): FileSettin
       } catch (backupErr) {
         logger.error("[settings] Failed to back up corrupted settings file:", backupErr);
       }
-      settingsCache = { ...DEFAULT_SETTINGS };
+      settingsCache = cloneAppSettings(DEFAULT_SETTINGS);
     }
 
     initialized = true;
@@ -179,7 +179,7 @@ export function createFileSettingsStore(deps: FileSettingsStoreDeps): FileSettin
   };
 
   const differsFromCache = (next: AppSettings): boolean =>
-    (Object.keys(next) as (keyof AppSettings)[]).some((key) => next[key] !== settingsCache[key]);
+    (Object.keys(next) as (keyof AppSettings)[]).some((key) => !settingsFieldEqual(next, settingsCache, key));
 
   const reportSubscriberError = (err: unknown): void => {
     logger.error("[settings] Change subscriber threw:", err);
@@ -277,6 +277,9 @@ export function createFileSettingsStore(deps: FileSettingsStoreDeps): FileSettin
     }
     // Own the patch from acceptance on; later caller mutation cannot reach queued work.
     const accepted: Partial<AppSettings> = { ...partial };
+    if (Array.isArray(partial.quickSessionDurations)) {
+      accepted.quickSessionDurations = partial.quickSessionDurations.slice();
+    }
     // rejectedKeys for this caller from validation against current cache (+ in-flight/pending).
     const baseForValidation = mergeCallersOnto(settingsCache, [
       ...(activeCallers ?? []),

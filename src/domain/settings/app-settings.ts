@@ -11,6 +11,7 @@ export interface AppSettings {
    * Preference only — runtime session state lives in the session timer, not settings.
    */
   defaultSessionDuration: number | null;
+  quickSessionDurations: readonly number[];
   /** Battery threshold (0-100) — auto-stop sleep prevention when on battery below threshold. 0 = disabled */
   batteryThreshold: number;
   /**
@@ -30,7 +31,24 @@ export const DEFAULT_SETTINGS: Readonly<AppSettings> = {
   launchAtLogin: false,
   preventSleep: false,
   defaultSessionDuration: null,
+  quickSessionDurations: Object.freeze([15, 30, 60, 120]),
   batteryThreshold: 0,
   shortcut: "",
   sleepBlockMode: "prevent-display-sleep",
 };
+
+export function cloneAppSettings(settings: AppSettings): AppSettings {
+  return { ...settings, quickSessionDurations: [...settings.quickSessionDurations] };
+}
+
+export function settingsFieldEqual(
+  first: AppSettings,
+  second: AppSettings,
+  key: keyof AppSettings,
+): boolean {
+  if (key !== "quickSessionDurations") return first[key] === second[key];
+  return (
+    first.quickSessionDurations.length === second.quickSessionDurations.length &&
+    first.quickSessionDurations.every((value, index) => value === second.quickSessionDurations[index])
+  );
+}

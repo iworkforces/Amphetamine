@@ -1,4 +1,5 @@
 import type { AppSettings } from "../../domain/settings/app-settings.js";
+import { settingsFieldEqual } from "../../domain/settings/app-settings.js";
 import type { AutoLaunchPort } from "../ports/auto-launch.port.js";
 import type { MainToRendererNotifierPort } from "../ports/main-to-renderer-notifier.port.js";
 import type { LoggerPort } from "../ports/logger.port.js";
@@ -8,6 +9,7 @@ export const RENDERER_VISIBLE_SETTINGS_KEYS: readonly (keyof AppSettings)[] = [
   "preventSleep",
   "batteryThreshold",
   "shortcut",
+  "quickSessionDurations",
 ] as const;
 
 export type SettingsReactionHandler = (
@@ -47,7 +49,7 @@ export function createSettingsReactionService(
         const keys = Object.keys(settings) as (keyof AppSettings)[];
         let changed = false;
         for (const key of keys) {
-          if (settings[key] !== prevSettings[key]) {
+          if (!settingsFieldEqual(settings, prevSettings, key)) {
             changed = true;
             break;
           }
@@ -82,7 +84,7 @@ export function createSettingsReactionService(
       const hasRendererChange =
         prevSettings === null ||
         RENDERER_VISIBLE_SETTINGS_KEYS.some(
-          (k) => settings[k] !== prevSettings[k],
+          (k) => !settingsFieldEqual(settings, prevSettings, k),
         );
       if (hasRendererChange) {
         deps.notifier.publish({ type: "settings-changed", settings });
