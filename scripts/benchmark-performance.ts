@@ -1,13 +1,15 @@
 #!/usr/bin/env bun
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-
-const RESULT_PREFIX = "AMPHETAMINE_BENCHMARK_RESULT:";
-const DEFAULT_TIMEOUT_MS = 60000;
+import {
+  BenchmarkRunError,
+  BenchmarkTerminationError,
+  collectBenchmarkOutput,
+} from "./benchmark-output.js";
 
 type BenchmarkArgs = {
   readonly label: string;
@@ -27,16 +29,13 @@ class UsageError extends Error {
   override readonly name = "UsageError";
 }
 
-class BenchmarkRunError extends Error {
-  override readonly name = "BenchmarkRunError";
-}
-
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const runId = randomUUID();
   const startedAt = new Date().toISOString();
   const userDataPath = await mkdtemp(path.join(tmpdir(), "amphetamine-benchmark-"));
 
+  let cleanupAllowed = true;
   try {
     const result = await runElectronBenchmark(args, userDataPath);
     const baseline = await readBaseline(args.baselinePath);
@@ -57,8 +56,11 @@ async function main(): Promise<void> {
     await mkdir(path.dirname(args.outPath), { recursive: true });
     await writeFile(args.outPath, `${JSON.stringify(artifact, null, 2)}\n`, "utf-8");
     process.stdout.write(`[benchmark] wrote ${args.outPath}\n`);
+  } catch (error) {
+    if (error instanceof BenchmarkTerminationError) cleanupAllowed = false;
+    throw error;
   } finally {
-    await rm(userDataPath, { recursive: true, force: true });
+    if (cleanupAllowed) await rm(userDataPath, { recursive: true, force: true });
   }
 }
 
@@ -118,17 +120,23 @@ async function runElectronBenchmark(
     env: buildBenchmarkEnv(args, userDataPath),
     detached: true,
   });
-  const output = await collectBenchmarkOutput(child);
-  return {
-    ...output,
-    durationMs: Math.round((performance.now() - started) * 1000) / 1000,
-  };
+  const controller = new AbortController();
+  const interrupt = (): void => controller.abort();
+  process.on("SIGINT", interrupt);
+  process.on("SIGTERM", interrupt);
+  try {
+    const output = await collectBenchmarkOutput(child, args.scenario, 60000, controller.signal);
+    return {
+      ...output,
+      durationMs: Math.round((performance.now() - started) * 1000) / 1000,
+    };
+  } finally {
+    process.removeListener("SIGINT", interrupt);
+    process.removeListener("SIGTERM", interrupt);
+  }
 }
 
-function buildBenchmarkEnv(
-  args: BenchmarkArgs,
-  userDataPath: string,
-): NodeJS.ProcessEnv {
+function buildBenchmarkEnv(args: BenchmarkArgs, userDataPath: string): NodeJS.ProcessEnv {
   return {
     ...process.env,
     NODE_ENV: "production",
@@ -138,92 +146,6 @@ function buildBenchmarkEnv(
     AMPHETAMINE_BENCHMARK_SCENARIO: args.scenario,
     ELECTRON_DISABLE_SECURITY_WARNINGS: "true",
   };
-}
-
-async function collectBenchmarkOutput(
-  child: ChildProcessWithoutNullStreams,
-): Promise<Omit<ElectronRunResult, "durationMs">> {
-  return new Promise((resolve, reject) => {
-    let stdout = "";
-    let stderr = "";
-    let payload: Record<string, unknown> | null = null;
-    let isSettled = false;
-    const resolveOnce = (): void => {
-      if (isSettled || payload === null) return;
-      isSettled = true;
-      clearTimeout(timeout);
-      terminateBenchmarkChild(child);
-      resolve({ payload, stdout, stderr });
-    };
-    const rejectOnce = (error: Error): void => {
-      if (isSettled) return;
-      isSettled = true;
-      clearTimeout(timeout);
-      terminateBenchmarkChild(child);
-      reject(error);
-    };
-    const timeout = setTimeout(() => {
-      rejectOnce(new BenchmarkRunError(`Electron benchmark timed out after ${DEFAULT_TIMEOUT_MS}ms.`));
-    }, DEFAULT_TIMEOUT_MS);
-
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString("utf-8");
-      for (const line of stdout.split("\n")) {
-        if (!line.startsWith(RESULT_PREFIX)) continue;
-        payload = parsePayload(line.slice(RESULT_PREFIX.length));
-        resolveOnce();
-      }
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf-8");
-    });
-    child.on("error", (error) => {
-      rejectOnce(error);
-    });
-    child.on("exit", (code) => {
-      if (payload !== null) {
-        resolveOnce();
-        return;
-      }
-      rejectOnce(new BenchmarkRunError(`Electron exited with ${code ?? "unknown"} before result.`));
-    });
-  });
-}
-
-function terminateBenchmarkChild(child: ChildProcessWithoutNullStreams): void {
-  child.stdin.destroy();
-  child.stdout.destroy();
-  child.stderr.destroy();
-  child.unref();
-
-  if (typeof child.pid !== "number") {
-    child.kill();
-    return;
-  }
-
-  try {
-    process.kill(-child.pid, "SIGTERM");
-  } catch (error) {
-    if (isNoSuchProcessError(error)) return;
-    process.stderr.write(`[benchmark] failed to terminate Electron process group: ${describeError(error)}\n`);
-  }
-}
-
-function isNoSuchProcessError(error: unknown): boolean {
-  return error instanceof Error && "code" in error && error.code === "ESRCH";
-}
-
-function describeError(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  return String(error);
-}
-
-function parsePayload(raw: string): Record<string, unknown> {
-  const parsed: unknown = JSON.parse(raw);
-  if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-    return parsed as Record<string, unknown>;
-  }
-  throw new BenchmarkRunError("Benchmark payload was not a JSON object.");
 }
 
 async function readBaseline(
