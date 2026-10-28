@@ -1,5 +1,10 @@
 import type { powerMonitor as PowerMonitorType } from "electron/main";
-import type { IpcResponse, PushChannel, SessionStatusResponse } from "../shared/types.js";
+import type {
+  IpcResponse,
+  PushChannel,
+  SessionExtendResponse,
+  SessionStatusResponse,
+} from "../shared/types.js";
 import {
   createSessionEngine,
   type SessionEngine,
@@ -27,6 +32,7 @@ export interface SessionTimerDeps {
  */
 export interface SessionTimerHandle {
   startSession: (durationMinutes: number | null) => SessionState;
+  extendSession: (additionalMinutes: number) => SessionExtendResponse;
   cancelSession: () => SessionState;
   getStatus: () => SessionStatusResponse;
   cleanup: () => void;
@@ -65,6 +71,7 @@ export function createSessionTimer(deps: SessionTimerDeps): SessionTimerHandle {
 
   return {
     startSession: (durationMinutes) => engine.startSession(durationMinutes),
+    extendSession: (additionalMinutes) => engine.extendSession(additionalMinutes),
     cancelSession: () => engine.cancelSession(),
     getStatus: () => engine.getStatus(),
     cleanup: () => {

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import type { AppSettings, SessionStatusResponse } from "../../src/shared/types.js";
+import type { AppSettings, SessionStatusResponse, SessionExtendResponse, TimedSessionStatus } from "../../src/shared/types.js";
 import { asPerf, DEFAULT_SETTINGS } from "../../src/shared/types.js";
 import {
   STATUS_PREVENTING_SLEEP,
@@ -19,6 +19,7 @@ const mockApi = {
   },
   session: {
     start: vi.fn(),
+    extend: vi.fn<(_minutes: number) => Promise<SessionExtendResponse>>(),
     cancel: vi.fn(),
     getStatus: vi.fn<() => Promise<SessionStatusResponse | null>>(),
   },
@@ -61,7 +62,7 @@ function getErrorText(): string | null {
   return document.getElementById("status-error")?.textContent ?? null;
 }
 
-function timedSessionStatus(remainingSeconds = 25 * 60): SessionStatusResponse {
+function timedSessionStatus(remainingSeconds = 25 * 60): TimedSessionStatus {
   const now = performance.now();
   return {
     isRunning: true,
@@ -118,6 +119,7 @@ describe("renderer popover (index.ts)", () => {
     mockApi.settings.get.mockReset();
     mockApi.settings.set.mockReset();
     mockApi.session.getStatus.mockReset();
+    mockApi.session.extend.mockReset();
     mockApi.app.getVersion.mockReset();
     mockApi.onSettingsChanged.mockReset().mockImplementation(() => vi.fn());
     mockApi.onSessionStatusUpdate.mockReset().mockImplementation(() => vi.fn());
@@ -1074,7 +1076,7 @@ describe("renderer popover (index.ts)", () => {
       sessionCallback?.(timedSessionStatus());
       await vi.advanceTimersByTimeAsync(16);
       expect(document.getElementById("cancel-session-action")).not.toBeNull();
-      expect(document.querySelectorAll(".session-chip:not(.session-chip--cancel)").length).toBe(0);
+      expect(document.querySelectorAll(".session-chip[data-duration]").length).toBe(0);
 
       sessionCallback?.({
         isRunning: false,
@@ -1192,6 +1194,147 @@ describe("renderer popover (index.ts)", () => {
       const text = getTimerText();
       expect(text).toContain("Timer");
       expect(text).toContain("0m remaining");
+    });
+  });
+
+  describe("configured quick sessions", () => {
+    it("refreshes idle chips in pushed order and starts only the selected session", async () => {
+      await bootRenderer();
+      mockApi.onSettingsChanged.mock.calls[0]?.[0]({
+        ...DEFAULT_SETTINGS, quickSessionDurations: [1440, 1, 121, 3, 4, 5],
+      });
+      await vi.advanceTimersByTimeAsync(16);
+      const chips = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-duration]"));
+      expect(chips.map((chip) => chip.dataset["duration"])).toEqual(["1440", "1", "121", "3", "4", "5", ""]);
+      expect(chips[0]?.getAttribute("aria-label")).toContain("1440");
+      chips[2]?.click();
+      chips[6]?.click();
+      expect(mockApi.session.start).toHaveBeenNthCalledWith(1, 121);
+      expect(mockApi.session.start).toHaveBeenNthCalledWith(2, null);
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+    });
+
+    it("preserves idle action identity for equal ordered values and copies pushed arrays", async () => {
+      await bootRenderer();
+      await vi.advanceTimersByTimeAsync(16);
+      const first = document.querySelector("[data-duration]");
+      const durations = [15, 30, 60, 120];
+      mockApi.onSettingsChanged.mock.calls[0]?.[0]({ ...DEFAULT_SETTINGS, quickSessionDurations: durations });
+      durations.reverse();
+      await vi.advanceTimersByTimeAsync(16);
+      expect(document.querySelector("[data-duration]")).toBe(first);
+      expect(document.querySelector<HTMLButtonElement>("[data-duration]")?.dataset["duration"]).toBe("15");
+    });
+
+    it("keeps Cancel across configured chips, ticks and timed-indefinite transitions", async () => {
+      mockApi.session.getStatus.mockResolvedValue(timedSessionStatus());
+      await bootRenderer();
+      const cancel = document.getElementById("cancel-session-action");
+      mockApi.onSettingsChanged.mock.calls[0]?.[0]({ ...DEFAULT_SETTINGS, quickSessionDurations: [1] });
+      mockApi.onSessionStatusUpdate.mock.calls[0]?.[0]({
+        isRunning: true, startedAt: asPerf(100), expiresAt: null, remainingSeconds: null, durationMinutes: null,
+      });
+      await vi.advanceTimersByTimeAsync(16);
+      expect(document.getElementById("cancel-session-action")).toBe(cancel);
+      expect(document.querySelector<HTMLButtonElement>("#extend-session-action")?.hidden).toBe(true);
+      mockApi.onSessionStatusUpdate.mock.calls[0]?.[0](timedSessionStatus());
+      await vi.advanceTimersByTimeAsync(1016);
+      expect(document.getElementById("cancel-session-action")).toBe(cancel);
+      expect(document.querySelector<HTMLButtonElement>("#extend-session-action")?.hidden).toBe(false);
+    });
+  });
+
+  describe("timed session extension", () => {
+    it("serializes activation and applies a successful extended deadline without changing preferences", async () => {
+      const extension = Promise.withResolvers<SessionExtendResponse>();
+      mockApi.session.extend.mockReturnValueOnce(extension.promise);
+      mockApi.session.getStatus.mockResolvedValue(timedSessionStatus());
+      await bootRenderer();
+      const cancel = document.getElementById("cancel-session-action");
+      const action = document.querySelector<HTMLButtonElement>("#extend-session-action");
+      action?.click();
+      action?.click();
+      expect(mockApi.session.extend).toHaveBeenCalledExactlyOnceWith(15);
+      expect(action?.disabled).toBe(true);
+      extension.resolve({ ok: true, status: { ...timedSessionStatus(40 * 60), durationMinutes: 45 } });
+      await vi.advanceTimersByTimeAsync(16);
+      expect(getTimerText()).toContain("40m remaining");
+      expect(action?.disabled).toBe(false);
+      expect(document.getElementById("cancel-session-action")).toBe(cancel);
+      expect(mockApi.session.start).not.toHaveBeenCalled();
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+    });
+
+    it.each(["invalid-additional-minutes", "idle", "indefinite", "expired", "duration-limit", "rejected"] as const)(
+      "shows a visible %s rejection and leaves Cancel usable", async (reason) => {
+        mockApi.session.getStatus.mockResolvedValue(timedSessionStatus());
+        mockApi.session.extend.mockResolvedValueOnce({ ok: false, reason });
+        await bootRenderer();
+        const cancel = document.getElementById("cancel-session-action");
+        document.getElementById("extend-session-action")?.click();
+        await vi.advanceTimersByTimeAsync(16);
+        expect(getErrorText()?.length).toBeGreaterThan(0);
+        expect(document.querySelector<HTMLButtonElement>("#extend-session-action")?.disabled).toBe(false);
+        expect(document.getElementById("cancel-session-action")).toBe(cancel);
+      },
+    );
+
+    it("reports a rejected promise and permits a retry", async () => {
+      mockApi.session.getStatus.mockResolvedValue(timedSessionStatus());
+      mockApi.session.extend.mockRejectedValueOnce(new Error("IPC failed"));
+      await bootRenderer();
+      document.getElementById("extend-session-action")?.click();
+      await vi.advanceTimersByTimeAsync(16);
+      expect(getErrorText()?.length).toBeGreaterThan(0);
+      mockApi.session.extend.mockResolvedValueOnce({ ok: false, reason: "duration-limit" });
+      document.getElementById("extend-session-action")?.click();
+      expect(mockApi.session.extend).toHaveBeenCalledTimes(2);
+    });
+
+    it.each(["idle", "indefinite", "newer-timed", "cancel", "expiry", "unload"] as const)(
+      "ignores late successful extension after %s", async (transition) => {
+        const extension = Promise.withResolvers<SessionExtendResponse>();
+        mockApi.session.extend.mockReturnValueOnce(extension.promise);
+        mockApi.session.getStatus.mockResolvedValue(timedSessionStatus(1));
+        await bootRenderer();
+        document.getElementById("extend-session-action")?.click();
+        const push = mockApi.onSessionStatusUpdate.mock.calls[0]?.[0];
+        switch (transition) {
+          case "idle": push?.({ isRunning: false, startedAt: null, expiresAt: null, remainingSeconds: null, durationMinutes: null }); break;
+          case "indefinite": push?.({ isRunning: true, startedAt: asPerf(200), expiresAt: null, remainingSeconds: null, durationMinutes: null }); break;
+          case "newer-timed": push?.(timedSessionStatus(10 * 60)); break;
+          case "cancel": document.getElementById("cancel-session-action")?.click(); break;
+          case "expiry": await vi.advanceTimersByTimeAsync(1000); break;
+          case "unload": window.dispatchEvent(new Event("beforeunload")); break;
+        }
+        extension.resolve({ ok: true, status: timedSessionStatus(40 * 60) });
+        await vi.advanceTimersByTimeAsync(16);
+        expect(getTimerText()).not.toContain("40m remaining");
+        expect(getErrorText()).toBe("");
+      },
+    );
+
+    it("does not show an old rejection after a newer session push", async () => {
+      const extension = Promise.withResolvers<SessionExtendResponse>();
+      mockApi.session.extend.mockReturnValueOnce(extension.promise);
+      mockApi.session.getStatus.mockResolvedValue(timedSessionStatus());
+      await bootRenderer();
+      document.getElementById("extend-session-action")?.click();
+      mockApi.onSessionStatusUpdate.mock.calls[0]?.[0](timedSessionStatus(40 * 60));
+      extension.reject(new Error("old failure"));
+      await vi.advanceTimersByTimeAsync(16);
+      expect(getErrorText()).toBe("");
+      expect(getTimerText()).toContain("40m remaining");
+    });
+
+    it("hides extension when the local timed deadline expires without polling", async () => {
+      mockApi.session.getStatus.mockResolvedValue(timedSessionStatus(1));
+      await bootRenderer();
+      const cancel = document.getElementById("cancel-session-action");
+      await vi.advanceTimersByTimeAsync(1016);
+      expect(document.querySelector<HTMLButtonElement>("#extend-session-action")?.hidden).toBe(true);
+      expect(document.getElementById("cancel-session-action")).toBe(cancel);
+      expect(mockApi.session.getStatus).toHaveBeenCalledOnce();
     });
   });
 });

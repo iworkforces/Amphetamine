@@ -49,6 +49,7 @@ const mockBatterySensor = vi.hoisted(() => ({
 const mockCreateBatterySensor = vi.hoisted(() => vi.fn(() => mockBatterySensor));
 const mockCreateBatteryMonitor = vi.hoisted(() =>
   vi.fn((_deps: unknown): BatteryMonitorHandle => ({
+    getStatus: () => ({ state: "disabled", reason: null, current: null, lastSample: null }),
     initBatteryMonitoring: mockBatteryInit,
     cleanupBatteryMonitoring: mockBatteryCleanup,
     onPreventSleepChange: mockBatteryOnPreventSleepChange,
@@ -208,6 +209,7 @@ describe("composition wiring", () => {
     launchAtLogin: false,
     preventSleep: false,
     defaultSessionDuration: null as number | null,
+    quickSessionDurations: [15, 30, 60, 120],
     batteryThreshold: 0,
     shortcut: "",
     // Union (not `as const` singleton) so mode-switch tests can emit either value.
@@ -220,6 +222,7 @@ describe("composition wiring", () => {
 
     // Re-wire factories that return handles after clearAllMocks reset return values
     mockCreateBatteryMonitor.mockReturnValue({
+      getStatus: () => ({ state: "disabled", reason: null, current: null, lastSample: null }),
       initBatteryMonitoring: mockBatteryInit,
       cleanupBatteryMonitoring: mockBatteryCleanup,
       onPreventSleepChange: mockBatteryOnPreventSleepChange,

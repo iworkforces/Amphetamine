@@ -8,6 +8,7 @@ export { asPerf } from "../domain/time/perf-timestamp.js";
 export type { SleepBlockMode } from "../domain/settings/sleep-block-mode.js";
 export type { AppSettings } from "../domain/settings/app-settings.js";
 export { DEFAULT_SETTINGS } from "../domain/settings/app-settings.js";
+export type { BatterySample, BatteryMonitorStatus } from "../domain/battery/monitor-status.js";
 
 /** IPC channel names — single source of truth */
 export const IPC_CHANNELS = {
@@ -27,10 +28,13 @@ export const IPC_CHANNELS = {
   AUTO_UPDATER_CHECK: "auto-updater:check",
   AUTO_UPDATER_STATUS: "auto-updater:status",
   SHORTCUT_REGISTRATION_FAILED: "shortcut:registration-failed",
+  BATTERY_STATUS: "battery:status",
+  BATTERY_STATUS_UPDATE: "battery:status-update",
 } as const;
 
 import type { PerfTimestamp } from "../domain/time/perf-timestamp.js";
 import type { AppSettings } from "../domain/settings/app-settings.js";
+import type { BatteryMonitorStatus } from "../domain/battery/monitor-status.js";
 
 /**
  * Canonical session status payload — discriminated union with three arms.
@@ -68,6 +72,19 @@ export type SessionStatusResponse =
       expiresAt: null;
       remainingSeconds: null;
       durationMinutes: null;
+    };
+
+export type SessionStartRequest = { durationMinutes: number | null; operation?: never };
+export type SessionExtendRequest = { operation: "extend"; additionalMinutes: number };
+export type TimedSessionStatus = Extract<
+  SessionStatusResponse,
+  { isRunning: true; expiresAt: PerfTimestamp }
+>;
+export type SessionExtendResponse =
+  | { ok: true; status: TimedSessionStatus }
+  | {
+      ok: false;
+      reason: "invalid-additional-minutes" | "idle" | "indefinite" | "expired" | "duration-limit" | "rejected";
     };
 
 /** Response shape for SESSION_START channel — discriminated union */
@@ -142,8 +159,8 @@ export type IpcChannelMap = {
     response: { settings: AppSettings; rejectedKeys: string[] };
   };
   [IPC_CHANNELS.SESSION_START]: {
-    request: { durationMinutes: number | null };
-    response: SessionStartResponse;
+    request: SessionStartRequest | SessionExtendRequest;
+    response: SessionStartResponse | SessionExtendResponse;
   };
   [IPC_CHANNELS.SESSION_CANCEL]: {
     request: undefined;
@@ -185,6 +202,14 @@ export type IpcChannelMap = {
     request: undefined;
     response: { accelerator: string };
   };
+  [IPC_CHANNELS.BATTERY_STATUS]: {
+    request: undefined;
+    response: BatteryMonitorStatus;
+  };
+  [IPC_CHANNELS.BATTERY_STATUS_UPDATE]: {
+    request: undefined;
+    response: BatteryMonitorStatus;
+  };
 };
 
 /** Type utilities for type-safe IPC */
@@ -199,6 +224,7 @@ export const PUSH_CHANNELS = [
   IPC_CHANNELS.AUTO_UPDATER_STATUS,
   IPC_CHANNELS.WINDOW_HIDE,
   IPC_CHANNELS.SHORTCUT_REGISTRATION_FAILED,
+  IPC_CHANNELS.BATTERY_STATUS_UPDATE,
 ] as const;
 
 export type PushChannel = (typeof PUSH_CHANNELS)[number];

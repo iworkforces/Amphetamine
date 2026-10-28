@@ -1,13 +1,19 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type {
   AppSettings,
+  BatteryMonitorStatus,
   IpcResponse,
   IPC_CHANNELS,
   SessionStartResponse,
   SessionStatusResponse,
 } from "../../src/shared/types.js";
 import { asPerf, DEFAULT_SETTINGS } from "../../src/shared/types.js";
-import { SAVED_INDICATOR } from "../../src/renderer/settings/constants.js";
+import {
+  SAVED_INDICATOR, ERROR_QUICK_SESSION_DURATIONS,
+  BATTERY_STATUS_AC_POWER, BATTERY_STATUS_AWAITING_SAMPLE, BATTERY_STATUS_CURRENT_PREFIX,
+  BATTERY_STATUS_DISABLED, BATTERY_STATUS_INACTIVE, BATTERY_STATUS_READING,
+  BATTERY_STATUS_UNAVAILABLE, BATTERY_STATUS_QUERY_FAILED, BATTERY_STATUS_HISTORY_PREFIX,
+} from "../../src/renderer/settings/constants.js";
 
 type SettingsSetResponse = IpcResponse<typeof IPC_CHANNELS.SETTINGS_SET>;
 
@@ -23,8 +29,13 @@ const mockApi = {
   },
   session: {
     start: vi.fn(),
+    extend: vi.fn(),
     cancel: vi.fn(),
     getStatus: vi.fn<() => Promise<SessionStatusResponse | null>>(),
+  },
+  battery: {
+    getStatus: vi.fn<() => Promise<BatteryMonitorStatus>>(),
+    onStatusChange: vi.fn<(_cb: (status: BatteryMonitorStatus) => void) => () => void>(() => vi.fn()),
   },
   onSettingsChanged: vi.fn<(_cb: (s: AppSettings) => void) => () => void>(() => vi.fn()),
   onShortcutRegistrationFailed: vi.fn<(_cb: (d: { accelerator: string }) => void) => () => void>(() => vi.fn()),
@@ -99,6 +110,10 @@ describe("renderer settings", () => {
       rejectedKeys: [] as string[],
     }));
     mockApi.session.getStatus.mockResolvedValue(null);
+    mockApi.battery.getStatus.mockReset().mockResolvedValue({
+      state: "disabled", reason: null, current: null, lastSample: null,
+    });
+    mockApi.battery.onStatusChange.mockReset().mockImplementation(() => vi.fn());
 
     Object.defineProperty(globalThis, "window", {
       value: {
@@ -116,8 +131,354 @@ describe("renderer settings", () => {
   });
 
   afterEach(() => {
+    document.defaultView?.dispatchEvent(new Event("beforeunload"));
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  describe("quick session editor", () => {
+    function editDurations(value: string): HTMLInputElement {
+      const input = document.querySelector<HTMLInputElement>("#quick-session-durations-input");
+      if (!input) throw new Error("Missing quick sessions editor");
+      input.value = value;
+      input.dispatchEvent(new Event("input"));
+      input.dispatchEvent(new Event("change"));
+      return input;
+    }
+
+    it("drains a focused text edit on quit before blur or the debounce deadline", async () => {
+      await mountSettings();
+      const input = document.querySelector<HTMLInputElement>("#quick-session-durations-input");
+      if (!input) throw new Error("Missing quick sessions editor");
+      input.focus();
+      input.value = "5, 10";
+      input.dispatchEvent(new Event("input"));
+      mockApi.settings.onQuitDrain.mock.calls.at(-1)?.[0]({ requestId: "quit-quick-edit" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockApi.settings.set).toHaveBeenCalledExactlyOnceWith({ quickSessionDurations: [5, 10] });
+      expect(mockApi.settings.ackQuitDrain).toHaveBeenCalledExactlyOnceWith({ requestId: "quit-quick-edit", status: "saved" });
+    });
+
+    it("saves ordered minutes with the serialized debounced queue, without starting a session", async () => {
+      await mountSettings();
+      const input = editDurations("1440, 1, 120, 7, 8, 9");
+      expect(input.closest("section")?.getAttribute("aria-labelledby")).toBe("section-session");
+      await vi.advanceTimersByTimeAsync(299);
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(mockApi.settings.set).toHaveBeenCalledExactlyOnceWith({ quickSessionDurations: [1440, 1, 120, 7, 8, 9] });
+      expect(input.value).toBe("1440, 1, 120, 7, 8, 9");
+      expect(document.getElementById("quick-session-save-indicator")?.textContent).toBe(SAVED_INDICATOR);
+      expect(mockApi.session.start).not.toHaveBeenCalled();
+    });
+
+    it("treats equal ordered content as unchanged but persists a reorder", async () => {
+      await mountSettings();
+      editDurations("15,30,60,120");
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+      editDurations("120, 60, 30, 15");
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenCalledExactlyOnceWith({ quickSessionDurations: [120, 60, 30, 15] });
+    });
+
+    it.each(["", "15,15", "0", "1441", "1.5", "15, nope", "1,2,3,4,5,6,7"])(
+      "surfaces whole-field rejection for %j and allows a corrected retry", async (raw) => {
+        mockApi.settings.set.mockResolvedValueOnce({ settings: defaultSettings, rejectedKeys: ["quickSessionDurations"] });
+        await mountSettings();
+        const input = editDurations(raw);
+        await vi.advanceTimersByTimeAsync(300);
+        expect(input.getAttribute("aria-invalid")).toBe("true");
+        expect(document.getElementById("quick-session-error")?.textContent).toBe(ERROR_QUICK_SESSION_DURATIONS);
+        expect(input.value).toBe(raw);
+        expect(document.getElementById("quick-session-save-indicator")?.textContent).not.toBe(SAVED_INDICATOR);
+        editDurations("5, 10");
+        await vi.advanceTimersByTimeAsync(300);
+        expect(input.getAttribute("aria-invalid")).toBe("false");
+        expect(input.value).toBe("5, 10");
+        expect(document.getElementById("quick-session-error")?.textContent).toBe("");
+      },
+    );
+
+    it("preserves an incomplete focused draft when validation rejects after the debounce", async () => {
+      mockApi.settings.set.mockResolvedValueOnce({ settings: defaultSettings, rejectedKeys: ["quickSessionDurations"] });
+      await mountSettings();
+      const input = document.querySelector<HTMLInputElement>("#quick-session-durations-input");
+      if (!input) throw new Error("Missing quick sessions editor");
+      input.focus();
+      input.value = "15, ";
+      input.dispatchEvent(new Event("input"));
+      await vi.advanceTimersByTimeAsync(300);
+      expect(input.value).toBe("15, ");
+      expect(document.activeElement).toBe(input);
+      expect(input.getAttribute("aria-invalid")).toBe("true");
+    });
+
+    it("clears rejection when the user restores saved choices without another write", async () => {
+      mockApi.settings.set.mockResolvedValueOnce({ settings: defaultSettings, rejectedKeys: ["quickSessionDurations"] });
+      await mountSettings();
+      const input = editDurations("15, 15");
+      await vi.advanceTimersByTimeAsync(300);
+      editDurations("15, 30, 60, 120");
+      await vi.advanceTimersByTimeAsync(300);
+      expect(input.getAttribute("aria-invalid")).toBe("false");
+      expect(mockApi.settings.set).toHaveBeenCalledOnce();
+    });
+
+    it("keeps a newer queued array edit when an older save returns", async () => {
+      const first = Promise.withResolvers<SettingsSetResponse>();
+      mockApi.settings.set.mockReturnValueOnce(first.promise);
+      await mountSettings();
+      const input = editDurations("5, 10");
+      await vi.advanceTimersByTimeAsync(300);
+      editDurations("10, 5");
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenCalledOnce();
+      first.resolve(accepted({ ...defaultSettings, quickSessionDurations: [5, 10] }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockApi.settings.set).toHaveBeenNthCalledWith(2, { quickSessionDurations: [10, 5] });
+      expect(input.value).toBe("10, 5");
+    });
+
+    it("lets a newer reordered push beat an older same-key save reply", async () => {
+      const first = Promise.withResolvers<SettingsSetResponse>();
+      mockApi.settings.set.mockReturnValueOnce(first.promise);
+      await mountSettings();
+      const input = editDurations("5, 10");
+      await vi.advanceTimersByTimeAsync(300);
+      input.dispatchEvent(new Event("change"));
+      mockApi.onSettingsChanged.mock.calls.at(-1)?.[0]({ ...defaultSettings, quickSessionDurations: [10, 5] });
+      first.resolve(accepted({ ...defaultSettings, quickSessionDurations: [5, 10] }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(input.value).toBe("10, 5");
+    });
+
+    it("does not give an equal array push authority over an unrelated save response", async () => {
+      const first = Promise.withResolvers<SettingsSetResponse>();
+      mockApi.settings.set.mockReturnValueOnce(first.promise);
+      await mountSettings();
+      document.querySelector<HTMLInputElement>("#launch-at-login-toggle")?.click();
+      await vi.advanceTimersByTimeAsync(300);
+      mockApi.onSettingsChanged.mock.calls.at(-1)?.[0]({ ...defaultSettings, quickSessionDurations: [15, 30, 60, 120] });
+      first.resolve(accepted({ ...defaultSettings, launchAtLogin: true, quickSessionDurations: [5, 10] }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.querySelector<HTMLInputElement>("#quick-session-durations-input")?.value).toBe("5, 10");
+    });
+
+    it("does not requeue an old failed array write or its feedback over a newer push", async () => {
+      const first = Promise.withResolvers<SettingsSetResponse>();
+      mockApi.settings.set.mockReturnValueOnce(first.promise);
+      await mountSettings();
+      const input = editDurations("5, 10");
+      await vi.advanceTimersByTimeAsync(300);
+      mockApi.onSettingsChanged.mock.calls.at(-1)?.[0]({ ...defaultSettings, quickSessionDurations: [10, 5] });
+      first.reject(new Error("stale failure"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(input.value).toBe("10, 5");
+      expect(document.getElementById("settings-error-text")?.textContent).toBe("");
+      document.querySelector<HTMLInputElement>("#launch-at-login-toggle")?.click();
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenNthCalledWith(2, { launchAtLogin: true });
+    });
+
+    it("does not show a stale rejected-key error after an authoritative array push", async () => {
+      const first = Promise.withResolvers<SettingsSetResponse>();
+      mockApi.settings.set.mockReturnValueOnce(first.promise);
+      await mountSettings();
+      const input = editDurations("5, 10");
+      await vi.advanceTimersByTimeAsync(300);
+      mockApi.onSettingsChanged.mock.calls.at(-1)?.[0]({ ...defaultSettings, quickSessionDurations: [10, 5] });
+      first.resolve({ settings: defaultSettings, rejectedKeys: ["quickSessionDurations"] });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(input.value).toBe("10, 5");
+      expect(input.getAttribute("aria-invalid")).toBe("false");
+    });
+
+    it("copies a successful response before a caller can mutate its durations", async () => {
+      const durations = [5, 10];
+      mockApi.settings.set.mockResolvedValueOnce(accepted({ ...defaultSettings, quickSessionDurations: durations }));
+      await mountSettings();
+      editDurations("5, 10");
+      await vi.advanceTimersByTimeAsync(300);
+      durations.reverse();
+      document.querySelector<HTMLInputElement>("#launch-at-login-toggle")?.click();
+      expect(document.querySelector<HTMLInputElement>("#quick-session-durations-input")?.value).toBe("5, 10");
+    });
+
+    it("copies incoming and outgoing arrays so mutation cannot alter local snapshots or a retry", async () => {
+      const durations = [5, 10];
+      mockApi.settings.get.mockResolvedValueOnce({ ...defaultSettings, quickSessionDurations: durations });
+      await mountSettings();
+      durations.reverse();
+      document.querySelector<HTMLInputElement>("#launch-at-login-toggle")?.click();
+      expect(document.querySelector<HTMLInputElement>("#quick-session-durations-input")?.value).toBe("5, 10");
+      const first = Promise.withResolvers<SettingsSetResponse>();
+      mockApi.settings.set.mockImplementationOnce((patch) => {
+        if (Array.isArray(patch.quickSessionDurations)) patch.quickSessionDurations.reverse();
+        return first.promise;
+      });
+      const input = editDurations("10, 20");
+      await vi.advanceTimersByTimeAsync(300);
+      const pushed = [30, 40];
+      mockApi.onSettingsChanged.mock.calls.at(-1)?.[0]({ ...defaultSettings, quickSessionDurations: pushed });
+      pushed.reverse();
+      first.resolve(accepted({ ...defaultSettings, quickSessionDurations: [10, 20] }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(input.value).toBe("30, 40");
+    });
+
+    it("retains a failed array write for retry when another field is edited", async () => {
+      mockApi.settings.set.mockRejectedValueOnce(new Error("Disk full"));
+      await mountSettings();
+      const input = editDurations("5, 10");
+      await vi.advanceTimersByTimeAsync(300);
+      expect(input.value).toBe("5, 10");
+      expect(document.getElementById("settings-error-text")?.textContent).toBe("Disk full");
+      document.querySelector<HTMLInputElement>("#launch-at-login-toggle")?.click();
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockApi.settings.set).toHaveBeenNthCalledWith(2, { quickSessionDurations: [5, 10], launchAtLogin: true });
+    });
+
+    it("preserves an uncommitted text edit through unrelated pushes", async () => {
+      await mountSettings();
+      const input = document.querySelector<HTMLInputElement>("#quick-session-durations-input");
+      if (!input) throw new Error("Missing quick sessions editor");
+      input.value = "5, ";
+      input.dispatchEvent(new Event("input"));
+      mockApi.onSettingsChanged.mock.calls.at(-1)?.[0]({ ...defaultSettings, preventSleep: true });
+      expect(input.value).toBe("5, ");
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("battery monitor status", () => {
+    const sample = { percent: 82, sampledAt: 1_793_184_000_000 };
+    const cases: readonly [BatteryMonitorStatus, string][] = [
+      [{ state: "disabled", reason: null, current: null, lastSample: null }, BATTERY_STATUS_DISABLED],
+      [{ state: "inactive", reason: null, current: null, lastSample: null }, BATTERY_STATUS_INACTIVE],
+      [{ state: "ac-power", reason: null, current: null, lastSample: null }, BATTERY_STATUS_AC_POWER],
+      [{ state: "reading", reason: null, current: null, lastSample: null }, BATTERY_STATUS_READING],
+      [{ state: "unavailable", reason: "awaiting-first-sample", current: null, lastSample: null }, BATTERY_STATUS_AWAITING_SAMPLE],
+      [{ state: "unavailable", reason: "unavailable", current: null, lastSample: null }, BATTERY_STATUS_UNAVAILABLE],
+      [{ state: "sample", reason: null, current: sample, lastSample: sample }, BATTERY_STATUS_CURRENT_PREFIX],
+    ];
+
+    it.each(cases)("renders authoritative monitor state %j without guessing from settings", async (status, text) => {
+      mockApi.battery.getStatus.mockResolvedValueOnce(status);
+      await mountSettings();
+      expect(document.getElementById("battery-monitor-status")?.textContent).toBe(text);
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+    });
+
+    it.each(cases.filter(([status]) => status.state !== "sample"))(
+      "marks an old sample as non-current for %j", async (status) => {
+        mockApi.battery.getStatus.mockResolvedValueOnce({ ...status, lastSample: sample });
+        await mountSettings();
+        const history = document.getElementById("battery-monitor-history")?.textContent;
+        expect(history).toContain(BATTERY_STATUS_HISTORY_PREFIX);
+        expect(history).toContain("82%");
+        expect(history).toContain(new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(sample.sampledAt));
+        expect(history).not.toContain(new Date(sample.sampledAt).toISOString());
+      },
+    );
+
+    it("shows the current sample percentage and localized timestamp without a history warning", async () => {
+      mockApi.battery.getStatus.mockResolvedValueOnce({ state: "sample", reason: null, current: sample, lastSample: sample });
+      await mountSettings();
+      const history = document.getElementById("battery-monitor-history")?.textContent;
+      expect(history).toContain("82%");
+      expect(history).not.toContain(BATTERY_STATUS_HISTORY_PREFIX);
+    });
+
+    it("subscribes before querying and preserves a push received before first render", async () => {
+      const initial = Promise.withResolvers<BatteryMonitorStatus>();
+      const settings = Promise.withResolvers<AppSettings>();
+      mockApi.battery.getStatus.mockReturnValueOnce(initial.promise);
+      mockApi.settings.get.mockReturnValueOnce(settings.promise);
+      await startCurrentSettingsEntry();
+      expect(mockApi.battery.onStatusChange.mock.invocationCallOrder[0]).toBeLessThan(mockApi.battery.getStatus.mock.invocationCallOrder[0] ?? Infinity);
+      mockApi.battery.onStatusChange.mock.calls[0]?.[0]({ state: "sample", reason: null, current: sample, lastSample: sample });
+      settings.resolve(defaultSettings);
+      initial.resolve({ state: "reading", reason: null, current: null, lastSample: null });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.getElementById("battery-monitor-status")?.textContent).toBe(BATTERY_STATUS_CURRENT_PREFIX);
+    });
+
+    it("keeps a synchronous subscription push when an older query resolves", async () => {
+      mockApi.battery.onStatusChange.mockImplementationOnce((callback) => {
+        callback({ state: "sample", reason: null, current: sample, lastSample: sample });
+        return vi.fn();
+      });
+      await mountSettings();
+      expect(document.getElementById("battery-monitor-status")?.textContent).toBe(BATTERY_STATUS_CURRENT_PREFIX);
+    });
+
+    it("does not replace a newer push with a failed initial query", async () => {
+      const initial = Promise.withResolvers<BatteryMonitorStatus>();
+      mockApi.battery.getStatus.mockReturnValueOnce(initial.promise);
+      await mountSettings();
+      mockApi.battery.onStatusChange.mock.calls[0]?.[0]({ state: "sample", reason: null, current: sample, lastSample: sample });
+      initial.reject(new Error("old query failure"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.getElementById("battery-monitor-status")?.textContent).toBe(BATTERY_STATUS_CURRENT_PREFIX);
+    });
+
+    it("shows a query failure without inventing a battery diagnosis", async () => {
+      mockApi.battery.getStatus.mockRejectedValueOnce(new Error("IPC unavailable"));
+      await mountSettings();
+      expect(document.getElementById("battery-monitor-status")?.textContent).toBe(BATTERY_STATUS_QUERY_FAILED);
+      expect(document.getElementById("battery-monitor-history")?.textContent).toBe("");
+    });
+
+    it("keeps warm subscriptions, cached updates and a single query without adding polling timers", async () => {
+      const stop = vi.fn();
+      mockApi.battery.onStatusChange.mockReturnValueOnce(stop);
+      const intervals = vi.spyOn(globalThis, "setInterval");
+      await mountSettings();
+      const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+      document.dispatchEvent(new Event("visibilitychange"));
+      mockApi.battery.onStatusChange.mock.calls[0]?.[0]({ state: "ac-power", reason: null, current: null, lastSample: sample });
+      visibility.mockReturnValue("visible");
+      document.dispatchEvent(new Event("visibilitychange"));
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(document.getElementById("battery-monitor-status")?.textContent).toBe(BATTERY_STATUS_AC_POWER);
+      expect(mockApi.battery.getStatus).toHaveBeenCalledOnce();
+      expect(mockApi.battery.onStatusChange).toHaveBeenCalledOnce();
+      expect(stop).not.toHaveBeenCalled();
+      expect(intervals).not.toHaveBeenCalled();
+    });
+
+    it("unsubscribes on unload and ignores late query and callback completions", async () => {
+      const initial = Promise.withResolvers<BatteryMonitorStatus>();
+      const stop = vi.fn();
+      mockApi.battery.getStatus.mockReturnValueOnce(initial.promise);
+      mockApi.battery.onStatusChange.mockReturnValueOnce(stop);
+      await mountSettings();
+      document.defaultView?.dispatchEvent(new Event("beforeunload"));
+      const previous = document.getElementById("app")?.innerHTML;
+      const next: BatteryMonitorStatus = { state: "sample", reason: null, current: sample, lastSample: sample };
+      mockApi.battery.onStatusChange.mock.calls[0]?.[0](next);
+      initial.resolve(next);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(stop).toHaveBeenCalledOnce();
+      expect(document.getElementById("app")?.innerHTML).toBe(previous);
+    });
+  });
+
+  describe("extended session projection", () => {
+    it("displays a non-preset running duration after extension and restores the unchanged preference on idle", async () => {
+      mockApi.settings.get.mockResolvedValueOnce({ ...defaultSettings, defaultSessionDuration: 30 });
+      await mountSettings();
+      const select = document.querySelector<HTMLSelectElement>("#session-duration-select");
+      mockApi.onSessionStatusUpdate.mock.calls.at(-1)?.[0]({ isRunning: true, startedAt: asPerf(100), expiresAt: asPerf(2_700_100), remainingSeconds: 2700, durationMinutes: 45 });
+      expect(select?.value).toBe("45");
+      expect(select?.selectedOptions[0]?.textContent).toContain("45");
+      mockApi.onSessionStatusUpdate.mock.calls.at(-1)?.[0](idleStatus);
+      expect(select?.value).toBe("30");
+      expect(select?.querySelector("[data-live-duration]")).toBeNull();
+      expect(mockApi.settings.set).not.toHaveBeenCalled();
+      expect(mockApi.session.start).not.toHaveBeenCalled();
+    });
   });
 
   describe("render", () => {

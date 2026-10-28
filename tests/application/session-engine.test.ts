@@ -222,6 +222,174 @@ describe("createSessionEngine", () => {
     }
   });
 
+  it("extends the existing wall deadline repeatedly and realigns the performance clock", () => {
+    const engine = build();
+    const original = engine.startSession(30);
+    clock.wall += 10 * 60_000;
+    clock.perf += 2 * 60_000;
+    onActiveMock.mockClear();
+    publish.mockClear();
+
+    const first = engine.extendSession(15);
+    const second = engine.extendSession(5);
+
+    expect(first).toEqual({
+      ok: true,
+      status: {
+        isRunning: true,
+        startedAt: original.startedAt,
+        expiresAt: asPerf(clock.perf + 35 * 60_000),
+        remainingSeconds: 35 * 60,
+        durationMinutes: 45,
+      },
+    });
+    expect(second).toEqual({
+      ok: true,
+      status: {
+        isRunning: true,
+        startedAt: original.startedAt,
+        expiresAt: asPerf(clock.perf + 40 * 60_000),
+        remainingSeconds: 40 * 60,
+        durationMinutes: 50,
+      },
+    });
+    expect(schedule.entries.map((entry) => [entry.ms, entry.cancelled])).toEqual([
+      [30 * 60_000, true],
+      [35 * 60_000, true],
+      [40 * 60_000, false],
+    ]);
+    expect(onActiveMock).not.toHaveBeenCalled();
+    expect(publish).toHaveBeenCalledTimes(2);
+  });
+
+  it("accepts exactly the cumulative cap and rejects the next minute without mutation", () => {
+    const engine = build();
+    engine.startSession(1430);
+    expect(engine.extendSession(10)).toMatchObject({
+      ok: true,
+      status: { durationMinutes: 1440 },
+    });
+    const before = engine.getStatus();
+    const entries = schedule.entries.map((entry) => ({ ...entry }));
+    publish.mockClear();
+    onActiveMock.mockClear();
+
+    expect(engine.extendSession(1)).toEqual({ ok: false, reason: "duration-limit" });
+    expect(engine.getStatus()).toEqual(before);
+    expect(schedule.entries).toEqual(entries);
+    expect(publish).not.toHaveBeenCalled();
+    expect(onActiveMock).not.toHaveBeenCalled();
+  });
+
+  it("uses wall remaining when the performance clock advances faster", () => {
+    const engine = build();
+    const original = engine.startSession(20);
+    clock.perf += 25 * 60_000;
+    clock.wall += 5 * 60_000;
+
+    const result = engine.extendSession(5);
+
+    expect(result).toMatchObject({
+      ok: true,
+      status: {
+        startedAt: original.startedAt,
+        expiresAt: asPerf(clock.perf + 20 * 60_000),
+        remainingSeconds: 1200,
+      },
+    });
+    expect(schedule.entries[1]?.ms).toBe(20 * 60_000);
+  });
+
+  it("ignores a queued expiry after resume expires the session", () => {
+    const engine = build();
+    engine.startSession(1);
+    const stale = schedule.entries[0];
+    expect(stale).toBeDefined();
+    clock.wall += 60_000;
+    engine.reconcileAfterResume();
+    publish.mockClear();
+    onActiveMock.mockClear();
+
+    stale?.cb();
+
+    expect(engine.sessionActive).toBe(false);
+    expect(publish).not.toHaveBeenCalled();
+    expect(onActiveMock).not.toHaveBeenCalled();
+  });
+
+  it.each([0, -1, 0.5, NaN, Infinity, -Infinity])(
+    "rejects invalid extension %s without changing an active schedule",
+    (minutes) => {
+      const engine = build();
+      engine.startSession(30);
+      const before = engine.getStatus();
+      const entries = schedule.entries.map((entry) => ({ ...entry }));
+      publish.mockClear();
+      onActiveMock.mockClear();
+
+      expect(engine.extendSession(minutes)).toEqual({
+        ok: false,
+        reason: "invalid-additional-minutes",
+      });
+      expect(engine.getStatus()).toEqual(before);
+      expect(schedule.entries).toEqual(entries);
+      expect(publish).not.toHaveBeenCalled();
+      expect(onActiveMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["idle", "indefinite", "expired"] as const)(
+    "rejects %s sessions without mutation",
+    (condition) => {
+      const engine = build();
+      if (condition === "indefinite") engine.startSession(null);
+      if (condition === "expired") {
+        engine.startSession(1);
+        clock.wall += 60_000;
+      }
+      const before = engine.getStatus();
+      const entries = schedule.entries.map((entry) => ({ ...entry }));
+      publish.mockClear();
+      onActiveMock.mockClear();
+
+      expect(engine.extendSession(1)).toEqual({ ok: false, reason: condition });
+      expect(engine.getStatus()).toEqual(before);
+      expect(schedule.entries).toEqual(entries);
+      expect(publish).not.toHaveBeenCalled();
+      expect(onActiveMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["extend", "resume", "restart", "indefinite", "cancel", "cleanup"] as const)(
+    "ignores an already queued expiry after %s",
+    (operation) => {
+      const engine = build();
+      engine.startSession(30);
+      const stale = schedule.entries[0];
+      expect(stale).toBeDefined();
+      if (operation === "extend") engine.extendSession(15);
+      if (operation === "resume") engine.reconcileAfterResume();
+      if (operation === "restart") engine.startSession(10);
+      if (operation === "indefinite") engine.startSession(null);
+      if (operation === "cancel") engine.cancelSession();
+      if (operation === "cleanup") engine.cleanup();
+      const before = engine.getStatus();
+      publish.mockClear();
+      onActiveMock.mockClear();
+
+      stale?.cb();
+
+      expect(engine.getStatus()).toEqual(before);
+      expect(publish).not.toHaveBeenCalled();
+      expect(onActiveMock).not.toHaveBeenCalled();
+      if (operation === "extend" || operation === "resume" || operation === "restart") {
+        schedule.runNext();
+        expect(engine.sessionActive).toBe(false);
+        expect(onActiveMock).toHaveBeenCalledOnce();
+      }
+    },
+  );
+
   it("throws when broadcast notifier is missing", () => {
     expect(() =>
       createSessionEngine({

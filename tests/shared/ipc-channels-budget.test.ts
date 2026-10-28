@@ -4,8 +4,8 @@ import { SETTINGS_QUIT_DRAIN_ACK, SETTINGS_QUIT_DRAIN_REQUEST } from "../../src/
 import * as utilityDialog from "../../src/shared/utility-dialog.js";
 
 describe("IPC channel budget contract", () => {
-  it("has exactly 16 named channels", () => {
-    expect(Object.keys(IPC_CHANNELS)).toHaveLength(16);
+  it("has exactly 18 named channels", () => {
+    expect(Object.keys(IPC_CHANNELS)).toHaveLength(18);
   });
 
   it("maps every channel in IpcChannelMap", () => {
@@ -23,7 +23,7 @@ describe("IPC channel budget contract", () => {
     for (const push of PUSH_CHANNELS) {
       expect(all.has(push)).toBe(true);
     }
-    expect(PUSH_CHANNELS).toHaveLength(5);
+    expect(PUSH_CHANNELS).toHaveLength(6);
   });
 
   it("keeps quit lifecycle messages private and disjoint from public IPC and pushes", () => {

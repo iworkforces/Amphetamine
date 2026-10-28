@@ -107,6 +107,47 @@ describe("session-timer", () => {
     });
   });
 
+  describe("extendSession", () => {
+    it("extends a live session through the facade without changing settings or active state", async () => {
+      vi.useFakeTimers();
+      const onActive = vi.fn();
+      const mod = await import("../../src/main/session-timer.js");
+      const handle = mod.createSessionTimer({
+        broadcast: mockBroadcastToWindows,
+        onSessionActiveChange: onActive,
+      });
+      const original = handle.startSession(2);
+      vi.advanceTimersByTime(60_000);
+      mockBroadcastToWindows.mockClear();
+      onActive.mockClear();
+      const settingsBefore = { ...settingsState };
+
+      const result = handle.extendSession(1);
+
+      expect(result).toMatchObject({
+        ok: true,
+        status: { startedAt: original.startedAt, durationMinutes: 3, remainingSeconds: 120 },
+      });
+      expect(mockBroadcastToWindows).toHaveBeenCalledTimes(1);
+      expect(onActive).not.toHaveBeenCalled();
+      expect(settingsState).toEqual(settingsBefore);
+      vi.advanceTimersByTime(60_000);
+      expect(handle.sessionActive).toBe(true);
+      vi.advanceTimersByTime(60_000);
+      expect(handle.sessionActive).toBe(false);
+      handle.cleanup();
+    });
+
+    it("rejects an idle extension without broadcasting", async () => {
+      const handle = await buildHandle();
+      mockBroadcastToWindows.mockClear();
+
+      expect(handle.extendSession(15)).toEqual({ ok: false, reason: "idle" });
+      expect(mockBroadcastToWindows).not.toHaveBeenCalled();
+      handle.cleanup();
+    });
+  });
+
   describe("cancelSession", () => {
     it("running - cancels active session", () => {
       startSession(30);

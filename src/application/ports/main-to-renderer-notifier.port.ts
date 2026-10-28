@@ -1,4 +1,5 @@
 import type { AppSettings } from "../../domain/settings/app-settings.js";
+import type { BatteryMonitorStatus } from "../../domain/battery/monitor-status.js";
 import type { AutoUpdaterStatus, SessionStatusResponse } from "../../shared/types.js";
 
 /**
@@ -8,6 +9,7 @@ import type { AutoUpdaterStatus, SessionStatusResponse } from "../../shared/type
 export type AppPushEvent =
   | { type: "settings-changed"; settings: AppSettings }
   | { type: "session-status"; status: SessionStatusResponse }
+  | { type: "battery-status"; status: BatteryMonitorStatus }
   | { type: "shortcut-registration-failed"; accelerator: string }
   | { type: "auto-updater-status"; status: AutoUpdaterStatus };
 

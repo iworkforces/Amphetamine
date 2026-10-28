@@ -5,6 +5,7 @@ const mockGetSettings = vi.hoisted(() =>
     launchAtLogin: false,
     preventSleep: false,
     defaultSessionDuration: null,
+    quickSessionDurations: [15, 30, 60, 120],
     batteryThreshold: 0,
     shortcut: "",
     sleepBlockMode: "prevent-display-sleep",
@@ -19,6 +20,7 @@ const mockIsPreventingSleep = vi.hoisted(() => vi.fn().mockReturnValue(false));
 const mockCreateSessionTimer = vi.hoisted(() =>
   vi.fn(() => ({
     startSession: vi.fn(),
+    extendSession: vi.fn(),
     cancelSession: vi.fn(),
     getStatus: vi.fn(),
     cleanup: vi.fn(),
@@ -138,6 +140,7 @@ describe("createAppComposition", () => {
     mockInitSettings.mockResolvedValue(undefined);
     mockCreateSessionTimer.mockReturnValue({
       startSession: vi.fn(),
+      extendSession: vi.fn().mockReturnValue({ ok: false, reason: "idle" }),
       cancelSession: vi.fn(),
       getStatus: vi.fn(),
       cleanup: vi.fn(),
@@ -156,6 +159,7 @@ describe("createAppComposition", () => {
       launchAtLogin: false,
       preventSleep: false,
       defaultSessionDuration: null,
+      quickSessionDurations: [15, 30, 60, 120],
       batteryThreshold: 0,
       shortcut: "",
       sleepBlockMode: "prevent-display-sleep",
@@ -171,6 +175,15 @@ describe("createAppComposition", () => {
     expect(() => deps.sessionTimer.getStatus()).toThrow(/not ready/i);
   });
 
+  it("forwards extension through the initialized timer", async () => {
+    const { createAppComposition } = await import("../../src/main/composition-root.js");
+    const composition = createAppComposition();
+    await composition.init();
+    expect(composition.getIpcDeps().sessionTimer.extendSession(15)).toEqual({ ok: false, reason: "idle" });
+    expect(mockCreateSessionTimer.mock.results[0]?.value.extendSession).toHaveBeenCalledWith(15);
+    composition.cleanup();
+  });
+
   it("session IPC deps work after init", async () => {
     const startSession = vi.fn().mockReturnValue({
       isRunning: true,
@@ -180,6 +193,7 @@ describe("createAppComposition", () => {
     });
     mockCreateSessionTimer.mockReturnValue({
       startSession,
+      extendSession: vi.fn(),
       cancelSession: vi.fn(),
       getStatus: vi.fn().mockReturnValue({
         isRunning: false,

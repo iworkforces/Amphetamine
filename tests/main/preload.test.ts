@@ -25,6 +25,7 @@ describe("preload", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     vi.resetModules();
+    mockInvoke.mockResolvedValue({ ok: false, reason: "rejected" });
 
     // Capture the API object passed to exposeInMainWorld
     mockExposeInMainWorld.mockImplementation(
@@ -111,6 +112,21 @@ describe("preload", () => {
     expect(mockInvoke).toHaveBeenCalledWith(IPC_CHANNELS.SESSION_START, {
       durationMinutes: null,
     });
+  });
+
+  it("exposes extension and battery query with removable status subscription", async () => {
+    await api.session.extend(15);
+    expect(mockInvoke).toHaveBeenCalledWith(IPC_CHANNELS.SESSION_START, { operation: "extend", additionalMinutes: 15 });
+    await api.battery.getStatus();
+    expect(mockInvoke).toHaveBeenCalledWith(IPC_CHANNELS.BATTERY_STATUS);
+    const callback = vi.fn();
+    const unsubscribe = api.battery.onStatusChange(callback);
+    const listener = mockOn.mock.calls.find(([channel]) => channel === IPC_CHANNELS.BATTERY_STATUS_UPDATE)?.[1];
+    const status = { state: "inactive", reason: null, current: null, lastSample: null };
+    listener({}, status);
+    expect(callback).toHaveBeenCalledWith(status);
+    unsubscribe();
+    expect(mockRemoveListener).toHaveBeenCalledWith(IPC_CHANNELS.BATTERY_STATUS_UPDATE, listener);
   });
 
   it("session.cancel calls ipcRenderer.invoke with correct channel", () => {

@@ -6,6 +6,7 @@
 import log from "electron-log";
 import { powerMonitor } from "electron/main";
 import type { AppSettings } from "../shared/types.js";
+import { cloneAppSettings } from "../domain/settings/app-settings.js";
 import { initSettings, getSettings, getSettingsStore, onSettingsChanged } from "./settings.js";
 import { getAutoLaunchPort } from "./auto-launch.js";
 import {
@@ -141,7 +142,7 @@ export function createAppComposition(): AppComposition {
         await initSettings();
         if (isClosing()) return;
         const settings = getSettings();
-        prevSettings = { ...settings };
+        prevSettings = cloneAppSettings(settings);
 
         getAutoLaunchPort().sync(settings.launchAtLogin);
         sessionActiveCache = false;
@@ -165,6 +166,7 @@ export function createAppComposition(): AppComposition {
           onPercentSample: (percent) => {
             lastBatteryPercent = percent;
           },
+          onStatusChange: (status) => notifier.publish({ type: "battery-status", status }),
         });
         void batteryMonitor
           .initBatteryMonitoring()
@@ -201,7 +203,7 @@ export function createAppComposition(): AppComposition {
         unsubscribeSettings = onSettingsChanged((next: AppSettings) => {
           const prev = prevSettings;
           reactions.handleChange(next, prev);
-          prevSettings = { ...next };
+          prevSettings = cloneAppSettings(next);
         });
 
         ready = true;
@@ -251,8 +253,12 @@ export function createAppComposition(): AppComposition {
     updateSettings: (partial) => updateSettingsUc(partial),
     createSettingsWindow,
     registerAutoUpdaterIpc,
+    getBatteryStatus: () => batteryMonitor?.getStatus() ?? {
+      state: "unavailable", reason: "awaiting-first-sample", current: null, lastSample: null,
+    },
     sessionTimer: {
       startSession: (durationMinutes) => requireSessionTimer().startSession(durationMinutes),
+      extendSession: (additionalMinutes) => requireSessionTimer().extendSession(additionalMinutes),
       cancelSession: () => requireSessionTimer().cancelSession(),
       getStatus: () => requireSessionTimer().getStatus(),
     },

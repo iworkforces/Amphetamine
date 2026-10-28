@@ -373,3 +373,12 @@ body {
   border-color: var(--danger);
   color: var(--danger);
 }
+
+.session-chip:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.status-error {
+  color: var(--danger);
+}
