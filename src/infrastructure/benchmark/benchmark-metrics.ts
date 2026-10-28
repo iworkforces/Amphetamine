@@ -4,6 +4,7 @@ import type {
   BatteryBenchmarkCounters,
   BenchmarkScenario,
   RendererCountdownTimerCounters,
+  BenchmarkLoadResult,
 } from "../../shared/benchmark-types.js";
 
 export type MainTimerCounters = {
@@ -55,6 +56,26 @@ export type BenchmarkArtifact = {
     readonly name: BenchmarkScenario;
     /** Minutes for active-session timed run; null for idle. */
     readonly sessionDurationMinutes: number | null;
+    readonly evidence:
+      | {
+          readonly kind: "idle";
+          readonly before: IdleEvidence;
+          readonly after: IdleEvidence;
+        }
+      | {
+          readonly kind: "active-session";
+          readonly sessionRunning: true;
+          readonly countdownActive: true;
+          readonly countdownStops: number;
+          readonly countdownClears: number;
+        };
+  };
+  readonly readiness: {
+    readonly popover: BenchmarkLoadResult;
+    readonly settings: readonly {
+      readonly load: BenchmarkLoadResult;
+      readonly ready: BenchmarkLoadResult;
+    }[];
   };
   readonly timestamps: {
     readonly startedAt: string;
@@ -96,11 +117,36 @@ export type BenchmarkArtifact = {
   readonly timerCounters: BenchmarkTimerCounters;
 };
 
-export type LoadResult =
-  | { readonly kind: "already-loaded"; readonly elapsedMs: number }
-  | { readonly kind: "loaded"; readonly elapsedMs: number }
-  | { readonly kind: "timeout"; readonly elapsedMs: number }
-  | { readonly kind: "failed"; readonly elapsedMs: number };
+export type LoadResult = BenchmarkLoadResult;
+
+export type IdleEvidence = {
+  readonly sessionRunning: boolean;
+  readonly preventSleep: boolean;
+  readonly countdownActive: boolean;
+};
+
+export function interpretLegacyScenario(value: unknown): BenchmarkScenario | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  if (!("scenario" in value)) return "idle";
+  return value.scenario === "idle" || value.scenario === "active-session" ? value.scenario : null;
+}
+
+export function isConfirmedActiveSession(
+  status: unknown,
+  counters: RendererCountdownTimerCounters,
+): boolean {
+  return (
+    typeof status === "object" &&
+    status !== null &&
+    "isRunning" in status &&
+    status.isRunning === true &&
+    "remainingSeconds" in status &&
+    typeof status.remainingSeconds === "number" &&
+    Number.isFinite(status.remainingSeconds) &&
+    status.remainingSeconds > 0 &&
+    counters.active
+  );
+}
 
 export function buildRuntimeInfo(): BenchmarkArtifact["runtime"] {
   const cpuList = cpus();
@@ -119,7 +165,9 @@ export function buildRuntimeInfo(): BenchmarkArtifact["runtime"] {
   };
 }
 
-export function summarizeIdle(samples: readonly IdleSample[]): BenchmarkArtifact["idle"]["summary"] {
+export function summarizeIdle(
+  samples: readonly IdleSample[],
+): BenchmarkArtifact["idle"]["summary"] {
   return {
     cpuPercent: summarize(samples.map((sample) => sample.totalCpuPercent)),
     idleWakeups: summarize(samples.map((sample) => sample.totalIdleWakeups)),

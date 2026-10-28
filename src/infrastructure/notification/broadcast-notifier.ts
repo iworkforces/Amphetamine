@@ -19,6 +19,9 @@ export function createBroadcastNotifier(
         case "session-status":
           broadcast(IPC_CHANNELS.SESSION_STATUS_UPDATE, event.status);
           return;
+        case "battery-status":
+          broadcast(IPC_CHANNELS.BATTERY_STATUS_UPDATE, event.status);
+          return;
         case "shortcut-registration-failed":
           broadcast(IPC_CHANNELS.SHORTCUT_REGISTRATION_FAILED, {
             accelerator: event.accelerator,

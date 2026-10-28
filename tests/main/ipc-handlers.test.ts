@@ -147,6 +147,30 @@ describe("ipc-handlers", () => {
       );
   });
 
+  it("authenticates cached battery queries before calling the getter", async () => {
+    const status = { state: "sample", reason: null, current: { percent: 75, sampledAt: 1 }, lastSample: { percent: 75, sampledAt: 1 } };
+    const getter = vi.fn(() => status);
+    registerIpcHandlers({}, { ...(makeIpcDeps() as object), getBatteryStatus: getter });
+    const handler = registeredHandlers.get(IPC_CHANNELS.BATTERY_STATUS);
+    expect(await handler?.({ senderFrame: { url: "https://evil.com/" } })).toEqual({ state: "unavailable", reason: "unavailable", current: null, lastSample: null });
+    expect(getter).not.toHaveBeenCalled();
+    expect(await handler?.({ senderFrame: { url: "file:///mock/app/lib/renderer/index.html" } })).toEqual(status);
+    expect(getter).toHaveBeenCalledOnce();
+  });
+
+  it("dispatches extension only for authenticated, well-formed operations", async () => {
+    const extendSession = vi.fn(() => ({ ok: false, reason: "idle" }));
+    registerIpcHandlers({}, { ...(makeIpcDeps() as object), sessionTimer: { startSession: mockStartSession, extendSession, cancelSession: mockCancelSession, getStatus: mockGetStatus } });
+    const handler = registeredHandlers.get(IPC_CHANNELS.SESSION_START);
+    const valid = { senderFrame: { url: "file:///mock/app/lib/renderer/index.html" } };
+    expect(await handler?.(valid, { operation: "extend", additionalMinutes: 15 })).toEqual({ ok: false, reason: "idle" });
+    expect(await handler?.(valid, { operation: "other", durationMinutes: 30 })).toEqual({ ok: false, reason: "rejected" });
+    expect(await handler?.(valid, { operation: "extend", additionalMinutes: "15" })).toEqual({ ok: false, reason: "invalid-additional-minutes" });
+    expect(await handler?.({ senderFrame: { url: "https://evil.com/" } }, { operation: "extend", additionalMinutes: 15 })).toEqual({ ok: false, reason: "rejected" });
+    expect(extendSession).toHaveBeenCalledOnce();
+    expect(mockStartSession).not.toHaveBeenCalled();
+  });
+
   describe("registration lifetime", () => {
     it("unregisters public channels and pending resize once without touching private channels", async () => {
       vi.useFakeTimers();
@@ -174,7 +198,7 @@ describe("ipc-handlers", () => {
         await vi.advanceTimersByTimeAsync(16);
 
         expect(registeredHandlers).toEqual(new Map([["utility-dialog:close", privateHandler]]));
-        expect(mockIpcMainRemoveHandler).toHaveBeenCalledTimes(10);
+        expect(mockIpcMainRemoveHandler).toHaveBeenCalledTimes(11);
         expect(mockIpcMainOff).toHaveBeenCalledExactlyOnceWith(
           IPC_CHANNELS.WINDOW_SET_HEIGHT,
           resize,
@@ -258,7 +282,7 @@ describe("ipc-handlers", () => {
       expect(() => unregister()).not.toThrow();
 
       expect(registeredHandlers).toEqual(new Map([["utility-dialog:close", privateHandler]]));
-      expect(mockIpcMainRemoveHandler).toHaveBeenCalledTimes(10);
+      expect(mockIpcMainRemoveHandler).toHaveBeenCalledTimes(11);
       expect(mockIpcMainOff).toHaveBeenCalledTimes(1);
     });
 
@@ -271,7 +295,7 @@ describe("ipc-handlers", () => {
       unregister();
 
       expect(registeredHandlers.size).toBe(0);
-      expect(mockIpcMainRemoveHandler).toHaveBeenCalledTimes(9);
+      expect(mockIpcMainRemoveHandler).toHaveBeenCalledTimes(10);
       expect(mockIpcMainOff).toHaveBeenCalledTimes(1);
     });
 
@@ -287,7 +311,7 @@ describe("ipc-handlers", () => {
       expect(() => registerIpcHandlers({}, deps)).toThrow(registrationError);
 
       expect(registeredHandlers.size).toBe(0);
-      expect(mockIpcMainRemoveHandler).toHaveBeenCalledTimes(9);
+      expect(mockIpcMainRemoveHandler).toHaveBeenCalledTimes(10);
       expect(mockIpcMainOff).toHaveBeenCalledWith(
         IPC_CHANNELS.WINDOW_SET_HEIGHT,
         expect.any(Function),
@@ -308,7 +332,7 @@ describe("ipc-handlers", () => {
       expect(() => registerIpcHandlers({}, deps)).toThrow(registrationError);
 
       expect(registeredHandlers.size).toBe(0);
-      expect(mockIpcMainRemoveHandler).toHaveBeenCalledTimes(10);
+      expect(mockIpcMainRemoveHandler).toHaveBeenCalledTimes(11);
       expect(mockIpcMainOff).toHaveBeenCalledTimes(1);
     });
 

@@ -1,11 +1,16 @@
 import type { PerfTimestamp } from "../../domain/time/perf-timestamp.js";
 import { asPerf } from "../../domain/time/perf-timestamp.js";
 import { MS_PER_MINUTE } from "../../domain/time/units.js";
+import { MAX_SESSION_DURATION_MINUTES } from "../../domain/session/duration.js";
 import type { ClockPort } from "../ports/clock.port.js";
 import type { SchedulePort } from "../ports/schedule.port.js";
 import type { LoggerPort } from "../ports/logger.port.js";
 import type { MainToRendererNotifierPort } from "../ports/main-to-renderer-notifier.port.js";
-import type { SessionStatusResponse } from "../../shared/types.js";
+import type {
+  SessionExtendResponse,
+  SessionStatusResponse,
+  TimedSessionStatus,
+} from "../../shared/types.js";
 
 /** Public snapshot returned by start/cancel (not the wire SessionStartResponse). */
 export interface SessionSnapshot {
@@ -25,6 +30,7 @@ export interface SessionEngineDeps {
 
 export interface SessionEngine {
   startSession: (durationMinutes: number | null) => SessionSnapshot;
+  extendSession: (additionalMinutes: number) => SessionExtendResponse;
   cancelSession: () => SessionSnapshot;
   getStatus: () => SessionStatusResponse;
   cleanup: () => void;
@@ -73,9 +79,11 @@ export function createSessionEngine(deps: SessionEngineDeps): SessionEngine {
   const onSessionActiveChange = deps.onSessionActiveChange;
 
   let state: InternalSessionState = { kind: "idle" };
+  let scheduleGeneration = 0;
 
   const clearTimedExpiry = (): void => {
     if (state.kind === "timed") {
+      scheduleGeneration += 1;
       state.cancelExpiry();
     }
   };
@@ -130,8 +138,9 @@ export function createSessionEngine(deps: SessionEngineDeps): SessionEngine {
   };
 
   const armTimedExpiry = (delayMs: number): { cancel: () => void } => {
+    const generation = ++scheduleGeneration;
     return schedule.schedule(delayMs, () => {
-      fireExpiry();
+      if (generation === scheduleGeneration) fireExpiry();
     });
   };
 
@@ -182,6 +191,42 @@ export function createSessionEngine(deps: SessionEngineDeps): SessionEngine {
     };
   };
 
+  const extendSession = (additionalMinutes: number): SessionExtendResponse => {
+    if (!Number.isInteger(additionalMinutes) || additionalMinutes <= 0) {
+      return { ok: false, reason: "invalid-additional-minutes" };
+    }
+    if (state.kind === "idle") return { ok: false, reason: "idle" };
+    if (state.kind === "indefinite") return { ok: false, reason: "indefinite" };
+    const wallNow = clock.wallNow();
+    if (state.wallClockExpiresAt <= wallNow) return { ok: false, reason: "expired" };
+    const durationMinutes = state.durationMinutes + additionalMinutes;
+    if (durationMinutes > MAX_SESSION_DURATION_MINUTES) {
+      return { ok: false, reason: "duration-limit" };
+    }
+
+    const wallClockExpiresAt = state.wallClockExpiresAt + additionalMinutes * MS_PER_MINUTE;
+    const remainingMs = wallClockExpiresAt - wallNow;
+    const expiresAt = asPerf(clock.perfNow() + remainingMs);
+    clearTimedExpiry();
+    const handle = armTimedExpiry(remainingMs);
+    state = {
+      ...state,
+      durationMinutes,
+      wallClockExpiresAt,
+      expiresAt,
+      cancelExpiry: handle.cancel,
+    };
+    const status: TimedSessionStatus = {
+      isRunning: true,
+      startedAt: state.startedAt,
+      expiresAt,
+      remainingSeconds: Math.floor(remainingMs / 1000),
+      durationMinutes,
+    };
+    notifier.publish({ type: "session-status", status });
+    return { ok: true, status };
+  };
+
   const cancelSession = (): SessionSnapshot => {
     const wasActive = state.kind !== "idle";
     clearTimedExpiry();
@@ -203,7 +248,7 @@ export function createSessionEngine(deps: SessionEngineDeps): SessionEngine {
       fireExpiry();
       return;
     }
-    state.cancelExpiry();
+    clearTimedExpiry();
     // Realign perf expiry so anchors and any perf-based math match wall remaining.
     const expiresAt = asPerf(clock.perfNow() + remainingMs);
     const handle = armTimedExpiry(remainingMs);
@@ -218,6 +263,7 @@ export function createSessionEngine(deps: SessionEngineDeps): SessionEngine {
 
   return {
     startSession,
+    extendSession,
     cancelSession,
     getStatus,
     cleanup,

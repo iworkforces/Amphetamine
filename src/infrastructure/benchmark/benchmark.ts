@@ -12,7 +12,13 @@ import {
   isBenchmarkMode,
 } from "./benchmark-env.js";
 import {
+  installBenchmarkReadinessTracking,
+  waitForWindowLoad,
+  waitForWindowReadyToShow,
+} from "./benchmark-readiness.js";
+import {
   buildRuntimeInfo,
+  isConfirmedActiveSession,
   round,
   summarize,
   summarizeIdle,
@@ -22,17 +28,15 @@ import {
   type BenchmarkContext,
   type BenchmarkTimerCounters,
   type IdleSample,
+  type IdleEvidence,
   type LoadResult,
   type MainTimerCounters,
 } from "./benchmark-metrics.js";
-import {
-  getBatteryBenchmarkCounters,
-} from "../../main/battery-monitor.js";
+import { getBatteryBenchmarkCounters } from "../../main/battery-monitor.js";
 
 const RESULT_PREFIX = "AMPHETAMINE_BENCHMARK_RESULT:";
 const RENDERER_COUNTER_SCRIPT =
   "globalThis.__AMPHETAMINE_BENCHMARK__?.getRendererCountdownTimerCounters?.() ?? null";
-const LOAD_TIMEOUT_MS = 7000;
 const RESPONSIVENESS_SAMPLE_COUNT = 5;
 const IDLE_SAMPLE_COUNT = 6;
 const IDLE_SAMPLE_INTERVAL_MS = 250;
@@ -70,6 +74,7 @@ export function configureBenchmarkEnvironment(): void {
 
 export function installBenchmarkTimerCounters(): void {
   if (!isBenchmarkMode() || timerHook !== null) return;
+  installBenchmarkReadinessTracking();
   timerHook = createHook({
     init(asyncId, type) {
       if (type !== "Timeout") return;
@@ -94,13 +99,42 @@ export async function runBenchmarkIfRequested(context: BenchmarkContext): Promis
   const scenario = getBenchmarkScenario();
   const startedAt = new Date().toISOString();
   const startMs = performance.now();
+  const popoverWaitStarted = performance.now();
   const popoverDomReady = await waitForWindowLoad(context.mainWindow);
+  const popoverDomReadyMs = round(performance.now() - popoverWaitStarted);
+  requireLoaded(popoverDomReady);
 
+  let countdownBaseline: RendererCountdownTimerCounters | null = null;
+  let idleBefore: IdleEvidence | null = null;
   if (scenario === "active-session") {
     await prepareActiveSessionScenario(context.mainWindow);
-  }
+    countdownBaseline = await readRendererCountdownTimerCounters(context.mainWindow);
+    if (!countdownBaseline.active)
+      throw new Error("[benchmark] countdown stopped before sampling.");
+  } else idleBefore = await confirmIdleScenario(context.mainWindow);
 
   const idleSamples = await collectIdleSamples(startMs, context.mainWindow);
+  let idleAfter: IdleEvidence | null = null;
+  if (scenario === "active-session") {
+    if (
+      countdownBaseline === null ||
+      !idleSamples.every((sample) => {
+        const countdown = sample.timerCounters.rendererCountdown;
+        return (
+          countdown.active &&
+          countdown.stops === countdownBaseline.stops &&
+          countdown.clears === countdownBaseline.clears
+        );
+      })
+    ) {
+      throw new Error("[benchmark] countdown was inactive during sampling.");
+    }
+    await confirmActiveSession(context.mainWindow);
+  } else {
+    if (idleSamples.some((sample) => sample.timerCounters.rendererCountdown.active))
+      throw new Error("[benchmark] countdown was active during idle sampling.");
+    idleAfter = await confirmIdleScenario(context.mainWindow);
+  }
   const popoverShowHide = sampleSync(() => {
     context.mainWindow.showInactive();
     context.mainWindow.hide();
@@ -108,6 +142,19 @@ export async function runBenchmarkIfRequested(context: BenchmarkContext): Promis
   const trayMenuProxy = await sampleTrayMenuProxy();
   const settingsWindowReady = await sampleSettingsWindowReady();
   const rendererCountdownCounters = await readRendererCountdownTimerCounters(context.mainWindow);
+  const evidence: BenchmarkArtifact["scenarioMeta"]["evidence"] | null =
+    countdownBaseline !== null
+      ? {
+          kind: "active-session",
+          sessionRunning: true,
+          countdownActive: true,
+          countdownStops: countdownBaseline.stops,
+          countdownClears: countdownBaseline.clears,
+        }
+      : idleBefore !== null && idleAfter !== null
+        ? { kind: "idle", before: idleBefore, after: idleAfter }
+        : null;
+  if (evidence === null) throw new Error("[benchmark] scenario was not confirmed.");
 
   const artifact: BenchmarkArtifact = {
     schemaVersion: 1,
@@ -117,18 +164,22 @@ export async function runBenchmarkIfRequested(context: BenchmarkContext): Promis
       name: scenario,
       sessionDurationMinutes:
         scenario === "active-session" ? BENCHMARK_ACTIVE_SESSION_MINUTES : null,
+      evidence,
     },
+    readiness: { popover: popoverDomReady, settings: settingsWindowReady },
     timestamps: { startedAt, completedAt: new Date().toISOString() },
     runtime: buildRuntimeInfo(),
     launchReadiness: {
       appReadyMs: round(context.appReadyMs),
       bootstrapReadyMs: round(context.bootstrapReadyMs),
-      popoverDomReadyMs: round(popoverDomReady.elapsedMs),
+      popoverDomReadyMs,
     },
     responsiveness: {
       popoverShowHide: summarize(popoverShowHide),
       trayMenuProxy: summarize(trayMenuProxy),
-      settingsWindowReady: summarize(settingsWindowReady),
+      settingsWindowReady: summarize(
+        settingsWindowReady.map((result) => round(result.ready.elapsedMs)),
+      ),
     },
     idle: {
       sampleIntervalMs: IDLE_SAMPLE_INTERVAL_MS,
@@ -157,7 +208,7 @@ async function prepareActiveSessionScenario(win: BrowserWindow): Promise<void> {
     typeof startResult !== "object" ||
     startResult === null ||
     !("ok" in startResult) ||
-    (startResult as { ok: unknown }).ok !== true
+    startResult.ok !== true
   ) {
     throw new Error(
       `[benchmark] active-session scenario failed to start session: ${JSON.stringify(startResult)}`,
@@ -166,14 +217,56 @@ async function prepareActiveSessionScenario(win: BrowserWindow): Promise<void> {
 
   const deadline = performance.now() + ACTIVE_SESSION_CONFIRM_TIMEOUT_MS;
   while (performance.now() < deadline) {
-    const counters = await readRendererCountdownTimerCounters(win);
-    if (counters.active || counters.starts > 0 || counters.schedules > 0) {
-      return;
-    }
+    if (await isActiveSession(win)) return;
     await sleep(50);
   }
-  // Countdown may still be zero if the window was not considered visible in test
-  // environments; status start success is the hard gate above.
+  throw new Error("[benchmark] active-session scenario was not confirmed.");
+}
+
+async function isActiveSession(win: BrowserWindow): Promise<boolean> {
+  const status: unknown = await win.webContents.executeJavaScript(
+    "window.api.session.getStatus()",
+    true,
+  );
+  const counters = await readRendererCountdownTimerCounters(win);
+  return isConfirmedActiveSession(status, counters);
+}
+
+async function confirmActiveSession(win: BrowserWindow): Promise<void> {
+  if (!(await isActiveSession(win)))
+    throw new Error("[benchmark] active session ended during sampling.");
+}
+
+async function confirmIdleScenario(win: BrowserWindow): Promise<IdleEvidence> {
+  const status: unknown = await win.webContents.executeJavaScript(
+    "window.api.session.getStatus()",
+    true,
+  );
+  const settings: unknown = await win.webContents.executeJavaScript("window.api.settings.get()", true);
+  const counters = await readRendererCountdownTimerCounters(win);
+  if (
+    typeof status !== "object" ||
+    status === null ||
+    !("isRunning" in status) ||
+    typeof status.isRunning !== "boolean" ||
+    typeof settings !== "object" ||
+    settings === null ||
+    !("preventSleep" in settings) ||
+    typeof settings.preventSleep !== "boolean"
+  )
+    throw new Error("[benchmark] idle scenario state is unavailable.");
+  const evidence = {
+    sessionRunning: status.isRunning,
+    preventSleep: settings.preventSleep,
+    countdownActive: counters.active,
+  };
+  if (evidence.sessionRunning || evidence.preventSleep || evidence.countdownActive)
+    throw new Error("[benchmark] idle scenario was not confirmed.");
+  return evidence;
+}
+
+function requireLoaded(result: LoadResult): void {
+  if (result.kind !== "loaded") throw new Error(`[benchmark] window readiness ${result.kind}.`);
 }
 
 function snapshotMainTimerCounters(): MainTimerCounters {
@@ -212,16 +305,21 @@ async function sampleTrayMenuProxy(): Promise<readonly number[]> {
   });
 }
 
-async function sampleSettingsWindowReady(): Promise<readonly number[]> {
-  const { createSettingsWindow, closeSettingsWindow } = await import(
-    "../../main/settings-window.js"
-  );
-  const samples: number[] = [];
+async function sampleSettingsWindowReady(): Promise<BenchmarkArtifact["readiness"]["settings"]> {
+  const { createSettingsWindow, closeSettingsWindow } =
+    await import("../../main/settings-window.js");
+  const samples: { load: LoadResult; ready: LoadResult }[] = [];
   for (let index = 0; index < RESPONSIVENESS_SAMPLE_COUNT; index += 1) {
     const settingsWin = createSettingsWindow();
-    const result = await waitForWindowReadyToShow(settingsWin);
-    samples.push(round(result.elapsedMs));
-    closeSettingsWindow();
+    try {
+      const result = await waitForWindowReadyToShow(settingsWin);
+      requireLoaded(result);
+      const load = await waitForWindowLoad(settingsWin);
+      requireLoaded(load);
+      samples.push({ load, ready: result });
+    } finally {
+      closeSettingsWindow();
+    }
     await sleep(25);
   }
   return samples;
@@ -258,48 +356,6 @@ async function readRendererCountdownTimerCounters(
     return result;
   }
   throw new InvalidRendererBenchmarkCountersError();
-}
-
-async function waitForWindowLoad(win: BrowserWindow): Promise<LoadResult> {
-  if (!win.webContents.isLoading()) {
-    return { kind: "already-loaded", elapsedMs: 0 };
-  }
-  return waitForWebContentsEvent(win, "did-finish-load");
-}
-
-async function waitForWindowReadyToShow(win: BrowserWindow): Promise<LoadResult> {
-  return new Promise((resolve) => {
-    const started = performance.now();
-    const timeout = setTimeout(() => {
-      resolve({ kind: "timeout", elapsedMs: performance.now() - started });
-    }, LOAD_TIMEOUT_MS);
-    timeout.unref();
-    win.once("ready-to-show", () => {
-      clearTimeout(timeout);
-      resolve({ kind: "loaded", elapsedMs: performance.now() - started });
-    });
-  });
-}
-
-async function waitForWebContentsEvent(
-  win: BrowserWindow,
-  successEvent: "did-finish-load",
-): Promise<LoadResult> {
-  return new Promise((resolve) => {
-    const started = performance.now();
-    const timeout = setTimeout(() => {
-      resolve({ kind: "timeout", elapsedMs: performance.now() - started });
-    }, LOAD_TIMEOUT_MS);
-    timeout.unref();
-    win.webContents.once(successEvent, () => {
-      clearTimeout(timeout);
-      resolve({ kind: "loaded", elapsedMs: performance.now() - started });
-    });
-    win.webContents.once("did-fail-load", () => {
-      clearTimeout(timeout);
-      resolve({ kind: "failed", elapsedMs: performance.now() - started });
-    });
-  });
 }
 
 async function sleep(ms: number): Promise<void> {

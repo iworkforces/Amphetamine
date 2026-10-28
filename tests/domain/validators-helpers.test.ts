@@ -10,10 +10,49 @@ import {
   isValidAccelerator,
   isValidShortcutSetting,
   normalizeAcceleratorForPlatform,
+  isQuickSessionDurations,
 } from "../../src/domain/settings-validation/validators.js";
 import { DEFAULT_SETTINGS } from "../../src/domain/settings/app-settings.js";
 
 describe("validator helpers and merge edges", () => {
+  it.each([[1], [1440], [60, 1, 1440, 30, 15, 120]])(
+    "accepts a valid ordered preset list %j",
+    (...durations) => {
+      expect(isQuickSessionDurations(durations)).toBe(true);
+      const { merged, rejectedKeys } = mergeValidatedPartial(DEFAULT_SETTINGS, {
+        quickSessionDurations: durations,
+      });
+      expect(rejectedKeys).toEqual([]);
+      expect(merged.quickSessionDurations).toEqual(durations);
+      expect(merged.quickSessionDurations).not.toBe(durations);
+    },
+  );
+
+  it.each([
+    [], [0], [1441], [1.5], [NaN], [Infinity], [1, 1], [1, 2, 3, 4, 5, 6, 7],
+  ])("rejects an invalid list %j while preserving a valid sibling", (...durations) => {
+    const { merged, rejectedKeys } = mergeValidatedPartial(DEFAULT_SETTINGS, {
+      quickSessionDurations: durations,
+      preventSleep: true,
+    });
+    expect(rejectedKeys).toEqual(["quickSessionDurations"]);
+    expect(merged.quickSessionDurations).toEqual([15, 30, 60, 120]);
+    expect(merged.preventSleep).toBe(true);
+  });
+
+  it("rejects sparse preset lists", () => {
+    const sparse = [1, 2];
+    Reflect.deleteProperty(sparse, "0");
+    expect(isQuickSessionDurations(sparse)).toBe(false);
+  });
+
+  it.each(["15", null, ["15"], [15, null]])("rejects malformed presets %j", (value) => {
+    expect(isQuickSessionDurations(value)).toBe(false);
+    expect(validateRawSettings({ quickSessionDurations: value }).quickSessionDurations).toEqual([
+      15, 30, 60, 120,
+    ]);
+  });
+
   it("validate* helpers fall back", () => {
     expect(validateBoolean("x", true)).toBe(true);
     expect(validateBoolean(false, true)).toBe(false);

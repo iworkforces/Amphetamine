@@ -2,6 +2,7 @@ import "./styles/main.css";
 import type { AppSettings, PerfTimestamp, SessionStatusResponse } from "../shared/types.js";
 import { asPerf } from "../shared/types.js";
 import { isEffectivelyActive as isEffectivelyActiveState } from "../domain/session/effective-active.js";
+import { cloneAppSettings } from "../domain/settings/app-settings.js";
 import {
   installRendererBenchmarkCounters,
   recordCountdownCallback,
@@ -14,7 +15,14 @@ import {
   LABEL_CANCEL_SESSION,
   LABEL_PREVENT_SLEEP,
   LABEL_SESSION_DURATION,
-  SESSION_DURATION_CHIPS,
+  LABEL_INDEFINITE,
+  LABEL_EXTEND_SESSION,
+  LABEL_EXTENDING_SESSION,
+  ERROR_EXTEND_SESSION,
+  ERROR_EXTEND_DURATION_LIMIT,
+  ERROR_EXTEND_SESSION_ENDED,
+  sessionChipLabel,
+  sessionChipAccessibleLabel,
   ERROR_PREFERENCE_SAVE_FAILED,
   ERROR_SETTINGS_UNAVAILABLE,
   STATUS_PREVENTING_SLEEP,
@@ -33,6 +41,9 @@ let sessionStatus: SessionStatus = null;
 /** Anchor (in renderer's performance.now() domain) when the active session expires. */
 let sessionExpiresAtPerf: PerfTimestamp | null = null;
 let saveError: string | null = null;
+let extensionError: string | null = null;
+let extensionPending = false;
+let sessionLocallyExpired = false;
 let sessionUnavailable = true;
 let settingsRevision = 0;
 let sessionRevision = 0;
@@ -68,6 +79,7 @@ let renderRafId: number | null = null;
 let pendingFullControls = false;
 /** Last painted session-actions mode; skip rebuild when unchanged. */
 let sessionActionsMode: "running" | "idle" | null = null;
+let sessionActionDurations: readonly number[] = [];
 /** True once click delegation is bound on `#session-actions`. */
 let sessionActionsDelegated = false;
 
@@ -81,6 +93,7 @@ function getApp(): HTMLElement | null {
  * via wall-clock delta (Date.now() approximates the moment of receipt).
  */
 function updateSessionAnchors(status: SessionStatus): void {
+  sessionLocallyExpired = false;
   if (status !== null && status.isRunning && status.remainingSeconds !== null) {
     const remainingMs = status.remainingSeconds * 1000;
     sessionExpiresAtPerf = asPerf(performance.now() + remainingMs);
@@ -134,6 +147,13 @@ function startCountdownTicker(): void {
     recordCountdownCallback();
     // Only refresh display when a timed session is active locally.
     if (sessionExpiresAtPerf === null) return;
+    if (!sessionLocallyExpired && performance.now() >= sessionExpiresAtPerf) {
+      sessionLocallyExpired = true;
+      sessionRevision += 1;
+      extensionError = null;
+      updateStatusUI({ fullControls: true });
+      return;
+    }
     // Pure tick: timer text only (no full controls repaint).
     updateStatusUI();
   }, COUNTDOWN_TICK_MS);
@@ -189,11 +209,12 @@ function paintControls(): void {
     preventSleepToggleEl.setAttribute("aria-checked", String(settings?.preventSleep ?? false));
   }
   if (statusErrorEl) {
-    const error = saveError ?? (settings === null ? ERROR_SETTINGS_UNAVAILABLE : null);
+    const error = extensionError ?? saveError ?? (settings === null ? ERROR_SETTINGS_UNAVAILABLE : null);
     statusErrorEl.textContent = error ?? "";
     statusErrorEl.classList.toggle("visible", error !== null);
   }
   paintSessionActions();
+  resizeToContent();
 }
 
 /**
@@ -206,19 +227,75 @@ function paintSessionActions(): void {
   const running = Boolean(sessionStatus?.isRunning);
   const mode: "running" | "idle" = running ? "running" : "idle";
   ensureSessionActionsDelegation(sessionActionsEl);
-  if (mode === sessionActionsMode) {
-    return;
-  }
-  sessionActionsMode = mode;
   if (running) {
-    sessionActionsEl.innerHTML = `<button type="button" id="cancel-session-action" class="session-chip session-chip--cancel">${LABEL_CANCEL_SESSION}</button>`;
+    if (mode !== sessionActionsMode) {
+      sessionActionsEl.innerHTML = `<div class="session-chip-row"><button type="button" id="cancel-session-action" class="session-chip session-chip--cancel">${LABEL_CANCEL_SESSION}</button><button type="button" id="extend-session-action" class="session-chip" hidden>${LABEL_EXTEND_SESSION}</button></div>`;
+      sessionActionsMode = mode;
+    }
+    const extend = sessionActionsEl.querySelector<HTMLButtonElement>("#extend-session-action");
+    if (extend) {
+      extend.hidden = !canExtendSession();
+      extend.disabled = extensionPending;
+      extend.textContent = extensionPending ? LABEL_EXTENDING_SESSION : LABEL_EXTEND_SESSION;
+    }
     return;
   }
-  const chips = SESSION_DURATION_CHIPS.map(
-    (chip) =>
-      `<button type="button" class="session-chip" data-duration="${chip.minutes === null ? "" : String(chip.minutes)}">${chip.label}</button>`,
+  const durations = settings?.quickSessionDurations ?? [];
+  if (
+    mode === sessionActionsMode &&
+    durations.length === sessionActionDurations.length &&
+    durations.every((duration, index) => duration === sessionActionDurations[index])
+  ) return;
+  sessionActionsMode = mode;
+  sessionActionDurations = [...durations];
+  const chips = durations.map(
+    (minutes) =>
+      `<button type="button" class="session-chip" data-duration="${minutes}" aria-label="${sessionChipAccessibleLabel(minutes)}">${sessionChipLabel(minutes)}</button>`,
   ).join("");
-  sessionActionsEl.innerHTML = `<span class="session-actions-label">${LABEL_SESSION_DURATION}</span><div class="session-chip-row">${chips}</div>`;
+  sessionActionsEl.innerHTML = `<span class="session-actions-label">${LABEL_SESSION_DURATION}</span><div class="session-chip-row">${chips}<button type="button" class="session-chip" data-duration="">${LABEL_INDEFINITE}</button></div>`;
+}
+
+function canExtendSession(): boolean {
+  return sessionStatus?.isRunning === true && sessionStatus.durationMinutes !== null &&
+    sessionExpiresAtPerf !== null && performance.now() < sessionExpiresAtPerf;
+}
+
+async function extendSession(): Promise<void> {
+  if (disposed || extensionPending || !canExtendSession()) return;
+  extensionPending = true;
+  extensionError = null;
+  const revision = sessionRevision;
+  paintSessionActions();
+  try {
+    const response = await window.api.session.extend(15);
+    if (!canApplySessionRead(revision) || !canExtendSession()) return;
+    if (response.ok) {
+      sessionStatus = response.status;
+      sessionRevision += 1;
+      updateSessionAnchors(response.status);
+      syncCountdownTicker();
+    } else {
+      switch (response.reason) {
+        case "duration-limit":
+          extensionError = ERROR_EXTEND_DURATION_LIMIT;
+          break;
+        case "idle":
+        case "indefinite":
+        case "expired":
+          extensionError = ERROR_EXTEND_SESSION_ENDED;
+          break;
+        case "invalid-additional-minutes":
+        case "rejected":
+          extensionError = ERROR_EXTEND_SESSION;
+          break;
+      }
+    }
+  } catch {
+    if (canApplySessionRead(revision) && canExtendSession()) extensionError = ERROR_EXTEND_SESSION;
+  } finally {
+    extensionPending = false;
+    updateStatusUI({ fullControls: true });
+  }
 }
 
 function ensureSessionActionsDelegation(container: HTMLElement): void {
@@ -232,8 +309,14 @@ function ensureSessionActionsDelegation(container: HTMLElement): void {
       const btn = target.closest<HTMLButtonElement>("button.session-chip");
       if (btn === null || !container.contains(btn)) return;
       if (btn.id === "cancel-session-action") {
+        sessionRevision += 1;
+        extensionError = null;
         // Status arrives via SESSION_STATUS_UPDATE push; no redundant getStatus.
         void window.api.session.cancel();
+        return;
+      }
+      if (btn.id === "extend-session-action") {
+        void extendSession();
         return;
       }
       const raw = btn.dataset["duration"] ?? "";
@@ -298,7 +381,7 @@ async function refreshSettings(preserveSaveError = false): Promise<void> {
   try {
     const next = await window.api.settings.get();
     if (!canApplySettingsRead(readId, revision)) return;
-    settings = next;
+    settings = cloneAppSettings(next);
     settingsRevision += 1;
     if (!preserveSaveError) saveError = null;
   } catch (error) {
@@ -344,7 +427,7 @@ async function savePreference(next: boolean): Promise<void> {
     const response = await window.api.settings.set({ preventSleep: next });
     if (disposed) return;
     if (revision === settingsRevision) {
-      settings = response.settings;
+      settings = cloneAppSettings(response.settings);
       settingsRevision += 1;
     }
     const rejected = response.rejectedKeys.includes("preventSleep");
@@ -426,7 +509,7 @@ function render(version: string): void {
         <span id="status-text" class="status-text"></span>
       </section>
 
-      <p id="status-error" class="status-error status-text popover-status"></p>
+      <p id="status-error" class="status-error status-text popover-status" role="alert"></p>
 
       <div class="popover-toggle-row">
         <label class="popover-toggle-label" for="prevent-sleep-toggle">${LABEL_PREVENT_SLEEP}</label>
@@ -514,7 +597,7 @@ function setupPushSubscriptions(): void {
   unsubscribeSettings = window.api.onSettingsChanged((next) => {
     if (disposed) return;
     activeSettingsReadId = null;
-    settings = next;
+    settings = cloneAppSettings(next);
     settingsRevision += 1;
     saveError = null;
     updateStatusUI({ fullControls: true });
@@ -524,6 +607,7 @@ function setupPushSubscriptions(): void {
     if (disposed) return;
     sessionStatus = status;
     sessionRevision += 1;
+    extensionError = null;
     sessionUnavailable = false;
     updateSessionAnchors(status);
     syncCountdownTicker();

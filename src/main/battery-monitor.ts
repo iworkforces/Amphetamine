@@ -1,6 +1,7 @@
 import log from "electron-log";
 import type { BatterySensorPort } from "../application/ports/battery-sensor.port.js";
 import { isThresholdEnabled } from "../domain/battery/threshold.js";
+import type { BatteryMonitorStatus, BatterySample } from "../domain/battery/monitor-status.js";
 import { isBenchmarkMode } from "../infrastructure/benchmark/benchmark-env.js";
 import type { BatteryBenchmarkCounters } from "../shared/benchmark-types.js";
 import { DEFAULT_BATTERY_BENCHMARK_COUNTERS } from "../shared/benchmark-types.js";
@@ -66,10 +67,12 @@ export interface BatteryDeps {
   isPreventingSleep: () => boolean;
   /** Optional: report last successful charge percent for user feedback. */
   onPercentSample?: (percent: number | null) => void;
+  onStatusChange?: (status: BatteryMonitorStatus) => void;
 }
 
 /** Public handle returned by `createBatteryMonitor`. */
 export interface BatteryMonitorHandle {
+  getStatus: () => BatteryMonitorStatus;
   initBatteryMonitoring: () => Promise<void>;
   cleanupBatteryMonitoring: () => void;
   /**
@@ -121,9 +124,46 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
   let readInFlight = false;
   /** One coalesced fresh check owed for eligible triggers seen during the current read. */
   let followUpRequested = false;
+  let lastSample: BatterySample | null = null;
+  let currentSample: BatterySample | null = null;
+  let readingEpoch: number | null = null;
+  let unavailableReason: "awaiting-first-sample" | "unavailable" = "awaiting-first-sample";
+  let status: BatteryMonitorStatus = { state: "unavailable", reason: "awaiting-first-sample", current: null, lastSample: null };
+
+  const updateStatus = (): void => {
+    if (disposed) return;
+    let next: BatteryMonitorStatus;
+    if (!isThresholdEnabled(getThreshold())) {
+      next = { state: "disabled", reason: null, current: null, lastSample };
+    } else if (!isPreventingSleep()) {
+      next = { state: "inactive", reason: null, current: null, lastSample };
+    } else if (!sensor.isOnBatteryPower()) {
+      next = { state: "ac-power", reason: null, current: null, lastSample };
+    } else if (readingEpoch === policyEpoch) {
+      next = { state: "reading", reason: null, current: null, lastSample };
+    } else if (currentSample !== null) {
+      next = { state: "sample", reason: null, current: currentSample, lastSample };
+    } else {
+      next = { state: "unavailable", reason: unavailableReason, current: null, lastSample };
+    }
+    if (JSON.stringify(next) === JSON.stringify(status)) return;
+    status = next;
+    deps.onStatusChange?.(getStatus());
+  };
+
+  const getStatus = (): BatteryMonitorStatus => {
+    const last = status.lastSample === null ? null : { ...status.lastSample };
+    if (status.state === "sample") {
+      return { ...status, lastSample: last, current: { ...status.current } };
+    }
+    return { ...status, lastSample: last };
+  };
 
   const invalidatePendingReads = (): void => {
     policyEpoch += 1;
+    currentSample = null;
+    unavailableReason = "awaiting-first-sample";
+    updateStatus();
   };
 
   /** Threshold to enforce under current policy, or null when sampling has no authority. */
@@ -144,7 +184,12 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
     } catch (err) {
       // Still a completed attempt past the gate (I/O failed after entry).
       recordBattery("completedRead");
-      if (!disposed) log.warn("[battery] Failed to check battery level:", err);
+      if (epoch === policyEpoch && currentAuthority() !== null) {
+        readingEpoch = null;
+        unavailableReason = "unavailable";
+        updateStatus();
+        log.warn("[battery] Failed to check battery level:", err);
+      }
       return;
     }
     recordBattery("completedRead");
@@ -155,8 +200,19 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
     const threshold = currentAuthority();
     if (threshold === null) return;
 
+    readingEpoch = null;
+    if (percent === null || !Number.isFinite(percent) || percent < 0 || percent > 100) {
+      currentSample = null;
+      unavailableReason = "unavailable";
+      updateStatus();
+      onPercentSample?.(null);
+      return;
+    }
+    currentSample = { percent, sampledAt: Date.now() };
+    lastSample = currentSample;
+    updateStatus();
     onPercentSample?.(percent);
-    if (percent !== null && percent <= threshold) {
+    if (percent <= threshold) {
       log.info(`[battery] Auto-stop triggered: battery at ${percent}% (threshold: ${threshold}%)`);
       onAutoStop();
     }
@@ -175,6 +231,9 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
       return;
     }
     readInFlight = true;
+    readingEpoch = policyEpoch;
+    currentSample = null;
+    updateStatus();
     void readBatteryAndStop()
       .catch((err) => log.error(errorMessage, err))
       .finally(() => {
@@ -217,6 +276,7 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
   /** @internal Power monitor listeners persist for app lifetime by design. */
   const initBatteryMonitoring = async (): Promise<void> => {
     if (disposed || unsubscribePowerSource !== null) return;
+    updateStatus();
     unsubscribePowerSource = sensor.onPowerSourceChange({
       onBattery: () => {
         invalidatePendingReads();
@@ -282,7 +342,9 @@ export function createBatteryMonitor(deps: BatteryDeps): BatteryMonitorHandle {
     }
   };
 
+  updateStatus();
   return {
+    getStatus,
     initBatteryMonitoring,
     cleanupBatteryMonitoring,
     onPreventSleepChange,

@@ -14,6 +14,8 @@ import type {
   IpcChannelMap,
   IpcRequest,
   IpcResponse,
+  SessionStartResponse,
+  SessionExtendResponse,
 } from "../shared/types.js";
 
 /**
@@ -71,14 +73,32 @@ const api = {
   },
 
   session: {
-    start: (
-      durationMinutes: number | null,
-    ): Promise<IpcResponse<typeof IPC_CHANNELS.SESSION_START>> =>
-      invoke(IPC_CHANNELS.SESSION_START, { durationMinutes }),
+    start: async (durationMinutes: number | null): Promise<SessionStartResponse> => {
+      const result = await invoke(IPC_CHANNELS.SESSION_START, { durationMinutes });
+      if (result.ok) return "startedAt" in result ? result : { ok: false, reason: "rejected" };
+      if (result.reason === "invalid-duration" || result.reason === "Duration cannot exceed 24 hours" || result.reason === "rejected") return { ok: false, reason: result.reason };
+      return { ok: false, reason: "rejected" };
+    },
+    extend: async (additionalMinutes: number): Promise<SessionExtendResponse> => {
+      const result = await invoke(IPC_CHANNELS.SESSION_START, { operation: "extend", additionalMinutes });
+      if (result.ok) return "status" in result ? result : { ok: false, reason: "rejected" };
+      if (result.reason === "invalid-duration" || result.reason === "Duration cannot exceed 24 hours") return { ok: false, reason: "rejected" };
+      return { ok: false, reason: result.reason };
+    },
     cancel: (): Promise<IpcResponse<typeof IPC_CHANNELS.SESSION_CANCEL>> =>
       invoke(IPC_CHANNELS.SESSION_CANCEL),
     getStatus: (): Promise<IpcResponse<typeof IPC_CHANNELS.SESSION_STATUS>> =>
       invoke(IPC_CHANNELS.SESSION_STATUS),
+  },
+
+  battery: {
+    getStatus: (): Promise<IpcResponse<typeof IPC_CHANNELS.BATTERY_STATUS>> =>
+      invoke(IPC_CHANNELS.BATTERY_STATUS),
+    onStatusChange: (callback: (status: IpcResponse<typeof IPC_CHANNELS.BATTERY_STATUS_UPDATE>) => void): (() => void) => {
+      const listener = (_event: IpcRendererEvent, status: IpcResponse<typeof IPC_CHANNELS.BATTERY_STATUS_UPDATE>) => callback(status);
+      ipcRenderer.on(IPC_CHANNELS.BATTERY_STATUS_UPDATE, listener);
+      return () => ipcRenderer.removeListener(IPC_CHANNELS.BATTERY_STATUS_UPDATE, listener);
+    },
   },
 
   onSettingsChanged: (callback: (_settings: AppSettings) => void) => {
@@ -196,7 +216,9 @@ type WiredChannels =
   | typeof IPC_CHANNELS.SESSION_STATUS_UPDATE
   | typeof IPC_CHANNELS.AUTO_UPDATER_CHECK
   | typeof IPC_CHANNELS.AUTO_UPDATER_STATUS
-  | typeof IPC_CHANNELS.SHORTCUT_REGISTRATION_FAILED;
+  | typeof IPC_CHANNELS.SHORTCUT_REGISTRATION_FAILED
+  | typeof IPC_CHANNELS.BATTERY_STATUS
+  | typeof IPC_CHANNELS.BATTERY_STATUS_UPDATE;
 
 type _UnwiredChannels = Exclude<IpcChannel, WiredChannels>;
 type _ExhaustivenessCheck = [_UnwiredChannels] extends [never]

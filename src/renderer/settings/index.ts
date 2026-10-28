@@ -1,6 +1,8 @@
 import "./styles.css";
 import type { AppSettings, SessionStatusResponse } from "../../shared/types.js";
 import { DEFAULT_SETTINGS } from "../../shared/types.js";
+import { cloneAppSettings, settingsFieldEqual } from "../../domain/settings/app-settings.js";
+import { createBatteryStatusView } from "./battery-status.js";
 import {
   DESC_ACTIVATE_FOR,
   DESC_BATTERY_THRESHOLD,
@@ -42,6 +44,12 @@ import {
   SHORTCUT_RECORDING,
   SHORTCUT_REGISTRATION_FAILED_PREFIX,
   WINDOW_TITLE,
+  LABEL_QUICK_SESSION_DURATIONS,
+  DESC_QUICK_SESSION_DURATIONS,
+  QUICK_SESSION_DURATIONS_PLACEHOLDER,
+  ERROR_QUICK_SESSION_DURATIONS,
+  LABEL_BATTERY_MONITOR,
+  sessionDurationOptionLabel,
 } from "./constants.js";
 
 const heroIcon = new URL("../../assets/settings-hero-icon.png", import.meta.url).toString();
@@ -54,9 +62,10 @@ const SETTINGS_KEYS = [
   "batteryThreshold",
   "shortcut",
   "sleepBlockMode",
+  "quickSessionDurations",
 ] as const satisfies readonly (keyof AppSettings)[];
 
-let confirmedSettings: AppSettings = { ...DEFAULT_SETTINGS };
+let confirmedSettings: AppSettings = cloneAppSettings(DEFAULT_SETTINGS);
 let sessionStatus: SessionStatusResponse | null = null;
 let inFlightPartial: Partial<AppSettings> = {};
 let pendingPartial: Partial<AppSettings> = {};
@@ -76,6 +85,8 @@ const keyPushVersions: Partial<Record<keyof AppSettings, number>> = {};
 let sessionPushVersion = 0;
 let sessionStartVersion = 0;
 let pendingSessionDuration: number | null | undefined;
+let quickSessionDraft: string | null = null;
+let quickSessionEditVersion = 0;
 let shortcutEdited = false;
 const saveIndicatorTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let isRecordingShortcut = false;
@@ -260,6 +271,17 @@ function buildSettingsForm(): string {
               </select>
             </div>
           </div>
+          <div class="setting-row setting-row--stacked">
+            <div class="setting-row-inner">
+              <label class="setting-label" for="quick-session-durations-input">${LABEL_QUICK_SESSION_DURATIONS}</label>
+              <span id="desc-quick-sessions" class="setting-description">${DESC_QUICK_SESSION_DURATIONS}</span>
+            </div>
+            <div class="setting-control setting-control--wide">
+              <input type="text" id="quick-session-durations-input" class="setting-text-input" aria-describedby="desc-quick-sessions quick-session-error" placeholder="${QUICK_SESSION_DURATIONS_PLACEHOLDER}" />
+              <span class="save-indicator" id="quick-session-save-indicator" aria-live="polite"></span>
+            </div>
+            <span id="quick-session-error" class="setting-description setting-field-error" role="alert"></span>
+          </div>
         </div>
       </section>
 
@@ -293,6 +315,13 @@ function buildSettingsForm(): string {
                 <option value="prevent-display-sleep"${settings.sleepBlockMode === "prevent-display-sleep" ? " selected" : ""}>${OPTION_DISPLAY_SLEEP}</option>
                 <option value="prevent-app-suspension"${settings.sleepBlockMode === "prevent-app-suspension" ? " selected" : ""}>${OPTION_ALLOW_DISPLAY_SLEEP}</option>
               </select>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-row-inner" role="status" aria-live="polite">
+              <span class="setting-label">${LABEL_BATTERY_MONITOR}</span>
+              <span id="battery-monitor-status" class="setting-description"></span>
+              <span id="battery-monitor-history" class="setting-description"></span>
             </div>
           </div>
         </div>
@@ -391,6 +420,31 @@ function startOpenAnimation(app: HTMLElement): void {
 
 /** Attach change listeners to toggles and dropdown */
 function attachFormListeners(): void {
+  const quickDurationsInput = document.querySelector<HTMLInputElement>("#quick-session-durations-input");
+  const saveQuickDurations = (event: Event): void => {
+    if (!quickDurationsInput) return;
+    if (quickSessionDraft !== quickDurationsInput.value) {
+      quickSessionDraft = quickDurationsInput.value;
+      quickSessionEditVersion += 1;
+    }
+    const raw = quickDurationsInput.value.trim();
+    const quickSessionDurations = raw === "" ? [] : raw.split(",").map((part) => Number(part.trim()));
+    const current = displayedSettings();
+    if (settingsFieldEqual(current, { ...current, quickSessionDurations }, "quickSessionDurations")) {
+      if (!Object.hasOwn(pendingPartial, "quickSessionDurations") &&
+        !Object.hasOwn(inFlightPartial, "quickSessionDurations")) {
+        if (event.type === "change") quickSessionDraft = null;
+        rejectedSaveKeys.delete("quickSessionDurations");
+        writeSaveErrors.delete("quickSessionDurations");
+        renderErrorMessage();
+        updateSettingsUI();
+      }
+      return;
+    }
+    saveSettings({ quickSessionDurations }, "quick-session-save-indicator");
+  };
+  quickDurationsInput?.addEventListener("input", saveQuickDurations);
+  quickDurationsInput?.addEventListener("change", saveQuickDurations);
   const launchToggle = document.getElementById("launch-at-login-toggle") as HTMLInputElement | null;
   if (launchToggle) {
     launchToggle.addEventListener("change", () => {
@@ -477,10 +531,14 @@ function renderErrorMessage(): void {
     const saveErrorMessage =
       writeSaveErrors.values().next().value ??
       (rejectedSaveKeys.size > 0
-        ? `${ERROR_REJECTED_KEYS_PREFIX}: ${[...rejectedSaveKeys].join(", ")}`
+        ? `${ERROR_REJECTED_KEYS_PREFIX}: ${[...rejectedSaveKeys].map((key) => key === "quickSessionDurations" ? LABEL_QUICK_SESSION_DURATIONS : key).join(", ")}`
         : null);
     errorEl.textContent = shortcutErrorMessage ?? sessionErrorMessage ?? saveErrorMessage ?? "";
   }
+  const quickError = document.getElementById("quick-session-error");
+  const rejected = rejectedSaveKeys.has("quickSessionDurations");
+  if (quickError) quickError.textContent = rejected ? ERROR_QUICK_SESSION_DURATIONS : "";
+  document.getElementById("quick-session-durations-input")?.setAttribute("aria-invalid", String(rejected));
 }
 
 function setSessionErrorMessage(message: string | null): void {
@@ -507,6 +565,8 @@ function render(): void {
 function updateSettingsUI(): void {
   if (disposed) return;
   const s = displayedSettings();
+  const quickDurationsInput = document.querySelector<HTMLInputElement>("#quick-session-durations-input");
+  if (quickDurationsInput) quickDurationsInput.value = quickSessionDraft ?? s.quickSessionDurations.join(", ");
   const launchToggle = document.getElementById("launch-at-login-toggle") as HTMLInputElement | null;
   if (launchToggle) {
     launchToggle.checked = s.launchAtLogin;
@@ -523,6 +583,15 @@ function updateSettingsUI(): void {
     "session-duration-select",
   ) as HTMLSelectElement | null;
   if (durationSelect) {
+    durationSelect.querySelector("[data-live-duration]")?.remove();
+    if (s.defaultSessionDuration !== null &&
+      !Array.from(durationSelect.options).some((option) => option.value === String(s.defaultSessionDuration))) {
+      const option = document.createElement("option");
+      option.value = String(s.defaultSessionDuration);
+      option.textContent = sessionDurationOptionLabel(s.defaultSessionDuration);
+      option.dataset["liveDuration"] = "true";
+      durationSelect.append(option);
+    }
     durationSelect.value =
       s.defaultSessionDuration === null ? "" : String(s.defaultSessionDuration);
   }
@@ -593,22 +662,28 @@ async function flushSave(): Promise<void> {
   )
     return;
   isSaving = true;
-  const toSend = { ...pendingPartial };
+  const toSend = globalThis.structuredClone(pendingPartial);
   const sentIndicators = { ...pendingIndicators };
   pendingPartial = {};
   pendingIndicators = {};
   pendingReady = false;
-  inFlightPartial = toSend;
+  inFlightPartial = globalThis.structuredClone(toSend);
   const savePushVersion = settingsPushVersion;
+  const saveQuickEditVersion = quickSessionEditVersion;
   try {
-    const res = await window.api.settings.set(toSend);
+    const res = await window.api.settings.set(globalThis.structuredClone(toSend));
     if (!isActive()) return;
     for (const key of SETTINGS_KEYS) {
       if ((keyPushVersions[key] ?? 0) <= savePushVersion) {
-        confirmedSettings = { ...confirmedSettings, [key]: res.settings[key] };
+        confirmedSettings = cloneAppSettings({ ...confirmedSettings, [key]: res.settings[key] });
       }
     }
     inFlightPartial = {};
+    if (Object.hasOwn(toSend, "quickSessionDurations") &&
+      !Object.hasOwn(pendingPartial, "quickSessionDurations") &&
+      saveQuickEditVersion === quickSessionEditVersion &&
+      (!res.rejectedKeys.includes("quickSessionDurations") ||
+        (keyPushVersions.quickSessionDurations ?? 0) > savePushVersion)) quickSessionDraft = null;
     updateSettingsUI();
     for (const key of SETTINGS_KEYS) {
       if (!Object.hasOwn(toSend, key)) continue;
@@ -620,18 +695,29 @@ async function flushSave(): Promise<void> {
         if (indicatorId) showSaveIndicator(indicatorId, SAVED_INDICATOR);
       }
     }
-    for (const key of res.rejectedKeys) rejectedSaveKeys.add(key);
+    for (const key of res.rejectedKeys) {
+      const settingsKey = SETTINGS_KEYS.find((candidate) => candidate === key);
+      if (settingsKey !== undefined && (keyPushVersions[settingsKey] ?? 0) > savePushVersion) continue;
+      rejectedSaveKeys.add(key);
+    }
     renderErrorMessage();
     if (quitDrainState === "draining" && res.rejectedKeys.length > 0) quitDrainState = "failed";
   } catch (err) {
     if (!isActive()) return;
-    pendingPartial = { ...toSend, ...pendingPartial };
+    const retryPartial = { ...toSend };
+    for (const key of SETTINGS_KEYS) {
+      if ((keyPushVersions[key] ?? 0) > savePushVersion) delete retryPartial[key];
+    }
+    pendingPartial = { ...retryPartial, ...pendingPartial };
     pendingIndicators = { ...sentIndicators, ...pendingIndicators };
     inFlightPartial = {};
+    if (Object.hasOwn(toSend, "quickSessionDurations") &&
+      !Object.hasOwn(pendingPartial, "quickSessionDurations") &&
+      saveQuickEditVersion === quickSessionEditVersion) quickSessionDraft = null;
     updateSettingsUI();
     const message = err instanceof Error ? err.message : ERROR_SAVE_SETTINGS;
     for (const key of SETTINGS_KEYS) {
-      if (Object.hasOwn(toSend, key)) writeSaveErrors.set(key, message);
+      if (Object.hasOwn(retryPartial, key)) writeSaveErrors.set(key, message);
     }
     renderErrorMessage();
     if (quitDrainState === "draining") quitDrainState = "failed";
@@ -657,7 +743,7 @@ async function flushSave(): Promise<void> {
 
 function saveSettings(partial: Partial<AppSettings>, indicatorId: string): void {
   if (disposed || quitDrainState === "saved" || quitDrainState === "failed") return;
-  pendingPartial = { ...pendingPartial, ...partial };
+  pendingPartial = globalThis.structuredClone({ ...pendingPartial, ...partial });
   for (const key of SETTINGS_KEYS) {
     if (Object.hasOwn(partial, key)) {
       pendingIndicators[key] = indicatorId;
@@ -737,6 +823,7 @@ function onSettingsVisibilityChange(): void {
 }
 
 async function init(): Promise<void> {
+  const batteryView = createBatteryStatusView();
   const cleanupQuitDrain = window.api.settings.onQuitDrain(onQuitDrain);
   const settingsReadVersion = settingsPushVersion;
   const statusReadVersion = sessionPushVersion;
@@ -744,11 +831,11 @@ async function init(): Promise<void> {
     if (disposed) return;
     settingsPushVersion++;
     for (const key of SETTINGS_KEYS) {
-      if (newSettings[key] !== confirmedSettings[key]) {
+      if (!settingsFieldEqual(newSettings, confirmedSettings, key)) {
         keyPushVersions[key] = settingsPushVersion;
       }
     }
-    confirmedSettings = { ...newSettings };
+    confirmedSettings = cloneAppSettings(newSettings);
     updateSettingsUI();
   });
   const cleanupSession = window.api.onSessionStatusUpdate((status) => {
@@ -782,6 +869,7 @@ async function init(): Promise<void> {
   function dispose(): void {
     if (disposed) return;
     disposed = true;
+    batteryView.dispose();
     cleanupSettings();
     cleanupSession();
     cleanupShortcutFailed();
@@ -806,7 +894,7 @@ async function init(): Promise<void> {
 
   const initialSettings = await window.api.settings.get().catch(() => null);
   if (!disposed && initialSettings && settingsPushVersion === settingsReadVersion) {
-    confirmedSettings = { ...initialSettings };
+    confirmedSettings = cloneAppSettings(initialSettings);
   }
   if (disposed) return;
 
@@ -817,6 +905,8 @@ async function init(): Promise<void> {
   if (!isActive()) return;
 
   render();
+  updateSettingsUI();
+  batteryView.paint();
 }
 
 function onDomReady(): void {

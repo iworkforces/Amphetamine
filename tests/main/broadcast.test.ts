@@ -85,3 +85,13 @@ describe("broadcastToWindows", () => {
     expect(mockSend).not.toHaveBeenCalled();
   });
 });
+
+it("routes a semantic battery status to renderer windows", async () => {
+  const { createBroadcastNotifier } = await import("../../src/infrastructure/notification/broadcast-notifier.js");
+  const { broadcastToWindows } = await import("../../src/main/utils/broadcast.js");
+  const send = vi.fn();
+  mockGetAllWindows.mockReturnValue([{ isDestroyed: () => false, webContents: { send } }]);
+  const status = { state: "inactive", reason: null, current: null, lastSample: null } as const;
+  createBroadcastNotifier(broadcastToWindows).publish({ type: "battery-status", status });
+  expect(send).toHaveBeenCalledWith(IPC_CHANNELS.BATTERY_STATUS_UPDATE, status);
+});

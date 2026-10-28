@@ -10,7 +10,7 @@ Tray-only Electron app for **macOS and Windows**. Prevents system sleep through 
 
 | Layer | Tech |
 |------|------|
-| Runtime | Bun 1.4.3+ / Node `>=26 <27` |
+| Runtime | Bun 1.4.4+ / Node `>=26 <27` |
 | TypeScript | Dual: native **7.x** (`@typescript/native` owns workspace `tsc`) for typecheck; **6.x** (`typescript@6`) for the JS API / ESLint until 7.1 programmatic API lands |
 | Electron | `^44.4.5` (package pin; do not downgrade below patched 44.x) |
 | Build | Rslib main/preload to CJS + Rsbuild renderer (popover + settings + about + utility-dialog) |
@@ -139,7 +139,7 @@ bun run clean                  # remove lib/dist outputs
 
 ## Notes
 
-- **Version:** `2.0.5` (tags `v2.0.5`; beta `v2.0.5-beta.N`). Electron pin `^44.4.5`. Runtime deps: `electron-log` + `electron-updater` only. CI Node `26.10.0`.
+- **Version:** `2.0.5` (tags `v2.0.5`; beta `v2.0.5-beta.N`). Electron pin `^44.4.5`. Runtime deps: `electron-log` + `electron-updater` only. CI Node `24.22.1`.
 - Effective sleep = `preventSleep` **OR** session. Tray **icon** = effective; checkbox = intent. Low-battery auto-stop clears both + OS `UserNotifierPort`.
 - Popover chips start a session only (do not write preference). Settings duration select starts **and** writes `defaultSessionDuration`.
 - Utility surfaces share `--utility-window-bg` (`#0D1117` only in `utility-tokens.css`). Fancy aurora bloom on `.icon-aurora` only; `bindIconAuroraStagePause` before any About await. Settings stays `icon-aurora--static`.

@@ -10,12 +10,16 @@ export const LABEL_PREVENT_SLEEP = "Prevent Sleep" as const;
 export const LABEL_CANCEL_SESSION = "Cancel session" as const;
 export const LABEL_SESSION_DURATION = "Start session" as const;
 export const LABEL_INDEFINITE = "Indefinite" as const;
+export const LABEL_EXTEND_SESSION = "Add 15 minutes" as const;
+export const LABEL_EXTENDING_SESSION = "Adding time..." as const;
+export const ERROR_EXTEND_SESSION = "Could not extend this session. Try again." as const;
+export const ERROR_EXTEND_DURATION_LIMIT = "A session cannot exceed 24 hours." as const;
+export const ERROR_EXTEND_SESSION_ENDED = "This timed session is no longer available." as const;
 
-/** Quick-start duration chips (minutes). null = indefinite. */
-export const SESSION_DURATION_CHIPS: readonly { minutes: number | null; label: string }[] = [
-  { minutes: 15, label: "15m" },
-  { minutes: 30, label: "30m" },
-  { minutes: 60, label: "1h" },
-  { minutes: 120, label: "2h" },
-  { minutes: null, label: LABEL_INDEFINITE },
-] as const;
+export function sessionChipLabel(minutes: number): string {
+  return minutes % 60 === 0 ? `${minutes / 60}h` : `${minutes}m`;
+}
+
+export function sessionChipAccessibleLabel(minutes: number): string {
+  return `Start a ${minutes}-minute session`;
+}

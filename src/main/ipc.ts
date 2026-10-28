@@ -9,11 +9,12 @@ import {
 import { MAIN_WINDOW_WIDTH, MIN_POPOVER_HEIGHT, MAX_POPOVER_HEIGHT } from "./constants.js";
 import { getPackageInfo } from "./utils/packageInfo.js";
 
-import type { AppSettings } from "../shared/types.js";
+import type { AppSettings, BatteryMonitorStatus } from "../shared/types.js";
 import type { SessionTimerHandle } from "./session-timer.js";
 
 import { validateSender, typedHandle } from "./ipc-utils.js";
 import { validateDurationMinutes } from "../domain/session/duration.js";
+import { cloneAppSettings } from "../domain/settings/app-settings.js";
 export { validateSender } from "./ipc-utils.js";
 
 /**
@@ -32,7 +33,8 @@ export interface IpcDeps {
   ) => Promise<{ settings: AppSettings; rejectedKeys: string[] }>;
   createSettingsWindow: () => void;
   registerAutoUpdaterIpc: () => () => void;
-  sessionTimer: Pick<SessionTimerHandle, "startSession" | "cancelSession" | "getStatus">;
+  getBatteryStatus: () => BatteryMonitorStatus;
+  sessionTimer: Pick<SessionTimerHandle, "startSession" | "extendSession" | "cancelSession" | "getStatus">;
 }
 
 /** Window IPC handlers (fire-and-forget) */
@@ -130,7 +132,7 @@ function registerSettingsIpc(deps: IpcDeps, disposers: Array<() => void>): void 
   disposers.push(
     typedHandle(
       IPC_CHANNELS.SETTINGS_GET,
-      () => ({ ...DEFAULT_SETTINGS }),
+      () => cloneAppSettings(DEFAULT_SETTINGS),
       (): IpcResponse<typeof IPC_CHANNELS.SETTINGS_GET> => deps.getSettings(),
     ),
   );
@@ -166,6 +168,13 @@ function registerSessionIpc(deps: IpcDeps, disposers: Array<() => void>): void {
       () => ({ ok: false, reason: "rejected" }),
       async (_event, request) => {
         const envelope: unknown = request;
+        if (typeof envelope === "object" && envelope !== null && !Array.isArray(envelope) && "operation" in envelope) {
+          if (envelope.operation !== "extend") return { ok: false, reason: "rejected" };
+          if (!("additionalMinutes" in envelope) || typeof envelope.additionalMinutes !== "number") {
+            return { ok: false, reason: "invalid-additional-minutes" };
+          }
+          return deps.sessionTimer.extendSession(envelope.additionalMinutes);
+        }
         if (
           typeof envelope !== "object" ||
           envelope === null ||
@@ -257,6 +266,11 @@ export function registerIpcHandlers(win: BrowserWindow, deps: IpcDeps): () => vo
     registerAppIpc(disposers);
     registerSettingsIpc(deps, disposers);
     registerSessionIpc(deps, disposers);
+    disposers.push(typedHandle(
+      IPC_CHANNELS.BATTERY_STATUS,
+      () => ({ state: "unavailable", reason: "unavailable", current: null, lastSample: null }),
+      () => deps.getBatteryStatus(),
+    ));
     disposers.push(deps.registerAutoUpdaterIpc());
   } catch (error) {
     try {
