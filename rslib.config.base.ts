@@ -17,6 +17,8 @@ export interface ElectronLibOptions {
 
 export function createElectronLibConfig(options: ElectronLibOptions) {
   return {
+    // Rslib uses the library id to namespace persistent caches across parallel builds.
+    id: options.electronTarget,
     format: "cjs" as const,
     bundle: true,
     dts: false,
