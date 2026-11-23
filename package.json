@@ -1,6 +1,6 @@
 {
   "name": "amphetamine",
-  "version": "2.2.5",
+  "version": "2.2.6",
   "author": "iworkforces Engineers",
   "authorEmail": "chitrung09t2@gmail.com",
   "description": "A tray app that keeps your computer awake on macOS and Windows. Lives in the system tray, prevents the system from going to sleep, and stays out of the Dock/taskbar when idle.",
@@ -18,10 +18,10 @@
     "@typescript-eslint/eslint-plugin": "^8.73.0",
     "@typescript-eslint/parser": "^8.73.0",
     "@typescript/native": "npm:typescript@^7.0.2",
-    "@vitest/browser": "^5.1.0",
-    "@vitest/coverage-v8": "^5.1.0",
-    "@vitest/ui": "^5.1.0",
-    "electron": "^45.3.4",
+    "@vitest/browser": "^5.1.1",
+    "@vitest/coverage-v8": "^5.1.1",
+    "@vitest/ui": "^5.1.1",
+    "electron": "^45.4.1",
     "electron-builder": "^26.18.0",
     "eslint": "^10.15.0",
     "eslint-config-prettier": "^10.1.8",
@@ -32,7 +32,7 @@
     "sharp": "^0.35.5",
     "typescript": "npm:@typescript/typescript6@^6.0.2",
     "typescript-eslint": "^8.73.0",
-    "vitest": "^5.1.0"
+    "vitest": "^5.1.1"
   },
   "engineStrict": true,
   "engines": {
@@ -40,7 +40,7 @@
     "bun": ">=1.4.4"
   },
   "homepage": "https://github.com/iworkforces/Amphetamine",
-  "packageManager": "bun@1.4.4",
+  "packageManager": "bun@1.4.5",
   "private": true,
   "productName": "Amphetamine",
   "scripts": {
